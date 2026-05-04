@@ -946,8 +946,9 @@ def find_signal_regions(proba, y, w, forbidden_regions=None, target_regions=None
         )
 
     def _overlap(lo1, hi1, lo2, hi2):
+        # Match _rect_mask's exact half-open [low, high) membership.
         for d in range(D):
-            if not (lo1[d] < hi2[d] - EPS and lo2[d] < hi1[d] - EPS):
+            if not (lo1[d] < hi2[d] and lo2[d] < hi1[d]):
                 return False
         return True
 

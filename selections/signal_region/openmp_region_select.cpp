@@ -28,13 +28,13 @@ bool overlaps(
     int lhs,
     int rhs
 ) {
-    constexpr double eps = 1.0e-12;
     const double* lo1 = lows + static_cast<long long>(lhs) * dim;
     const double* hi1 = highs + static_cast<long long>(lhs) * dim;
     const double* lo2 = lows + static_cast<long long>(rhs) * dim;
     const double* hi2 = highs + static_cast<long long>(rhs) * dim;
     for (int d = 0; d < dim; ++d) {
-        if (!(lo1[d] < hi2[d] - eps && lo2[d] < hi1[d] - eps)) {
+        // Match signal_region.py's exact half-open [low, high) event mask.
+        if (!(lo1[d] < hi2[d] && lo2[d] < hi1[d])) {
             return false;
         }
     }
