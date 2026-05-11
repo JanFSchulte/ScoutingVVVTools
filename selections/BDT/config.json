@@ -40,7 +40,7 @@
     "colsample_bytree": 0.9,
     "colsample_bynode": 0.9,
     "early_stopping_rounds": 10,
-    "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1"],
+    "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1", "ScoutingFatPFJetRecluster_msoftdrop_2"],
     "decor_efficiencies": [1.0, 0.5, 0.1, 0.01],
     "event_reweight_branches": ["weight_pu"]
   },
@@ -60,7 +60,7 @@
     "colsample_bytree": 0.9,
     "colsample_bynode": 0.9,
     "early_stopping_rounds": 10,
-    "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1"],
+    "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1", "ScoutingFatPFJetRecluster_msoftdrop_2", "ScoutingFatPFJetRecluster_msoftdrop_3"],
     "decor_efficiencies": [1.0, 0.5, 0.1, 0.01],
     "event_reweight_branches": ["weight_pu"]
   }
