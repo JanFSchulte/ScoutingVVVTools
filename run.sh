@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_CONCURRENT_JOBS=1
 USE_SLURM=false
-SLURM_PARTITION="cms"
-SLURM_TIME="04:00:00"
+SLURM_PARTITION="cms-express"
+SLURM_TIME="24:00:00"
 SLURM_MEM="4G"
 SLURM_CPUS=12
 SLURM_EXTRA=""
