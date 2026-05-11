@@ -11,7 +11,7 @@ import json
 import math
 import os
 import pickle
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import mplhep as hep
@@ -594,29 +594,58 @@ def _add_uncert_band(ax, edges: np.ndarray, lower: np.ndarray, upper: np.ndarray
     )
 
 
+def _qcd_merged_group_maps(
+    group_vals: Dict[str, np.ndarray],
+    group_vars: Dict[str, np.ndarray],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], List[str]]:
+    merged_vals = {}
+    merged_vars = {}
+    merged_groups = []
+    n_regions = len(next(iter(group_vals.values())))
+    qcd_vals = np.zeros(n_regions, dtype=float)
+    qcd_vars = np.zeros(n_regions, dtype=float)
+
+    for name in CLASS_NAMES:
+        if name in QCD_CLASS_SET:
+            qcd_vals += group_vals[name]
+            qcd_vars += group_vars[name]
+        else:
+            merged_vals[name] = group_vals[name].copy()
+            merged_vars[name] = group_vars[name].copy()
+            merged_groups.append(name)
+
+    merged_vals[QCD_PREDICT_GROUP_NAME] = qcd_vals
+    merged_vars[QCD_PREDICT_GROUP_NAME] = qcd_vars
+    merged_groups.append(QCD_PREDICT_GROUP_NAME)
+    return merged_vals, merged_vars, merged_groups
+
+
 def plot_abcd_region_counts(
     region_labels: List[str],
     group_vals: Dict[str, np.ndarray],
     group_vars: Dict[str, np.ndarray],
     out_path: str,
     normalize_per_bin: bool = False,
+    groups: Optional[List[str]] = None,
+    log_y: bool = True,
 ) -> None:
     edges = np.arange(len(region_labels) + 1, dtype=float)
     centers = edges[:-1] + 0.5
     widths = np.full(len(region_labels), 1.0)
+    plot_groups = list(groups) if groups is not None else list(CLASS_NAMES)
 
-    vals_map = {name: group_vals[name].copy() for name in CLASS_NAMES}
-    vars_map = {name: group_vars[name].copy() for name in CLASS_NAMES}
+    vals_map = {name: group_vals[name].copy() for name in plot_groups}
+    vars_map = {name: group_vars[name].copy() for name in plot_groups}
 
     totals = np.zeros(len(region_labels), dtype=float)
     total_vars = np.zeros(len(region_labels), dtype=float)
-    for name in CLASS_NAMES:
+    for name in plot_groups:
         totals += vals_map[name]
         total_vars += vars_map[name]
 
     if normalize_per_bin:
         scale = np.where(totals > 0, 1.0 / totals, 0.0)
-        for name in CLASS_NAMES:
+        for name in plot_groups:
             vals_map[name] *= scale
             vars_map[name] *= scale ** 2
         totals *= scale
@@ -624,9 +653,9 @@ def plot_abcd_region_counts(
 
     fig, ax = plt.subplots(figsize=(11, 7))
     bottom = np.zeros(len(region_labels), dtype=float)
-    order = np.argsort([float(np.sum(vals_map[name])) for name in CLASS_NAMES])
-    ordered_groups = [CLASS_NAMES[idx] for idx in order]
-    color_map = _group_color_map()
+    order = np.argsort([float(np.sum(vals_map[name])) for name in plot_groups])
+    ordered_groups = [plot_groups[idx] for idx in order]
+    color_map = _group_color_map(plot_groups)
 
     for name in ordered_groups:
         ax.bar(
@@ -646,11 +675,16 @@ def plot_abcd_region_counts(
 
     if not normalize_per_bin:
         sigma = np.sqrt(np.maximum(total_vars, 0.0))
-        lower = np.clip(totals - sigma, 1e-12, None)
-        upper = np.clip(totals + sigma, 1e-12, None)
+        lower_clip = 1e-12 if log_y else 0.0
+        lower = np.clip(totals - sigma, lower_clip, None)
+        upper = np.clip(totals + sigma, lower_clip, None)
         _add_uncert_band(ax, edges, lower, upper)
-        ax.set_yscale("log")
-        ax.set_ylim(0.1, max(1.0, float(np.max(totals[totals > 0])) * 3.0 if np.any(totals > 0) else 1.0))
+        if log_y:
+            ax.set_yscale("log")
+            ax.set_ylim(0.1, max(1.0, float(np.max(totals[totals > 0])) * 3.0 if np.any(totals > 0) else 1.0))
+        else:
+            max_upper = float(np.max(upper)) if len(upper) else 0.0
+            ax.set_ylim(0.0, max(1.0, max_upper * 1.25))
         ax.set_ylabel("Events", fontsize=22)
     else:
         ax.set_ylim(0.0, 1.0)
@@ -1147,6 +1181,10 @@ def main() -> None:
             vals = weights[group_mask]
             abcd_group_vals[group_name][reg_idx] = float(np.sum(vals))
             abcd_group_vars[group_name][reg_idx] = float(np.sum(vals ** 2))
+    abcd_qcd_merged_vals, abcd_qcd_merged_vars, abcd_qcd_merged_groups = _qcd_merged_group_maps(
+        abcd_group_vals,
+        abcd_group_vars,
+    )
 
     root_path = os.path.join(OUTPUT_DIR, ROOT_FILE_NAME)
     log_message("Writing summary ROOT file")
@@ -1183,8 +1221,41 @@ def main() -> None:
         ["A union", "B", "C", "D"],
         abcd_group_vals,
         abcd_group_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_counts_linear.pdf"),
+        normalize_per_bin=False,
+        log_y=False,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_group_vals,
+        abcd_group_vars,
         os.path.join(OUTPUT_DIR, "qcd_abcd_region_fractions.pdf"),
         normalize_per_bin=True,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_qcd_merged_vals,
+        abcd_qcd_merged_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_counts_qcd_merged.pdf"),
+        normalize_per_bin=False,
+        groups=abcd_qcd_merged_groups,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_qcd_merged_vals,
+        abcd_qcd_merged_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_counts_qcd_merged_linear.pdf"),
+        normalize_per_bin=False,
+        groups=abcd_qcd_merged_groups,
+        log_y=False,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_qcd_merged_vals,
+        abcd_qcd_merged_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_fractions_qcd_merged.pdf"),
+        normalize_per_bin=True,
+        groups=abcd_qcd_merged_groups,
     )
     plot_signal_region_prediction(
         region_labels,
