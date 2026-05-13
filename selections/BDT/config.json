@@ -3,7 +3,7 @@
   "sample_config": "../../src/sample.json",
   "input_root": "../../dataset",
   "input_pattern": "{input_root}/{sample_group}_mixed/{sample}.root",
-  "output_root": "./{tree_name}_v5",
+  "output_root": "./{tree_name}_v6",
   "model_pattern": "{output_root}/{tree_name}_model",
   "entries_per_sample": 20000000,
   "train_fraction": 0.7,
