@@ -1206,11 +1206,13 @@ std::string csvDouble(double value) {
 void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
                  const std::vector<ChannelData>& channels,
                  const Scenario& sc, bool use_abcd,
+                 const std::string& tag_prefix,
                  CombineOutput& sig_out, CombineOutput& lim_out) {
     const std::string mode_tag = use_abcd ? "abcd" : "mc";
     const std::string scope_tag = slugify(sc.scope);
     const std::string name_tag = slugify(sc.name);
-    const std::string tag = mode_tag + "_" + scope_tag + "_" + name_tag;
+    const std::string prefix_tag = tag_prefix.empty() ? "" : slugify(tag_prefix) + "_";
+    const std::string tag = prefix_tag + mode_tag + "_" + scope_tag + "_" + name_tag;
     const fs::path work = fs::path(cfg.work_dir) / tag;
     fs::create_directories(work);
 
@@ -1226,9 +1228,9 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
         pc.processes = maybeDropZeroBackgroundProcesses(cfg, std::move(pc.processes), sc, ch.name);
         const Process& signal_proc = getRequiredProcess(pc.processes, "signal", sc, ch.name);
         if (isExactlyZeroProcess(signal_proc)) {
-            if (sc.scope == "sample") {
+            if (sc.scope == "sample" || channels.size() == 1u) {
                 logMessage("WARNING: Dropping zero-yield zero-covariance signal channel from "
-                           "sample scenario: channel=" + ch.name +
+                           "scenario: channel=" + ch.name +
                            " scenario=" + sc.scope + "/" + sc.name +
                            " qcd_mode=" + mode_tag);
                 skipped_zero_signal_channels.push_back(ch.name);
@@ -1272,13 +1274,13 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
     }
 
     if (card_tokens.empty()) {
-        if (sc.scope == "sample") {
+        if (sc.scope == "sample" || channels.size() == 1u) {
             std::ostringstream channels_os;
             for (size_t i = 0; i < skipped_zero_signal_channels.size(); ++i) {
                 if (i) channels_os << ",";
                 channels_os << skipped_zero_signal_channels[i];
             }
-            logMessage("WARNING: Signal sample scenario is identically zero in all channels; "
+            logMessage("WARNING: Signal scenario is identically zero in all usable channels; "
                        "storing significance=0 and infinite expected limits: scenario=" +
                        sc.scope + "/" + sc.name +
                        " qcd_mode=" + mode_tag +
@@ -1383,6 +1385,44 @@ void writeLimitsCsv(const std::string& path,
     logMessage("Wrote " + path);
 }
 
+void writeChannelSignificanceCsv(const std::string& path,
+                                 const std::vector<std::string>& channel_names,
+                                 const std::vector<Scenario>& scenarios,
+                                 const std::vector<CombineOutput>& results) {
+    if (channel_names.size() != scenarios.size() || scenarios.size() != results.size()) {
+        throw std::runtime_error("Channel significance CSV row size mismatch");
+    }
+    std::ofstream ofs(path);
+    if (!ofs) throw std::runtime_error("Cannot write " + path);
+    ofs << "channel,scope,name,significance\n";
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        ofs << channel_names[i] << "," << scenarios[i].scope << "," << scenarios[i].name << ","
+            << results[i].significance << "\n";
+    }
+    logMessage("Wrote " + path);
+}
+
+void writeChannelLimitsCsv(const std::string& path,
+                           const std::vector<std::string>& channel_names,
+                           const std::vector<Scenario>& scenarios,
+                           const std::vector<CombineOutput>& results) {
+    if (channel_names.size() != scenarios.size() || scenarios.size() != results.size()) {
+        throw std::runtime_error("Channel limits CSV row size mismatch");
+    }
+    std::ofstream ofs(path);
+    if (!ofs) throw std::runtime_error("Cannot write " + path);
+    ofs << "channel,scope,name,exp_2p5,exp_16,exp_50,exp_84,exp_97p5\n";
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        ofs << channel_names[i] << "," << scenarios[i].scope << "," << scenarios[i].name << ","
+            << csvDouble(results[i].exp_2p5) << ","
+            << csvDouble(results[i].exp_16) << ","
+            << csvDouble(results[i].exp_50) << ","
+            << csvDouble(results[i].exp_84) << ","
+            << csvDouble(results[i].exp_97p5) << "\n";
+    }
+    logMessage("Wrote " + path);
+}
+
 int runMain() {
     AppConfig cfg = loadAppConfig();
     fs::create_directories(cfg.output_dir);
@@ -1420,9 +1460,56 @@ int runMain() {
     for (size_t i = 0; i < scenarios.size(); ++i) {
         const auto& sc = scenarios[i];
         logMessage("=== Scenario: scope=" + sc.scope + " name=" + sc.name + " (MC true QCD) ===");
-        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/false, sig_mc[i], lim_mc[i]);
+        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/false, "", sig_mc[i], lim_mc[i]);
         logMessage("=== Scenario: scope=" + sc.scope + " name=" + sc.name + " (ABCD QCD) ===");
-        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/true, sig_abcd[i], lim_abcd[i]);
+        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/true, "", sig_abcd[i], lim_abcd[i]);
+    }
+
+    std::vector<std::string> channel_result_names;
+    std::vector<Scenario> channel_result_scenarios;
+    std::vector<CombineOutput> sig_channel_mc;
+    std::vector<CombineOutput> lim_channel_mc;
+    std::vector<CombineOutput> sig_channel_abcd;
+    std::vector<CombineOutput> lim_channel_abcd;
+
+    for (const auto& ch : channels) {
+        std::vector<ChannelData> single_channel;
+        single_channel.push_back(ch);
+        const std::string tag_prefix = "channel_" + ch.name;
+        for (const auto& sc : scenarios) {
+            channel_result_names.push_back(ch.name);
+            channel_result_scenarios.push_back(sc);
+            sig_channel_mc.emplace_back();
+            lim_channel_mc.emplace_back();
+            sig_channel_abcd.emplace_back();
+            lim_channel_abcd.emplace_back();
+            const size_t idx = sig_channel_mc.size() - 1;
+
+            logMessage("=== Channel scenario: channel=" + ch.name +
+                       " scope=" + sc.scope + " name=" + sc.name +
+                       " (MC true QCD) ===");
+            buildAndRun(
+                cfg,
+                reg,
+                single_channel,
+                sc,
+                /*use_abcd=*/false,
+                tag_prefix,
+                sig_channel_mc[idx],
+                lim_channel_mc[idx]);
+            logMessage("=== Channel scenario: channel=" + ch.name +
+                       " scope=" + sc.scope + " name=" + sc.name +
+                       " (ABCD QCD) ===");
+            buildAndRun(
+                cfg,
+                reg,
+                single_channel,
+                sc,
+                /*use_abcd=*/true,
+                tag_prefix,
+                sig_channel_abcd[idx],
+                lim_channel_abcd[idx]);
+        }
     }
 
     writeSignificanceCsv((fs::path(cfg.output_dir) / "significance.csv").string(),
@@ -1433,6 +1520,26 @@ int runMain() {
                          scenarios, sig_abcd);
     writeLimitsCsv((fs::path(cfg.output_dir) / "limits_abcd_mc.csv").string(),
                    scenarios, lim_abcd);
+    writeChannelSignificanceCsv(
+        (fs::path(cfg.output_dir) / "significance_by_channel.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        sig_channel_mc);
+    writeChannelLimitsCsv(
+        (fs::path(cfg.output_dir) / "limits_by_channel.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        lim_channel_mc);
+    writeChannelSignificanceCsv(
+        (fs::path(cfg.output_dir) / "significance_by_channel_abcd_mc.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        sig_channel_abcd);
+    writeChannelLimitsCsv(
+        (fs::path(cfg.output_dir) / "limits_by_channel_abcd_mc.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        lim_channel_abcd);
 
     if (!cfg.keep_work) {
         std::error_code ec;

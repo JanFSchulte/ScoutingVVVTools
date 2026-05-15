@@ -3,5 +3,9 @@
   "bdt_root": "../selections/BDT/fat3_v7",
   "signal_region_csv": "../selections/signal_region/output/fat3_v7/signal_region.csv",
   "output_dir": "./output/fat3_v7",
-  "root_file_name": "qcd_abcd_yields.root"
+  "root_file_name": "qcd_abcd_yields.root",
+  "abcd_branches": {
+    "fat2": ["ScoutingFatPFJetRecluster_sphere_mass"],
+    "fat3": ["ScoutingFatPFJetRecluster_sphere_mass"]
+  }
 }

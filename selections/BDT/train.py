@@ -2708,6 +2708,22 @@ def main():
         )
         final_model = stage2_model if stage2_model is not None else stage1_model
 
+        X_test_qcd_full_model = standardize_X(X_test_unfiltered[branches].copy(), clip_ranges, log_tf)
+        X_test_qcd_full_model = _drop_decorrelated_features(X_test_qcd_full_model, decorrelate)
+        proba_qcd_full_test = _predict_proba(final_model, X_test_qcd_full_model)
+        _write_prediction_reference(
+            output_root,
+            "test_reference_qcd_est_full",
+            tree_name,
+            "qcd_est_full",
+            X_test_qcd_full_model.columns,
+            sample_labels_test_unfiltered,
+            y_test_unfiltered,
+            w_test_physics_unfiltered,
+            proba_qcd_full_test,
+        )
+        del X_test_qcd_full_model, proba_qcd_full_test
+
         X_test_signal_model = _drop_decorrelated_features(X_test_std, decorrelate)
         proba_signal_test = _predict_proba(final_model, X_test_signal_model)
         _write_prediction_reference(

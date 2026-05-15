@@ -110,6 +110,7 @@ OUTPUT_DIR = _resolve(qcd_cfg.get("output_dir", "./output"), _SCRIPT_DIR)
 ROOT_FILE_NAME = qcd_cfg.get("root_file_name", "qcd_abcd_yields.root")
 SIGNAL_REGION_CSV_PATH = _resolve(qcd_cfg["signal_region_csv"], _SCRIPT_DIR)
 TEST_REFERENCE_QCD_EST = os.path.join(BDT_ROOT, "test_reference_qcd_est.npz")
+TEST_REFERENCE_QCD_EST_FULL = os.path.join(BDT_ROOT, "test_reference_qcd_est_full.npz")
 
 
 # -------------------- BDT config copies --------------------
@@ -129,6 +130,43 @@ CLASS_GROUPS = cfg["class_groups"]
 CLASS_NAMES = list(CLASS_GROUPS.keys())
 NUM_CLASSES = len(CLASS_NAMES)
 DEFAULT_AXIS_NAMES = CLASS_NAMES[: max(1, NUM_CLASSES - 1)]
+
+
+def _resolve_abcd_branch_names(config: dict, tree_name: str) -> List[str]:
+    if "abcd_branches" not in config:
+        raise RuntimeError(
+            "background_estimation config missing required 'abcd_branches' mapping"
+        )
+    payload = config["abcd_branches"]
+    if not isinstance(payload, dict):
+        raise TypeError("background_estimation config 'abcd_branches' must be a dict")
+    if tree_name not in payload:
+        raise RuntimeError(
+            f"background_estimation config 'abcd_branches' missing tree '{tree_name}'"
+        )
+    value = payload[tree_name]
+    if isinstance(value, str):
+        names = [value]
+    elif isinstance(value, list):
+        names = value
+    else:
+        raise TypeError(f"abcd_branches['{tree_name}'] must be a string or list")
+
+    out = []
+    seen = set()
+    for item in names:
+        if not isinstance(item, str) or not item:
+            raise TypeError(f"abcd_branches['{tree_name}'] entries must be non-empty strings")
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    if not out:
+        raise RuntimeError(f"abcd_branches['{tree_name}'] must not be empty")
+    return out
+
+
+ABCD_BRANCH_NAMES = _resolve_abcd_branch_names(qcd_cfg, TREE_NAME)
 
 QCD_CLASS_NAMES = [class_name for class_name in CLASS_NAMES if "qcd" in class_name.lower()]
 if not QCD_CLASS_NAMES:
@@ -262,6 +300,15 @@ def standardize_X(X: pd.DataFrame, clip_ranges: dict, log_transform: list) -> pd
                     arr = arr.astype(float)
                 arr[pos] = np.log(arr[pos])
         X[col] = arr
+    return X
+
+
+def _drop_decorrelated_features(X: pd.DataFrame, decorrelate: list[str]) -> pd.DataFrame:
+    if not decorrelate:
+        return X
+    drop_cols = [name for name in decorrelate if name in X.columns]
+    if drop_cols:
+        return X.drop(columns=drop_cols)
     return X
 
 
@@ -472,27 +519,32 @@ def _load_model():
 
 
 # -------------------- Region helpers --------------------
-def _resolve_mass_thresholds(thresholds: dict) -> Tuple[dict, dict]:
-    mass_thresholds = {}
+def _resolve_abcd_thresholds(thresholds: dict, abcd_branch_names: List[str]) -> Tuple[dict, dict]:
+    abcd_thresholds = {}
     other_thresholds = {}
+    abcd_set = set(abcd_branch_names)
+    missing = [name for name in abcd_branch_names if name not in thresholds]
+    if missing:
+        raise RuntimeError(
+            "Configured ABCD branch is missing from bdt_root selection.json thresholds: "
+            + ", ".join(missing)
+        )
     for name, cond in thresholds.items():
-        if name.startswith("ScoutingFatPFJetRecluster_msoftdrop_"):
-            mass_thresholds[name] = cond
+        if name in abcd_set:
+            abcd_thresholds[name] = cond
         else:
             other_thresholds[name] = cond
-    if not mass_thresholds:
-        raise RuntimeError("No ScoutingFatPFJetRecluster_msoftdrop_* thresholds found in selection.json")
-    return mass_thresholds, other_thresholds
+    return abcd_thresholds, other_thresholds
 
 
-def _mass_pass_fail_masks(df: pd.DataFrame, mass_thresholds: dict) -> Tuple[np.ndarray, np.ndarray]:
+def _abcd_pass_fail_masks(df: pd.DataFrame, abcd_thresholds: dict) -> Tuple[np.ndarray, np.ndarray]:
     pass_mask = np.ones(len(df), dtype=bool)
     fail_mask = np.ones(len(df), dtype=bool)
     valid_mask = np.ones(len(df), dtype=bool)
 
-    for name, cond in mass_thresholds.items():
+    for name, cond in abcd_thresholds.items():
         if name not in df.columns:
-            raise KeyError(f"Mass threshold branch {name!r} not found in DataFrame")
+            raise KeyError(f"ABCD threshold branch {name!r} not found in DataFrame")
         col = df[name]
         values = col.to_numpy(dtype=float, copy=False)
         sentinel = values < -990
@@ -940,12 +992,12 @@ def main() -> None:
         key: (tuple(val) if isinstance(val, list) else val)
         for key, val in selection.get("thresholds", {}).items()
     }
-    mass_thresholds, bdt_thresholds = _resolve_mass_thresholds(thresholds)
+    abcd_thresholds, bdt_thresholds = _resolve_abcd_thresholds(thresholds, ABCD_BRANCH_NAMES)
     decorrelate = cfg.get(TREE_NAME, {}).get("decorrelate", [])
 
     log_message("Loading signal region file")
     # Load every branch needed downstream: BDT features (model_branches), all
-    # threshold branches (for filter_X and the mass pass/fail masks), and every
+    # threshold branches (for filter_X and the ABCD pass/fail masks), and every
     # decorrelate branch (in case decorrelation references a branch not in
     # branch.json). BDT inference still uses only model_branches.
     load_branches = sorted(set(model_branches) | set(thresholds.keys()) | set(decorrelate))
@@ -955,8 +1007,8 @@ def main() -> None:
     log_message(
         f"Resolved inputs: model_branches={len(model_branches)}, "
         f"load_branches={len(load_branches)}, signal_regions={len(region_labels)}, "
-        f"score_axes={axis_names}, non_mass_thresholds={len(bdt_thresholds)}, "
-        f"mass_thresholds={len(mass_thresholds)}"
+        f"score_axes={axis_names}, non_abcd_thresholds={len(bdt_thresholds)}, "
+        f"abcd_thresholds={list(abcd_thresholds)}"
     )
     log_message(
         "QCD classes for ABCD merge: "
@@ -974,7 +1026,27 @@ def main() -> None:
     del df_all
     gc.collect()
 
-    log_message("Applying non-mass thresholds")
+    clf = _load_model()
+    have_full_reference = os.path.exists(TEST_REFERENCE_QCD_EST_FULL)
+    if have_full_reference:
+        log_message("Validating full test-set prediction reference")
+        X_model_full = standardize_X(X_raw[model_branches].copy(), clip_ranges, log_transform)
+        X_model_full = _drop_decorrelated_features(X_model_full, decorrelate)
+        proba_full = _predict_model_proba(clf, X_model_full)
+        _compare_prediction_reference(
+            TEST_REFERENCE_QCD_EST_FULL,
+            X_model_full.columns
+            if hasattr(X_model_full, "columns")
+            else [f"f{i}" for i in range(X_model_full.shape[1])],
+            sample_labels,
+            y,
+            w,
+            proba_full,
+        )
+        del X_model_full, proba_full
+        gc.collect()
+
+    log_message("Applying non-ABCD thresholds")
     X_raw, y, w, sample_labels = filter_X(
         X_raw,
         y,
@@ -985,38 +1057,41 @@ def main() -> None:
         sample_labels=sample_labels,
     )
     group_labels = np.asarray([SAMPLE_TO_GROUP[name] for name in sample_labels], dtype=object)
-    log_message(f"After non-mass filtering: {len(X_raw)} events")
+    log_message(f"After non-ABCD filtering: {len(X_raw)} events")
 
-    log_message("Evaluating mass pass/fail masks")
-    mass_pass, mass_fail = _mass_pass_fail_masks(X_raw, mass_thresholds)
-    mass_mixed = ~(mass_pass | mass_fail)
+    log_message("Evaluating ABCD pass/fail masks")
+    abcd_pass, abcd_fail = _abcd_pass_fail_masks(X_raw, abcd_thresholds)
+    abcd_mixed = ~(abcd_pass | abcd_fail)
     log_message(
-        f"Mass categories: pass={int(np.count_nonzero(mass_pass))}, "
-        f"fail={int(np.count_nonzero(mass_fail))}, excluded_mixed={int(np.count_nonzero(mass_mixed))}"
+        f"ABCD branch categories: pass={int(np.count_nonzero(abcd_pass))}, "
+        f"fail={int(np.count_nonzero(abcd_fail))}, excluded_mixed={int(np.count_nonzero(abcd_mixed))}"
     )
 
     log_message("Standardising model features")
     X_model = standardize_X(X_raw[model_branches].copy(), clip_ranges, log_transform)
     if decorrelate:
-        name_to_idx = {name: idx for idx, name in enumerate(X_model.columns)}
-        decor_idx = sorted(name_to_idx[name] for name in decorrelate if name in name_to_idx)
-        keep_idx = [idx for idx in range(len(X_model.columns)) if idx not in decor_idx]
-        X_model = X_model.iloc[:, keep_idx]
+        X_model = _drop_decorrelated_features(X_model, decorrelate)
         log_message(f"Removed decorrelated features: {decorrelate}")
 
-    clf = _load_model()
     log_message("Running BDT prediction")
     proba = _predict_model_proba(clf, X_model)
     log_message(f"Predicted probabilities shape: {proba.shape}")
-    log_message("Validating test-set prediction reference")
-    _compare_prediction_reference(
-        TEST_REFERENCE_QCD_EST,
-        X_model.columns if hasattr(X_model, "columns") else [f"f{i}" for i in range(X_model.shape[1])],
-        sample_labels,
-        y,
-        w,
-        proba,
-    )
+    if not have_full_reference:
+        log_warning(
+            "Full qcd_est reference missing; using legacy filtered reference. "
+            "Re-run train.py to produce test_reference_qcd_est_full.npz for configurable ABCD branches."
+        )
+        log_message("Validating filtered test-set prediction reference")
+        _compare_prediction_reference(
+            TEST_REFERENCE_QCD_EST,
+            X_model.columns
+            if hasattr(X_model, "columns")
+            else [f"f{i}" for i in range(X_model.shape[1])],
+            sample_labels,
+            y,
+            w,
+            proba,
+        )
 
     log_message("Building ABCD regions")
     region_score_masks = []
@@ -1031,11 +1106,11 @@ def main() -> None:
     if np.any(membership > 1):
         raise RuntimeError("Signal region definitions overlap on the current event set")
 
-    region_a_masks = [mask & mass_pass for mask in region_score_masks]
-    a_union_mask = union_score_mask & mass_pass
-    b_mask = (~union_score_mask) & mass_pass
-    c_mask = union_score_mask & mass_fail
-    d_mask = (~union_score_mask) & mass_fail
+    region_a_masks = [mask & abcd_pass for mask in region_score_masks]
+    a_union_mask = union_score_mask & abcd_pass
+    b_mask = (~union_score_mask) & abcd_pass
+    c_mask = union_score_mask & abcd_fail
+    d_mask = (~union_score_mask) & abcd_fail
 
     log_message(
         f"ABCD event counts: A_union={int(np.count_nonzero(a_union_mask))}, "
