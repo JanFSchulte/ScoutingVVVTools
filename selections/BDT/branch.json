@@ -1,6 +1,8 @@
 {
   "fat2": [
     { "name": "ScoutingFatPFJetRecluster_selected_pt_sum" },
+    { "name": "ScoutingFatPFJetRecluster_sphere_mass" },
+    { "name": "ScoutingFatPFJetRecluster_msoftdrop_2" },
     { "name": "ScoutingFatPFJetRecluster_mass" },
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_mass" },
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_pt" },
@@ -41,6 +43,9 @@
   ],
   "fat3": [
     { "name": "ScoutingFatPFJetRecluster_selected_pt_sum" },
+    { "name": "ScoutingFatPFJetRecluster_sphere_mass" },
+    { "name": "ScoutingFatPFJetRecluster_msoftdrop_2" },
+    { "name": "ScoutingFatPFJetRecluster_msoftdrop_3" },
     { "name": "ScoutingFatPFJetRecluster_mass" },
     { "name": "ScoutingFatPFJetRecluster_pt" },
     { "name": "ScoutingFatPFJetRecluster_mass_fraction_1" },
