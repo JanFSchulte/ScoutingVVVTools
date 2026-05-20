@@ -2,16 +2,16 @@
   "channels": [
     {
       "name": "fat2",
-      "root_file": "../background_estimation/output/fat2_v8/qcd_abcd_yields.root",
-      "bdt_root": "../selections/BDT/fat2_v8"
+      "root_file": "../background_estimation/output/fat2_v10_MSD50/qcd_abcd_yields.root",
+      "bdt_root": "../selections/BDT/fat2_v10_MSD50"
     },
     {
       "name": "fat3",
-      "root_file": "../background_estimation/output/fat3_v8/qcd_abcd_yields.root",
-      "bdt_root": "../selections/BDT/fat3_v8"
+      "root_file": "../background_estimation/output/fat3_v10_MSD50/qcd_abcd_yields.root",
+      "bdt_root": "../selections/BDT/fat3_v10_MSD50"
     }
   ],
-  "output_dir": "./v8",
+  "output_dir": "./v10_MSD50",
   "combine_cmd": "combine",
   "combine_cards_cmd": "combineCards.py",
   "use_root_covariance": false,
