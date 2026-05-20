@@ -3,9 +3,9 @@
   "sample_config": "../../src/sample.json",
   "input_root": "../../dataset",
   "input_pattern": "{input_root}/{sample_group}_mixed/{sample}.root",
-  "output_root": "./{tree_name}_v4_MSD",
+  "output_root": "./{tree_name}_nn_v1",
   "model_pattern": "{output_root}/{tree_name}_model",
-  "model_type": "bdt",
+  "model_type": "nn",
   "entries_per_sample": 20000000,
   "train_fraction": 0.7,
   "random_state": 42,
@@ -73,13 +73,13 @@
     "dropout": 0.12,
     "batch_norm": true,
     "batch_size": 8192,
-    "learning_rate": 0.001,
-    "learning_rate_decorr": 0.0005,
+    "learning_rate": 0.005,
+    "learning_rate_decorr": 0.005,
     "min_learning_rate": 0.00002,
     "lr_reduce_patience": 4,
     "weight_decay": 0.0001,
-    "early_stopping_rounds": 12,
-    "permutation_importance_events": 50000
+    "early_stopping_rounds": 10,
+    "permutation_importance_events": 100000
   },
   "fat3_nn": {
     "epochs": 180,
@@ -89,12 +89,12 @@
     "dropout": 0.12,
     "batch_norm": true,
     "batch_size": 8192,
-    "learning_rate": 0.001,
-    "learning_rate_decorr": 0.0005,
-    "min_learning_rate": 0.00002,
+    "learning_rate": 0.005,
+    "learning_rate_decorr": 0.005,
+    "min_learning_rate": 0.0001,
     "lr_reduce_patience": 4,
     "weight_decay": 0.0001,
-    "early_stopping_rounds": 12,
-    "permutation_importance_events": 50000
+    "early_stopping_rounds": 10,
+    "permutation_importance_events": 100000
   }
 }
