@@ -599,6 +599,20 @@ def _load_signal_regions() -> Tuple[pd.DataFrame, List[str]]:
             f"Signal region CSV missing required columns: {', '.join(missing)}"
         )
 
+    bin_values = pd.to_numeric(df["bin_index"], errors="raise").to_numpy(dtype=float)
+    rounded_bins = np.rint(bin_values)
+    if (
+        not np.all(np.isfinite(bin_values))
+        or not np.allclose(bin_values, rounded_bins)
+        or np.any(rounded_bins <= 0)
+    ):
+        raise RuntimeError("Signal region CSV bin_index values must be positive integers")
+    bin_ids = [int(value) for value in rounded_bins]
+    if len(set(bin_ids)) != len(bin_ids):
+        raise RuntimeError("Signal region CSV bin_index values must be unique")
+    df = df.copy()
+    df["bin_index"] = bin_ids
+
     return df.sort_values("bin_index").reset_index(drop=True), axis_names
 
 
@@ -879,6 +893,7 @@ def plot_signal_region_prediction(
 def write_root_output(
     root_path: str,
     edges: np.ndarray,
+    signal_region_ids: List[int],
     sample_yields: Dict[str, np.ndarray],
     sample_vars: Dict[str, np.ndarray],
     group_yields: Dict[str, np.ndarray],
@@ -896,6 +911,12 @@ def write_root_output(
     true_total_vals: np.ndarray,
     true_total_vars: np.ndarray,
 ) -> None:
+    sr_ids = np.asarray(signal_region_ids, dtype=np.int32)
+    if sr_ids.ndim != 1 or len(sr_ids) == 0:
+        raise RuntimeError("Signal region ids must be a non-empty one-dimensional list")
+    if len(set(int(value) for value in sr_ids)) != len(sr_ids) or np.any(sr_ids <= 0):
+        raise RuntimeError("Signal region ids must be unique positive integers")
+
     def _write_bundle(
         root_file,
         prefix: str,
@@ -916,6 +937,8 @@ def write_root_output(
             covariance_total = np.asarray(covariance_total, dtype=float)
 
         n_sr = len(vals)
+        if n_sr != len(sr_ids):
+            raise RuntimeError(f"Signal-region count mismatch for ROOT bundle '{prefix}'")
         if stat_vars.shape != vals.shape or scale_vars.shape != vals.shape:
             raise RuntimeError(f"Uncertainty size mismatch for ROOT bundle '{prefix}'")
         if covariance_total.shape != (n_sr, n_sr):
@@ -925,7 +948,7 @@ def write_root_output(
         stat_err = np.sqrt(np.maximum(stat_vars, 0.0))
         scale_err = np.sqrt(np.maximum(scale_vars, 0.0))
         for idx in range(n_sr):
-            sr_prefix = f"{prefix}/sr{idx + 1}"
+            sr_prefix = f"{prefix}/sr{int(sr_ids[idx])}"
             root_file[f"{sr_prefix}/yield"] = (np.array([vals[idx]], dtype=float), one_bin_edges)
             root_file[f"{sr_prefix}/stat_error"] = (
                 np.array([stat_err[idx]], dtype=float),
@@ -938,6 +961,8 @@ def write_root_output(
         root_file[f"{prefix}/covariance_total"] = (covariance_total, edges, edges)
 
     with uproot.recreate(root_path) as root_file:
+        root_file["metadata/signal_regions"] = {"bin_index": sr_ids}
+
         for sample_name in sorted(sample_yields):
             _write_bundle(
                 root_file,
@@ -1266,6 +1291,7 @@ def main() -> None:
     write_root_output(
         root_path,
         edges,
+        [int(idx) for idx in signal_regions["bin_index"].tolist()],
         sample_yields,
         sample_root_vars,
         group_yields,
