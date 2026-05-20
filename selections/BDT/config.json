@@ -5,6 +5,7 @@
   "input_pattern": "{input_root}/{sample_group}_mixed/{sample}.root",
   "output_root": "./{tree_name}_v4_MSD",
   "model_pattern": "{output_root}/{tree_name}_model",
+  "model_type": "bdt",
   "entries_per_sample": 20000000,
   "train_fraction": 0.7,
   "random_state": 42,
@@ -63,5 +64,37 @@
     "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1"],
     "decor_efficiencies": [1.0, 0.5, 0.1, 0.05],
     "event_reweight_branches": ["weight_pu"]
+  },
+  "fat2_nn": {
+    "epochs": 200,
+    "epochs_decorr": 100,
+    "hidden_layers": [512, 256, 128],
+    "activation": "silu",
+    "dropout": 0.12,
+    "batch_norm": true,
+    "batch_size": 8192,
+    "learning_rate": 0.001,
+    "learning_rate_decorr": 0.0005,
+    "min_learning_rate": 0.00002,
+    "lr_reduce_patience": 4,
+    "weight_decay": 0.0001,
+    "early_stopping_rounds": 12,
+    "permutation_importance_events": 50000
+  },
+  "fat3_nn": {
+    "epochs": 180,
+    "epochs_decorr": 100,
+    "hidden_layers": [384, 256, 128],
+    "activation": "silu",
+    "dropout": 0.12,
+    "batch_norm": true,
+    "batch_size": 8192,
+    "learning_rate": 0.001,
+    "learning_rate_decorr": 0.0005,
+    "min_learning_rate": 0.00002,
+    "lr_reduce_patience": 4,
+    "weight_decay": 0.0001,
+    "early_stopping_rounds": 12,
+    "permutation_importance_events": 50000
   }
 }

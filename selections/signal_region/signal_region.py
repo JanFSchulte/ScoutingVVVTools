@@ -1,17 +1,16 @@
 import os
 import json
 import gc
-import pickle
 import time
 import ctypes
 import colorsys
 import subprocess
+import sys
 import uproot
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as hep
-import xgboost as xgb
 from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations, product as iproduct
 from matplotlib.lines import Line2D
@@ -56,6 +55,13 @@ def _plot_colors(n):
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 _SELECTIONS_DIR = os.path.dirname(_SCRIPT_DIR)
 _BDT_DIR        = os.path.join(_SELECTIONS_DIR, "BDT")
+if _BDT_DIR not in sys.path:
+    sys.path.insert(0, _BDT_DIR)
+
+from model_io import (
+    load_model as _shared_load_model,
+    predict_model_proba as _shared_predict_model_proba,
+)
 
 
 # -------------------- Logging --------------------
@@ -133,7 +139,7 @@ if not os.path.isabs(OUTPUT_DIR):
     OUTPUT_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, OUTPUT_DIR))
 
 
-# -------------------- BDT config copies --------------------
+# -------------------- Trained-model config copies --------------------
 cfg       = _load_json(os.path.join(BDT_ROOT, "config.json"))
 br_cfg    = _load_json(os.path.join(BDT_ROOT, "branch.json"))
 sel_cfg   = _load_json(os.path.join(BDT_ROOT, "selection.json"))
@@ -228,7 +234,7 @@ def load_test_data(branches):
       total_weight     = lumi * xsec * total_tree_entries / raw_entries
       per_event_weight = raw_w * total_weight / sum(raw_w_loaded)
 
-    The reweight branches come from the BDT config copy in ``bdt_root`` and are
+    The reweight branches come from the trained-model config copy in ``bdt_root`` and are
     read on raw values (before any clip/log/threshold). Weights are fixed here;
     threshold filtering later does NOT rescale them.
     """
@@ -357,30 +363,8 @@ def standardize_X(X: pd.DataFrame, clip_ranges: dict, log_transform: list) -> pd
     return X
 
 
-def _reshape_multiclass_margin(predt, num_class):
-    predt = np.asarray(predt, dtype=float)
-    if predt.ndim == 2:
-        if predt.shape[1] == num_class:
-            return predt
-        if predt.shape[0] == num_class:
-            return predt.T
-    rows = predt.size // num_class
-    return predt.reshape(rows, num_class)
-
-
-def _softmax_rows(logits: np.ndarray) -> np.ndarray:
-    logits = np.asarray(logits, dtype=float)
-    shifted = logits - np.max(logits, axis=1, keepdims=True)
-    exp_v = np.exp(shifted)
-    return exp_v / (np.sum(exp_v, axis=1, keepdims=True) + 1e-12)
-
-
 def _predict_model_proba(model, X):
-    if isinstance(model, xgb.Booster):
-        dmat = xgb.DMatrix(X, feature_names=list(X.columns) if hasattr(X, "columns") else None)
-        margins = model.predict(dmat, output_margin=True)
-        return _softmax_rows(_reshape_multiclass_margin(margins, NUM_CLASSES))
-    return model.predict_proba(X)
+    return _shared_predict_model_proba(model, X, NUM_CLASSES)
 
 
 def _compare_prediction_reference(path, feature_names, sample_labels, class_idx, weights, proba):
@@ -568,7 +552,7 @@ def write_signal_region_csv(result):
 
 
 def plot_score_distributions(proba, y, w):
-    """Weighted BDT score distributions per scan axis (one plot per axis)."""
+    """Weighted model score distributions per scan axis (one plot per axis)."""
     palette = _plot_colors(NUM_CLASSES)
     bins = np.linspace(0.0, 1.0, 51)
 
@@ -2380,7 +2364,7 @@ def main():
     # Threshold and decorrelate branches that are NOT declared in branch.json
     # still need to be read from the ROOT files so filter_X can cut on them and
     # the decorrelation step can reference them. They are removed from X before
-    # model inference so the BDT input feature set stays strictly defined by
+    # model inference so the trained-model input feature set stays strictly defined by
     # branch.json (mirrors train.py).
     extra_cols = []
     for c in list(thresholds.keys()) + list(decorrelate):
@@ -2423,23 +2407,10 @@ def main():
     else:
         X_model = X
 
-    # Load the trained model.
     model_base = MODEL_PATTERN.format(output_root=BDT_ROOT, tree_name=TREE_NAME)
-    if os.path.exists(model_base + ".json"):
-        model_path = model_base + ".json"
-        clf = xgb.Booster()
-        clf.load_model(model_path)
-        log_message(f"Loaded model: {model_path}")
-    elif os.path.exists(model_base + ".pkl"):
-        model_path = model_base + ".pkl"
-        with open(model_path, "rb") as f:
-            clf = pickle.load(f)
-        log_message(f"Loaded model: {model_path}")
-    else:
-        raise FileNotFoundError(f"No model found at {model_base}(.json/.pkl)")
+    clf = _shared_load_model(model_base, cfg, NUM_CLASSES, log_message=log_message)
 
-    # Run the BDT prediction.
-    log_message("Running BDT prediction")
+    log_message("Running model prediction")
     proba = _predict_model_proba(clf, X_model)
     log_message(f"Predicted probabilities shape: {proba.shape}")
     log_message("Validating test-set prediction reference")

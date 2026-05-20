@@ -4,7 +4,7 @@
 """Data vs MC histogram comparison plotter.
 
 Reads convert_branch.C output ROOT files directly (per-sample trees), applies
-the BDT selection.json clip/threshold cuts (no log transform), and draws a
+the trained-model selection.json clip/threshold cuts (no log transform), and draws a
 stacked MC + data panel with a Data/MC ratio sub-panel.
 """
 
@@ -13,16 +13,23 @@ import sys
 import json
 import glob
 import math
-import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import mplhep as hep
 import uproot
-import xgboost as xgb
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_SCRIPT_DIR)
+_BDT_DIR = os.path.join(_ROOT_DIR, "selections", "BDT")
+if _BDT_DIR not in sys.path:
+    sys.path.insert(0, _BDT_DIR)
+
+from model_io import (
+    load_model as _shared_load_model,
+    predict_model_proba as _shared_predict_model_proba,
+)
 
 # -------------------- Style --------------------
 plt.rcParams["mathtext.fontset"] = "cm"
@@ -136,7 +143,7 @@ def _plot_branches_for_tree(tree_name):
     return out
 
 
-# -------------------- BDT config copies --------------------
+# -------------------- Trained-model config copies --------------------
 def _bdt_root_for_tree(tree_name):
     return _resolve(BDT_ROOT_PATT.format(tree_name=tree_name), _SCRIPT_DIR)
 
@@ -300,48 +307,20 @@ def _drop_decorrelated_features(X, decorrelate):
     return X
 
 
-def _reshape_multiclass_margin(predt, num_class):
-    predt = np.asarray(predt, dtype=float)
-    if predt.ndim == 2:
-        if predt.shape[1] == num_class:
-            return predt
-        if predt.shape[0] == num_class:
-            return predt.T
-    rows = predt.size // num_class
-    return predt.reshape(rows, num_class)
-
-
-def _softmax_rows(logits):
-    logits = np.asarray(logits, dtype=float)
-    shifted = logits - np.max(logits, axis=1, keepdims=True)
-    exp_v = np.exp(shifted)
-    return exp_v / (np.sum(exp_v, axis=1, keepdims=True) + 1e-12)
-
-
 def _predict_model_proba(model, X, num_classes):
-    if isinstance(model, xgb.Booster):
-        dmat = xgb.DMatrix(X, feature_names=list(X.columns) if hasattr(X, "columns") else None)
-        margins = model.predict(dmat, output_margin=True)
-        return _softmax_rows(_reshape_multiclass_margin(margins, num_classes))
-    return model.predict_proba(X)
+    return _shared_predict_model_proba(model, X, num_classes)
 
 
-def _load_bdt_model(bdt_root, bdt_cfg, tree_name):
+def _load_score_model(bdt_root, bdt_cfg, tree_name):
     model_pattern = bdt_cfg.get("model_pattern", "{output_root}/{tree_name}_model")
     model_base = model_pattern.format(output_root=bdt_root, tree_name=tree_name)
-    if os.path.exists(model_base + ".json"):
-        model_path = model_base + ".json"
-        clf = xgb.Booster()
-        clf.load_model(model_path)
-        log_message(f"Loaded BDT model: {model_path}")
-        return clf
-    if os.path.exists(model_base + ".pkl"):
-        model_path = model_base + ".pkl"
-        with open(model_path, "rb") as handle:
-            clf = pickle.load(handle)
-        log_message(f"Loaded BDT model: {model_path}")
-        return clf
-    raise FileNotFoundError(f"No model found at {model_base}(.json/.pkl)")
+    class_groups = bdt_cfg["class_groups"]
+    return _shared_load_model(
+        model_base,
+        bdt_cfg,
+        len(class_groups),
+        log_message=log_message,
+    )
 
 
 def _compare_score_reference(path, feature_names, sample_labels, class_idx, weights, proba):
@@ -602,7 +581,7 @@ def _ratio_data_over_mc(data_vals, data_vars, mc_vals, mc_vars):
 def _process_tree(tree_name):
     log_message(f"Running data_mc.py: tree={tree_name}")
 
-    log_message("Loading BDT config copies")
+    log_message("Loading trained-model config copies")
     bdt_cfg, bdt_br, bdt_sel, test_meta = _bdt_configs_for_tree(tree_name)
     class_groups     = bdt_cfg["class_groups"]
     class_names      = list(class_groups.keys())
@@ -695,14 +674,14 @@ def _process_tree(tree_name):
     else:
         log_message(f"Loaded data events: {len(data_df)}")
 
-    # Build derived BDT score branches. MC scores use the saved test split and
+    # Build derived model score branches. MC scores use the saved test split and
     # are validated against train.py's signal-region reference; data scores use
     # the full configured data input, matching the ordinary branch plots.
     score_class_dfs = {}
     score_data_df = None
     if score_branches:
-        log_message("Preparing BDT score branches")
-        clf = _load_bdt_model(bdt_root_dir, bdt_cfg, tree_name)
+        log_message("Preparing model score branches")
+        clf = _load_score_model(bdt_root_dir, bdt_cfg, tree_name)
         decorrelate = list(bdt_cfg.get(tree_name, {}).get("decorrelate", []))
         score_load = sorted(set(model_branches) | set(thresholds.keys()) | set(score_reweight_branches))
         sample_to_class_name = {}

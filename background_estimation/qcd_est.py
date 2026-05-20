@@ -10,7 +10,7 @@ import colorsys
 import json
 import math
 import os
-import pickle
+import sys
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -18,7 +18,6 @@ import mplhep as hep
 import numpy as np
 import pandas as pd
 import uproot
-import xgboost as xgb
 
 
 # -------------------- Style --------------------
@@ -72,6 +71,13 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(_SCRIPT_DIR)
 _SELECTIONS_DIR = os.path.join(_ROOT_DIR, "selections")
 _BDT_DIR = os.path.join(_SELECTIONS_DIR, "BDT")
+if _BDT_DIR not in sys.path:
+    sys.path.insert(0, _BDT_DIR)
+
+from model_io import (
+    load_model as _shared_load_model,
+    predict_model_proba as _shared_predict_model_proba,
+)
 
 
 # -------------------- Logging --------------------
@@ -113,7 +119,7 @@ TEST_REFERENCE_QCD_EST = os.path.join(BDT_ROOT, "test_reference_qcd_est.npz")
 TEST_REFERENCE_QCD_EST_FULL = os.path.join(BDT_ROOT, "test_reference_qcd_est_full.npz")
 
 
-# -------------------- BDT config copies --------------------
+# -------------------- Trained-model config copies --------------------
 cfg = _load_json(os.path.join(BDT_ROOT, "config.json"))
 br_cfg = _load_json(os.path.join(BDT_ROOT, "branch.json"))
 sel_cfg = _load_json(os.path.join(BDT_ROOT, "selection.json"))
@@ -312,30 +318,8 @@ def _drop_decorrelated_features(X: pd.DataFrame, decorrelate: list[str]) -> pd.D
     return X
 
 
-def _reshape_multiclass_margin(predt, num_class):
-    predt = np.asarray(predt, dtype=float)
-    if predt.ndim == 2:
-        if predt.shape[1] == num_class:
-            return predt
-        if predt.shape[0] == num_class:
-            return predt.T
-    rows = predt.size // num_class
-    return predt.reshape(rows, num_class)
-
-
-def _softmax_rows(logits: np.ndarray) -> np.ndarray:
-    logits = np.asarray(logits, dtype=float)
-    shifted = logits - np.max(logits, axis=1, keepdims=True)
-    exp_v = np.exp(shifted)
-    return exp_v / (np.sum(exp_v, axis=1, keepdims=True) + 1e-12)
-
-
 def _predict_model_proba(model, X):
-    if isinstance(model, xgb.Booster):
-        dmat = xgb.DMatrix(X, feature_names=list(X.columns) if hasattr(X, "columns") else None)
-        margins = model.predict(dmat, output_margin=True)
-        return _softmax_rows(_reshape_multiclass_margin(margins, NUM_CLASSES))
-    return model.predict_proba(X)
+    return _shared_predict_model_proba(model, X, NUM_CLASSES)
 
 
 def _compare_prediction_reference(path, feature_names, sample_labels, class_idx, weights, proba):
@@ -503,19 +487,7 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
 # -------------------- Model loading --------------------
 def _load_model():
     model_base = MODEL_PATTERN.format(output_root=BDT_ROOT, tree_name=TREE_NAME)
-    if os.path.exists(model_base + ".json"):
-        model_path = model_base + ".json"
-        clf = xgb.Booster()
-        clf.load_model(model_path)
-        log_message(f"Loaded model: {model_path}")
-        return clf
-    if os.path.exists(model_base + ".pkl"):
-        model_path = model_base + ".pkl"
-        with open(model_path, "rb") as handle:
-            clf = pickle.load(handle)
-        log_message(f"Loaded model: {model_path}")
-        return clf
-    raise FileNotFoundError(f"No model found at {model_base}(.json/.pkl)")
+    return _shared_load_model(model_base, cfg, NUM_CLASSES, log_message=log_message)
 
 
 # -------------------- Region helpers --------------------
@@ -1007,7 +979,7 @@ def main() -> None:
         f"Running qcd_est.py: tree={TREE_NAME}, lumi={LUMI} fb^-1, "
         f"bdt_root={BDT_ROOT}, signal_region_csv={SIGNAL_REGION_CSV_PATH}, output_dir={OUTPUT_DIR}"
     )
-    log_message("Loading BDT config copies")
+    log_message("Loading trained-model config copies")
 
     model_branches = [item["name"] for item in br_cfg[TREE_NAME]]
     selection = sel_cfg[TREE_NAME]
@@ -1021,10 +993,10 @@ def main() -> None:
     decorrelate = cfg.get(TREE_NAME, {}).get("decorrelate", [])
 
     log_message("Loading signal region file")
-    # Load every branch needed downstream: BDT features (model_branches), all
+    # Load every branch needed downstream: model features (model_branches), all
     # threshold branches (for filter_X and the ABCD pass/fail masks), and every
     # decorrelate branch (in case decorrelation references a branch not in
-    # branch.json). BDT inference still uses only model_branches.
+    # branch.json). Model inference still uses only model_branches.
     load_branches = sorted(set(model_branches) | set(thresholds.keys()) | set(decorrelate))
     signal_regions, axis_names = _load_signal_regions()
     region_labels = [f"SR{int(idx)}" for idx in signal_regions["bin_index"].tolist()]
@@ -1098,7 +1070,7 @@ def main() -> None:
         X_model = _drop_decorrelated_features(X_model, decorrelate)
         log_message(f"Removed decorrelated features: {decorrelate}")
 
-    log_message("Running BDT prediction")
+    log_message("Running model prediction")
     proba = _predict_model_proba(clf, X_model)
     log_message(f"Predicted probabilities shape: {proba.shape}")
     if not have_full_reference:

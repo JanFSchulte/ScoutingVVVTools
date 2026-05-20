@@ -90,6 +90,10 @@
           { "name": "ScoutingFatPFJetRecluster_mass", "type": "F", "onlyMC": false },
           { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud", "type": "F", "onlyMC": false },
           { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs", "type": "F", "onlyMC": false },
+          { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq", "type": "F", "onlyMC": false },
+          { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb", "type": "F", "onlyMC": false },
+          { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc", "type": "F", "onlyMC": false },
+          { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss", "type": "F", "onlyMC": false },
           { "name": "ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD", "type": "F", "onlyMC": false }
         ]
       },
@@ -237,6 +241,7 @@
             { "name": "ScoutingFatPFJetRecluster_msoftdrop", "type": "F", "collection": "ak8", "slots": 2, "formula": "ScoutingFatPFJetRecluster_msoftdrop", "onlyMC": false },
             { "name": "ScoutingFatPFJetRecluster_mass", "type": "F", "collection": "ak8", "slots": 2, "formula": "ScoutingFatPFJetRecluster_mass", "onlyMC": false },
             { "name": "ScoutingFatPFJetRecluster_WvsQCD", "type": "F", "collection": "ak8", "slots": 2, "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)", "onlyMC": false },
+            { "name": "ScoutingFatPFJetRecluster_VvsQCD", "type": "F", "collection": "ak8", "slots": 2, "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)", "onlyMC": false },
 
             { "name": "ScoutingPFJetRecluster2_pt", "type": "F", "collection": "ak4", "slots": 4, "formula": "ScoutingPFJetRecluster2_pt", "onlyMC": false },
             { "name": "ScoutingPFJetRecluster2_eta", "type": "F", "collection": "ak4", "slots": 4, "formula": "ScoutingPFJetRecluster2_eta", "onlyMC": false },
@@ -249,6 +254,30 @@
             { "name": "SelectedLepton_hcalIso", "type": "F", "collection": "lep", "slots": 3, "formula": "first_valid(ScoutingElectron_hcalIso, ScoutingMuonVtx_hcalIso, ScoutingMuonNoVtx_hcalIso)", "onlyMC": false }
           ],
           "extrema": [
+            {
+              "name": "ScoutingFatPFJetRecluster_WvsQCD_sum",
+              "type": "F",
+              "formula": "sum(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0))",
+              "onlyMC": false
+            },
+            {
+              "name": "ScoutingFatPFJetRecluster_VvsQCD_sum",
+              "type": "F",
+              "formula": "sum(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0))",
+              "onlyMC": false
+            },
+            {
+              "name": "ScoutingFatPFJetRecluster_WvsQCD_max",
+              "type": "F",
+              "formula": "max_value(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0), -99)",
+              "onlyMC": false
+            },
+            {
+              "name": "ScoutingFatPFJetRecluster_VvsQCD_max",
+              "type": "F",
+              "formula": "max_value(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0), -99)",
+              "onlyMC": false
+            },
             {
               "name": "ScoutingPFJetRecluster2_scoutUParT_probb_max",
               "type": "F",
@@ -404,6 +433,7 @@
             { "name": "ScoutingFatPFJetRecluster_msoftdrop", "type": "F", "collection": "ak8", "slots": 3, "formula": "ScoutingFatPFJetRecluster_msoftdrop", "onlyMC": false },
             { "name": "ScoutingFatPFJetRecluster_mass", "type": "F", "collection": "ak8", "slots": 3, "formula": "ScoutingFatPFJetRecluster_mass", "onlyMC": false },
             { "name": "ScoutingFatPFJetRecluster_WvsQCD", "type": "F", "collection": "ak8", "slots": 3, "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)", "onlyMC": false },
+            { "name": "ScoutingFatPFJetRecluster_VvsQCD", "type": "F", "collection": "ak8", "slots": 3, "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)", "onlyMC": false },
 
             { "name": "SelectedLepton_pt", "type": "F", "collection": "lep", "slots": 3, "formula": "pt(self)", "onlyMC": false },
             { "name": "SelectedLepton_eta", "type": "F", "collection": "lep", "slots": 3, "formula": "eta(self)", "onlyMC": false },
@@ -412,6 +442,30 @@
             { "name": "SelectedLepton_hcalIso", "type": "F", "collection": "lep", "slots": 3, "formula": "first_valid(ScoutingElectron_hcalIso, ScoutingMuonVtx_hcalIso, ScoutingMuonNoVtx_hcalIso)", "onlyMC": false }
           ],
           "extrema": [
+            {
+              "name": "ScoutingFatPFJetRecluster_WvsQCD_sum",
+              "type": "F",
+              "formula": "sum(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0))",
+              "onlyMC": false
+            },
+            {
+              "name": "ScoutingFatPFJetRecluster_VvsQCD_sum",
+              "type": "F",
+              "formula": "sum(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0))",
+              "onlyMC": false
+            },
+            {
+              "name": "ScoutingFatPFJetRecluster_WvsQCD_max",
+              "type": "F",
+              "formula": "max_value(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0), -99)",
+              "onlyMC": false
+            },
+            {
+              "name": "ScoutingFatPFJetRecluster_VvsQCD_max",
+              "type": "F",
+              "formula": "max_value(ak8, safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xud + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcs + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0), -99)",
+              "onlyMC": false
+            },
             {
               "name": "ScoutingPFJetRecluster2_scoutUParT_probb_max",
               "type": "F",
