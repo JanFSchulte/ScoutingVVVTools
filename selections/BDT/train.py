@@ -1298,6 +1298,28 @@ def _loss_components(predt, labels, weights, decor_state, num_class, lam, decor_
     }
 
 
+def _nn_loss_components_from_epoch_sums(epoch_sums, n_steps):
+    if int(n_steps) <= 0:
+        return {
+            "classification": float("nan"),
+            "mlogloss": float("nan"),
+            "decorrelation": float("nan"),
+            "regularization": 0.0,
+            "total": float("nan"),
+        }
+    inv = 1.0 / float(n_steps)
+    cls_loss = float(epoch_sums.get("classification", 0.0) * inv)
+    decor_loss = float(epoch_sums.get("decorrelation", 0.0) * inv)
+    reg_loss = float(epoch_sums.get("regularization", 0.0) * inv)
+    return {
+        "classification": cls_loss,
+        "mlogloss": cls_loss,
+        "decorrelation": decor_loss,
+        "regularization": reg_loss,
+        "total": float(cls_loss + decor_loss + reg_loss),
+    }
+
+
 def _make_multiclass_objective(num_class, decor_state, lam, decor_scale):
     def obj(predt, dtrain):
         labels = dtrain.get_label().astype(int)
@@ -2044,12 +2066,6 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
     use_decor = Z_train.shape[1] > 0 and DECOR_LAMBDA > 0.0
     if use_decor:
-        train_decor_state = _prepare_decor_state_for_labels(
-            _build_decor_state(Z_train, DECOR_LOSS_MODE), y_train, w_train, NUM_CLASSES
-        )
-        test_decor_state = _prepare_decor_state_for_labels(
-            _build_decor_state(Z_test, DECOR_LOSS_MODE), y_test, w_test, NUM_CLASSES
-        )
         decor_edges = _nn_build_decor_edges(torch, Z_train, device)
         prob_grid = np.linspace(0.02, 0.98, max(3, DECOR_N_THRESHOLDS))
         score_thresholds = torch.as_tensor(
@@ -2058,8 +2074,6 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
             device=device,
         )
     else:
-        train_decor_state = {"mode": "none"}
-        test_decor_state = {"mode": "none"}
         decor_edges = []
         score_thresholds = torch.zeros(1, dtype=torch.float32, device=device)
 
@@ -2087,25 +2101,115 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     def _make_optimizer(lr):
         return torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=weight_decay)
 
-    def _compute_history_entry(lam, decor_scale, train_state, test_state):
-        train_logits = _torch_predict_logits_numpy(torch, model, device, X_train_np, batch_size)
-        test_logits = _torch_predict_logits_numpy(torch, model, device, X_test_np, batch_size)
-        train_comp = _loss_components(
-            train_logits, y_train, w_train, train_state, NUM_CLASSES, lam, decor_scale,
-            prediction_mode="margin",
-        )
-        test_comp = _loss_components(
-            test_logits, y_test, w_test, test_state, NUM_CLASSES, lam, decor_scale,
-            prediction_mode="margin",
-        )
-        return train_comp, test_comp
+    def _torch_batch_loss(logits, labels, weights, Z_batch, lam, decor_scale):
+        ce = F.cross_entropy(logits, labels, reduction="none")
+        weight_sum = torch.clamp(torch.sum(weights), min=logits.new_tensor(_EPS))
+        cls_loss = torch.sum(weights * ce) / weight_sum
+        decor_loss = logits.new_tensor(0.0)
+        if lam > 0.0 and use_decor:
+            decor_raw = _torch_smooth_decor_loss(
+                torch,
+                logits,
+                labels,
+                weights,
+                Z_batch,
+                decor_edges,
+                score_thresholds,
+                DECOR_SCORE_TAU,
+            )
+            decor_loss = float(lam) * float(decor_scale) * decor_raw
+        return cls_loss + decor_loss, cls_loss, decor_loss
+
+    def _evaluate_torch_split(X_np, y_np, w_np, Z_np, lam, decor_scale):
+        model.eval()
+        epoch_sums = {
+            "classification": 0.0,
+            "decorrelation": 0.0,
+            "regularization": 0.0,
+            "total": 0.0,
+        }
+        n_steps_eval = 0
+        with torch.no_grad():
+            for start in range(0, X_np.shape[0], batch_size):
+                end = min(start + batch_size, X_np.shape[0])
+                if end <= start:
+                    continue
+                xb = torch.as_tensor(X_np[start:end], dtype=torch.float32, device=device)
+                yb = torch.as_tensor(y_np[start:end], dtype=torch.long, device=device)
+                wb = torch.as_tensor(w_np[start:end], dtype=torch.float32, device=device)
+                if use_decor:
+                    zb = torch.as_tensor(Z_np[start:end], dtype=torch.float32, device=device)
+                else:
+                    zb = None
+                total_loss, cls_loss, decor_loss = _torch_batch_loss(
+                    model(xb), yb, wb, zb, lam, decor_scale
+                )
+                epoch_sums["classification"] += float(cls_loss.detach().cpu().item())
+                epoch_sums["decorrelation"] += float(decor_loss.detach().cpu().item())
+                epoch_sums["total"] += float(total_loss.detach().cpu().item())
+                n_steps_eval += 1
+        return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)
+
+    def _batch_mean_ce_from_logits(logits_np, y_np, w_np):
+        epoch_sums = {
+            "classification": 0.0,
+            "decorrelation": 0.0,
+            "regularization": 0.0,
+            "total": 0.0,
+        }
+        n_steps_eval = 0
+        for start in range(0, len(y_np), batch_size):
+            end = min(start + batch_size, len(y_np))
+            if end <= start:
+                continue
+            _, _, _, cls_sum = _multiclass_classification_terms(
+                y_np[start:end],
+                logits_np[start:end],
+                w_np[start:end],
+                NUM_CLASSES,
+            )
+            epoch_sums["classification"] += _weighted_mlogloss(cls_sum, w_np[start:end])
+            n_steps_eval += 1
+        return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)["classification"]
+
+    def _batch_mean_raw_decor_from_logits(logits_np, y_np, w_np, Z_np):
+        if not use_decor:
+            return 0.0
+        raw_sum = 0.0
+        n_steps_eval = 0
+        with torch.no_grad():
+            for start in range(0, len(y_np), batch_size):
+                end = min(start + batch_size, len(y_np))
+                if end <= start:
+                    continue
+                logits_t = torch.as_tensor(
+                    logits_np[start:end], dtype=torch.float32, device=device
+                )
+                y_t = torch.as_tensor(y_np[start:end], dtype=torch.long, device=device)
+                w_t = torch.as_tensor(w_np[start:end], dtype=torch.float32, device=device)
+                Z_t = torch.as_tensor(Z_np[start:end], dtype=torch.float32, device=device)
+                decor_raw = _torch_smooth_decor_loss(
+                    torch,
+                    logits_t,
+                    y_t,
+                    w_t,
+                    Z_t,
+                    decor_edges,
+                    score_thresholds,
+                    DECOR_SCORE_TAU,
+                )
+                raw_sum += float(decor_raw.detach().cpu().item())
+                n_steps_eval += 1
+        if n_steps_eval <= 0:
+            return float("nan")
+        return raw_sum / float(n_steps_eval)
 
     def _append_history(history, train_comp, test_comp):
         for key in ("classification", "mlogloss", "decorrelation", "regularization", "total"):
             history["train"][key].append(float(train_comp[key]))
             history["test"][key].append(float(test_comp[key]))
 
-    def _run_stage(stage_label, n_epochs, lr, lam, decor_scale, train_state, test_state,
+    def _run_stage(stage_label, n_epochs, lr, lam, decor_scale,
                    monitor_metric_key, monitor_metric_label, compact_log):
         optimizer = _make_optimizer(lr)
         current_lr = float(lr)
@@ -2134,6 +2238,13 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         for epoch in range(int(n_epochs)):
             model.train()
             order = rng.permutation(n_train)
+            epoch_sums = {
+                "classification": 0.0,
+                "decorrelation": 0.0,
+                "regularization": 0.0,
+                "total": 0.0,
+            }
+            n_steps_update = 0
             for start in range(0, n_train, batch_size):
                 idx_np = order[start:start + batch_size]
                 if idx_np.size == 0:
@@ -2145,30 +2256,25 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 yb = y_train_t.index_select(0, idx)
                 wb = w_train_t.index_select(0, idx)
                 logits = model(xb)
-                ce = F.cross_entropy(logits, yb, reduction="none")
-                weight_sum = torch.clamp(torch.sum(wb), min=logits.new_tensor(_EPS))
-                cls_sum = torch.sum(wb * ce)
-                loss = cls_sum / weight_sum
-                if lam > 0.0 and use_decor:
+                if use_decor:
                     zb = Z_train_t.index_select(0, idx)
-                    decor_raw = _torch_smooth_decor_loss(
-                        torch,
-                        logits,
-                        yb,
-                        wb,
-                        zb,
-                        decor_edges,
-                        score_thresholds,
-                        DECOR_SCORE_TAU,
-                    )
-                    loss = loss + (float(lam) * float(decor_scale) * decor_raw) / weight_sum
+                else:
+                    zb = None
+                loss, cls_loss, decor_loss = _torch_batch_loss(
+                    logits, yb, wb, zb, lam, decor_scale
+                )
+                epoch_sums["classification"] += float(cls_loss.detach().cpu().item())
+                epoch_sums["decorrelation"] += float(decor_loss.detach().cpu().item())
+                epoch_sums["total"] += float(loss.detach().cpu().item())
+                n_steps_update += 1
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if grad_clip_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-            train_comp, test_comp = _compute_history_entry(lam, decor_scale, train_state, test_state)
+            train_comp = _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_update)
+            test_comp = _evaluate_torch_split(X_test_np, y_test, w_test, Z_test, lam, decor_scale)
             _append_history(history, train_comp, test_comp)
             prefix = f"[{stage_label}]"
             log_message(_format_detailed_loss_line(
@@ -2232,10 +2338,8 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         learning_rate,
         0.0,
         1.0,
-        {"mode": "none"},
-        {"mode": "none"},
-        "classification",
-        "classification_loss",
+        "mlogloss",
+        "mlogloss",
         True,
     )
 
@@ -2278,13 +2382,8 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
     # ---------- Stage 2: classification + smooth-CvM decorrelation ----------
     stage1_logits = _torch_predict_logits_numpy(torch, model, device, X_train_np, batch_size)
-    _, _, _, cls_loss_ref = _multiclass_classification_terms(
-        y_train, stage1_logits, w_train, NUM_CLASSES
-    )
-    decor_loss_ref_raw, _, _ = _decorrelation_loss_components(
-        stage1_logits, y_train, w_train, train_decor_state, NUM_CLASSES,
-        decor_scale=1.0, need_derivatives=False,
-    )
+    cls_loss_ref = _batch_mean_ce_from_logits(stage1_logits, y_train, w_train)
+    decor_loss_ref_raw = _batch_mean_raw_decor_from_logits(stage1_logits, y_train, w_train, Z_train)
     if not np.isfinite(decor_loss_ref_raw) or decor_loss_ref_raw <= _EPS:
         raise RuntimeError(
             f"Stage-1 raw decorrelation loss is non-positive ({decor_loss_ref_raw:.6g}); "
@@ -2307,8 +2406,6 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         learning_rate_decorr,
         DECOR_LAMBDA,
         decor_scale,
-        train_decor_state,
-        test_decor_state,
         "total",
         "total_loss",
         False,
