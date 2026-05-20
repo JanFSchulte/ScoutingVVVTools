@@ -1320,6 +1320,19 @@ def _nn_loss_components_from_epoch_sums(epoch_sums, n_steps):
     }
 
 
+def _nn_loss_components_from_values(cls_loss, decor_loss=0.0, reg_loss=0.0):
+    cls_loss = float(cls_loss)
+    decor_loss = float(decor_loss)
+    reg_loss = float(reg_loss)
+    return {
+        "classification": cls_loss,
+        "mlogloss": cls_loss,
+        "decorrelation": decor_loss,
+        "regularization": reg_loss,
+        "total": float(cls_loss + decor_loss + reg_loss),
+    }
+
+
 def _make_multiclass_objective(num_class, decor_state, lam, decor_scale):
     def obj(predt, dtrain):
         labels = dtrain.get_label().astype(int)
@@ -1982,7 +1995,7 @@ def _save_nn_checkpoint(torch, path, model, feature_names, hp, input_dim):
         "hidden_layers": [int(v) for v in hp.get("hidden_layers", [])],
         "activation": str(hp.get("activation", "silu")),
         "dropout": float(hp.get("dropout", 0.0)),
-        "batch_norm": bool(hp.get("batch_norm", True)),
+        "batch_norm": bool(hp.get("batch_norm", False)),
         "state_dict": _torch_state_copy(model),
         "training_config": dict(hp),
         "class_names": list(CLASS_NAMES),
@@ -2051,8 +2064,8 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     lr_reduce_patience = int(hp.get("lr_reduce_patience", 0))
     early_stopping_rounds = int(hp.get("early_stopping_rounds", 10))
     weight_decay = float(hp.get("weight_decay", 0.0))
-    grad_clip_norm = float(hp.get("grad_clip_norm", 5.0))
-    batch_norm = bool(hp.get("batch_norm", True))
+    grad_clip_norm = float(hp.get("grad_clip_norm", 0.0))
+    batch_norm = bool(hp.get("batch_norm", False))
     if early_stopping_rounds <= 0:
         raise ValueError(
             f"early_stopping_rounds must be a positive integer, got {early_stopping_rounds}"
@@ -2091,6 +2104,11 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         f"Thread mode: PyTorch, device = {device}, batch_size = {batch_size}, "
         f"hidden_layers = {hidden_layers}"
     )
+    log_message(
+        "NN loss diagnostics: train-update is the train-mode mini-batch loss used "
+        "for backward(); train-eval/test-eval are eval-mode full-split weighted CE "
+        "computed as sum(w*CE)/sum(w)."
+    )
 
     splits = (X_train_all, X_test_all, y_train, y_test, w_train, w_test)
 
@@ -2122,13 +2140,10 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
     def _evaluate_torch_split(X_np, y_np, w_np, Z_np, lam, decor_scale):
         model.eval()
-        epoch_sums = {
-            "classification": 0.0,
-            "decorrelation": 0.0,
-            "regularization": 0.0,
-            "total": 0.0,
-        }
-        n_steps_eval = 0
+        cls_sum = 0.0
+        weight_sum = 0.0
+        decor_sum = 0.0
+        n_decor_steps = 0
         with torch.no_grad():
             for start in range(0, X_np.shape[0], batch_size):
                 end = min(start + batch_size, X_np.shape[0])
@@ -2141,36 +2156,48 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                     zb = torch.as_tensor(Z_np[start:end], dtype=torch.float32, device=device)
                 else:
                     zb = None
-                total_loss, cls_loss, decor_loss = _torch_batch_loss(
-                    model(xb), yb, wb, zb, lam, decor_scale
-                )
-                epoch_sums["classification"] += float(cls_loss.detach().cpu().item())
-                epoch_sums["decorrelation"] += float(decor_loss.detach().cpu().item())
-                epoch_sums["total"] += float(total_loss.detach().cpu().item())
-                n_steps_eval += 1
-        return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)
+                logits = model(xb)
+                ce = F.cross_entropy(logits, yb, reduction="none")
+                cls_sum += float(torch.sum(wb * ce).detach().cpu().item())
+                weight_sum += float(torch.sum(wb).detach().cpu().item())
+                if lam > 0.0 and use_decor:
+                    decor_raw = _torch_smooth_decor_loss(
+                        torch,
+                        logits,
+                        yb,
+                        wb,
+                        zb,
+                        decor_edges,
+                        score_thresholds,
+                        DECOR_SCORE_TAU,
+                    )
+                    decor_sum += float((float(lam) * float(decor_scale) * decor_raw).detach().cpu().item())
+                    n_decor_steps += 1
+        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+            cls_loss = float("nan")
+        else:
+            cls_loss = cls_sum / weight_sum
+        decor_loss = decor_sum / float(n_decor_steps) if n_decor_steps > 0 else 0.0
+        return _nn_loss_components_from_values(cls_loss, decor_loss)
 
-    def _batch_mean_ce_from_logits(logits_np, y_np, w_np):
-        epoch_sums = {
-            "classification": 0.0,
-            "decorrelation": 0.0,
-            "regularization": 0.0,
-            "total": 0.0,
-        }
-        n_steps_eval = 0
+    def _full_sample_ce_from_logits(logits_np, y_np, w_np):
+        cls_loss_sum = 0.0
+        weight_sum = 0.0
         for start in range(0, len(y_np), batch_size):
             end = min(start + batch_size, len(y_np))
             if end <= start:
                 continue
-            _, _, _, cls_sum = _multiclass_classification_terms(
+            _, _, _, batch_cls_sum = _multiclass_classification_terms(
                 y_np[start:end],
                 logits_np[start:end],
                 w_np[start:end],
                 NUM_CLASSES,
             )
-            epoch_sums["classification"] += _weighted_mlogloss(cls_sum, w_np[start:end])
-            n_steps_eval += 1
-        return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)["classification"]
+            cls_loss_sum += float(batch_cls_sum)
+            weight_sum += float(np.sum(w_np[start:end]))
+        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+            return float("nan")
+        return cls_loss_sum / weight_sum
 
     def _batch_mean_raw_decor_from_logits(logits_np, y_np, w_np, Z_np):
         if not use_decor:
@@ -2203,6 +2230,29 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         if n_steps_eval <= 0:
             return float("nan")
         return raw_sum / float(n_steps_eval)
+
+    def _format_nn_loss_line(epoch, stage_label, update_comp, train_eval_comp, test_eval_comp,
+                             compact=False):
+        head = f"[{stage_label}][{epoch}]"
+        if compact:
+            return (
+                f"{head}"
+                f"\ttrain-update-weighted_ce_loss:{update_comp['classification']:.5f}"
+                f"\ttrain-eval-weighted_ce_loss:{train_eval_comp['classification']:.5f}"
+                f"\ttest-eval-weighted_ce_loss:{test_eval_comp['classification']:.5f}"
+            )
+        return (
+            f"{head}"
+            f"\ttrain-update-weighted_ce_loss:{update_comp['classification']:.5f}"
+            f"\ttrain-update-decorrelation_loss:{update_comp['decorrelation']:.5f}"
+            f"\ttrain-update-total_loss:{update_comp['total']:.5f}"
+            f"\ttrain-eval-weighted_ce_loss:{train_eval_comp['classification']:.5f}"
+            f"\ttrain-eval-decorrelation_loss:{train_eval_comp['decorrelation']:.5f}"
+            f"\ttrain-eval-total_loss:{train_eval_comp['total']:.5f}"
+            f"\ttest-eval-weighted_ce_loss:{test_eval_comp['classification']:.5f}"
+            f"\ttest-eval-decorrelation_loss:{test_eval_comp['decorrelation']:.5f}"
+            f"\ttest-eval-total_loss:{test_eval_comp['total']:.5f}"
+        )
 
     def _append_history(history, train_comp, test_comp):
         for key in ("classification", "mlogloss", "decorrelation", "regularization", "total"):
@@ -2273,12 +2323,12 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-            train_comp = _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_update)
+            update_comp = _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_update)
+            train_comp = _evaluate_torch_split(X_train_np, y_train, w_train, Z_train, lam, decor_scale)
             test_comp = _evaluate_torch_split(X_test_np, y_test, w_test, Z_test, lam, decor_scale)
             _append_history(history, train_comp, test_comp)
-            prefix = f"[{stage_label}]"
-            log_message(_format_detailed_loss_line(
-                epoch, history, prefix=prefix, compact=compact_log
+            log_message(_format_nn_loss_line(
+                epoch, stage_label, update_comp, train_comp, test_comp, compact=compact_log
             ))
 
             current_score = _loss_value_at(history, "test", monitor_metric_key, epoch)
@@ -2338,8 +2388,8 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         learning_rate,
         0.0,
         1.0,
-        "mlogloss",
-        "mlogloss",
+        "classification",
+        "weighted_ce_loss",
         True,
     )
 
@@ -2382,7 +2432,7 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
     # ---------- Stage 2: classification + smooth-CvM decorrelation ----------
     stage1_logits = _torch_predict_logits_numpy(torch, model, device, X_train_np, batch_size)
-    cls_loss_ref = _batch_mean_ce_from_logits(stage1_logits, y_train, w_train)
+    cls_loss_ref = _full_sample_ce_from_logits(stage1_logits, y_train, w_train)
     decor_loss_ref_raw = _batch_mean_raw_decor_from_logits(stage1_logits, y_train, w_train, Z_train)
     if not np.isfinite(decor_loss_ref_raw) or decor_loss_ref_raw <= _EPS:
         raise RuntimeError(
@@ -2459,8 +2509,9 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     Model-dependent plots (ROC, importance, score distributions, decor_corr,
     and decor diagnostic multipage PDFs) are saved twice with ``_cls`` /
     ``_decorr`` suffixes (for the stage-1 baseline and stage-2 final model
-    respectively). ``feature_corr.pdf`` and the shared ``loss_mlogloss.pdf`` /
-    ``loss_classification.pdf`` / ``loss_decorrelation.pdf`` /
+    respectively). ``feature_corr.pdf`` and the shared BDT
+    ``loss_mlogloss.pdf`` / ``loss_classification.pdf`` or NN
+    ``loss_weighted_ce.pdf`` plus ``loss_decorrelation.pdf`` /
     ``loss_total.pdf`` files are saved once. ``stage_boundary`` is the number
     of stage-1 iterations kept; it is drawn as a dotted vertical line on the
     loss curves.
@@ -2511,6 +2562,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
 
     n_classes = NUM_CLASSES
     class_names = CLASS_NAMES
+    is_nn_model = isinstance(stage1_model, TorchModelHandle) or isinstance(stage2_model, TorchModelHandle)
     palette = plt.cm.get_cmap("tab10", max(n_classes, 3))(np.arange(max(n_classes, 3)))
 
     def _savefig(stem, fig=None, tight=True):
@@ -3134,7 +3186,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 color="gray", linestyle=":", alpha=0.7,
                 label="stage 2 start",
             )
-        ax.set_xlabel("Boosting Round")
+        ax.set_xlabel("Epoch" if is_nn_model else "Boosting Round")
         ax.set_ylabel(ylabel)
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend()
@@ -3149,8 +3201,11 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             ax.set_ylim(bottom=0.0)
         _savefig(stem, fig=fig)
 
-    _plot_loss_metric("classification", "classification_loss", "loss_classification")
-    _plot_loss_metric("mlogloss", "mlogloss", "loss_mlogloss")
+    if is_nn_model:
+        _plot_loss_metric("classification", "weighted_ce_loss", "loss_weighted_ce")
+    else:
+        _plot_loss_metric("classification", "classification_loss", "loss_classification")
+        _plot_loss_metric("mlogloss", "mlogloss", "loss_mlogloss")
     _plot_loss_metric("decorrelation", "decorrelation_loss", "loss_decorrelation")
     _plot_loss_metric("total", "total_loss", "loss_total")
 

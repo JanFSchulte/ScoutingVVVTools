@@ -45,7 +45,7 @@ def import_torch():
 
 
 def build_torch_mlp(nn, input_dim, hidden_layers, output_dim, activation="silu",
-                    dropout=0.0, batch_norm=True):
+                    dropout=0.0, batch_norm=False):
     activation_key = str(activation).strip().lower()
     activation_map = {
         "relu": nn.ReLU,
@@ -129,7 +129,7 @@ def load_torch_model(path, num_classes, device=None):
         output_dim=int(num_classes),
         activation=checkpoint.get("activation", "silu"),
         dropout=float(checkpoint.get("dropout", 0.0)),
-        batch_norm=bool(checkpoint.get("batch_norm", True)),
+        batch_norm=bool(checkpoint.get("batch_norm", False)),
     )
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
