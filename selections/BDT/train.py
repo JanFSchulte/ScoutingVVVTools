@@ -2554,7 +2554,8 @@ def _predict_proba(model, Xlike):
 
 def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                  loss_history, stage_boundary, decorrelate_feature_names=None,
-                 decor_plot_X_test=None, decor_efficiencies=None):
+                 decor_plot_X_test=None, decor_efficiencies=None,
+                 eval_splits=None):
     """ROC curves, feature importance, score distributions, loss curves, and decorrelation checks.
 
     Model-dependent plots (ROC, importance, score distributions, decor_corr,
@@ -2565,12 +2566,32 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     or NN ``loss_weighted_ce.pdf`` / ``loss_objective.pdf`` plus
     ``loss_decorrelation.pdf`` files are saved once. ``stage_boundary`` is the
     number of stage-1 iterations kept; it is drawn as a dotted vertical line
-    on the loss curves.
+    on the loss curves. ``splits`` are the training-objective splits; when
+    ``eval_splits`` is provided, ordinary ROC, score, importance, and feature
+    correlation plots use those full-threshold evaluation splits while
+    decorrelation diagnostics keep using ``splits``.
     """
-    X_train_full, X_test_full, y_train, y_test, w_train, w_test = splits
+    (
+        X_train_decor_full,
+        X_test_decor_full,
+        y_train_decor,
+        y_test_decor,
+        w_train_decor,
+        w_test_decor,
+    ) = splits
+    if eval_splits is None:
+        eval_splits = splits
+    (
+        X_train_eval_full,
+        X_test_eval_full,
+        y_train_eval,
+        y_test_eval,
+        w_train_eval,
+        w_test_eval,
+    ) = eval_splits
 
-    full_feature_names = list(X_train_full.columns) if hasattr(X_train_full, "columns") \
-        else [f"f{i}" for i in range(X_train_full.shape[1])]
+    full_feature_names = list(X_train_decor_full.columns) if hasattr(X_train_decor_full, "columns") \
+        else [f"f{i}" for i in range(X_train_decor_full.shape[1])]
 
     def _resolve(names_or_idx):
         if not names_or_idx:
@@ -2600,14 +2621,17 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     def _slice(Xlike, idx):
         return Xlike.iloc[:, idx] if hasattr(Xlike, "iloc") else Xlike[:, idx]
 
-    X_train_used = _slice(X_train_full, keep_idx)
-    X_test_used = _slice(X_test_full, keep_idx)
+    X_train_decor_used = _slice(X_train_decor_full, keep_idx)
+    X_test_decor_used = _slice(X_test_decor_full, keep_idx)
+    X_train_eval_used = _slice(X_train_eval_full, keep_idx)
+    X_test_eval_used = _slice(X_test_eval_full, keep_idx)
     feat_names_used = [full_feature_names[i] for i in keep_idx]
 
     booster_ref = _booster_from_model(stage1_model if stage1_model is not None else stage2_model)
     booster_features = (booster_ref.feature_names or []) if booster_ref is not None else []
     if booster_features and len(booster_features) == len(full_feature_names):
-        X_train_used, X_test_used = X_train_full, X_test_full
+        X_train_decor_used, X_test_decor_used = X_train_decor_full, X_test_decor_full
+        X_train_eval_used, X_test_eval_used = X_train_eval_full, X_test_eval_full
         feat_names_used = full_feature_names
         decor_idx_full = []
 
@@ -2828,8 +2852,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 f"{tree_name} [{stage_tag}] no valid decorrelation plot data for score-vs-branch PDF"
             )
         scores = np.asarray(scores, dtype=float)
-        y_true = np.asarray(y_test, dtype=int)
-        wv_all = np.asarray(w_test, dtype=float)
+        y_true = np.asarray(y_test_decor, dtype=int)
+        wv_all = np.asarray(w_test_decor, dtype=float)
         path = _figure_path(output_root, f"decor_score_vs_branch{suffix}")
         pdf_state = {"pdf": None, "pages": 0}
         for cls_idx, cls_name in enumerate(class_names):
@@ -2895,8 +2919,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 f"{tree_name} [{stage_tag}] cannot build signal-score-shape PDF without signal classes"
             )
         scores = np.asarray(scores, dtype=float)
-        y_true = np.asarray(y_test, dtype=int)
-        wv_all = np.asarray(w_test, dtype=float)
+        y_true = np.asarray(y_test_decor, dtype=int)
+        wv_all = np.asarray(w_test_decor, dtype=float)
         path = _figure_path(output_root, f"decor_branch_shapes_by_signal_score{suffix}")
         pdf_state = {"pdf": None, "pages": 0}
         colors = plt.cm.get_cmap("viridis", max(len(decor_efficiencies), 2))(
@@ -3023,10 +3047,11 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     def _plot_for_model(model, suffix, stage_tag):
         if model is None:
             return
-        probs_train = _predict_proba(model, X_train_used)
-        probs_test = _predict_proba(model, X_test_used)
-        margins_train = _predict_margins(model, X_train_used)
-        margins_test = _predict_margins(model, X_test_used)
+        probs_train = _predict_proba(model, X_train_eval_used)
+        probs_test = _predict_proba(model, X_test_eval_used)
+        probs_test_decor = _predict_proba(model, X_test_decor_used)
+        margins_train_decor = _predict_margins(model, X_train_decor_used)
+        margins_test_decor = _predict_margins(model, X_test_decor_used)
         booster = _booster_from_model(model)
 
         # ROC plots
@@ -3042,11 +3067,11 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 score_test = probs_test[:, sig_idx] / np.clip(
                     probs_test[:, sig_idx] + probs_test[:, bkg_idx], _EPS, None
                 )
-                mask_train = (y_train == sig_idx) | (y_train == bkg_idx)
-                mask_test = (y_test == sig_idx) | (y_test == bkg_idx)
+                mask_train = (y_train_eval == sig_idx) | (y_train_eval == bkg_idx)
+                mask_test = (y_test_eval == sig_idx) | (y_test_eval == bkg_idx)
                 color = palette[bkg_idx]
-                r_tst = _roc_binary(mask_test, score_test, y_test, w_test, sig_idx)
-                r_trn = _roc_binary(mask_train, score_train, y_train, w_train, sig_idx)
+                r_tst = _roc_binary(mask_test, score_test, y_test_eval, w_test_eval, sig_idx)
+                r_trn = _roc_binary(mask_train, score_train, y_train_eval, w_train_eval, sig_idx)
                 if r_tst:
                     fpr, tpr, auc = r_tst
                     ax.plot(tpr, fpr, color=color, linestyle="-",
@@ -3079,7 +3104,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
 
         # Importance plot
         if isinstance(model, TorchModelHandle):
-            importances = _permutation_importance(model, X_test_used, y_test, w_test)
+            importances = _permutation_importance(model, X_test_eval_used, y_test_eval, w_test_eval)
             importance_label = "Permutation loss increase"
         else:
             score_map = booster.get_score(importance_type="gain")
@@ -3125,33 +3150,33 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             score_test = probs_test[:, sig_idx] / np.clip(
                 probs_test[:, sig_idx] + probs_test[:, bkg_idx], _EPS, None
             )
-            mask_train = (y_train == sig_idx) | (y_train == bkg_idx)
-            mask_test = (y_test == sig_idx) | (y_test == bkg_idx)
+            mask_train = (y_train_eval == sig_idx) | (y_train_eval == bkg_idx)
+            mask_test = (y_test_eval == sig_idx) | (y_test_eval == bkg_idx)
             bins = np.linspace(0, 1, 31)
             fig, ax = plt.subplots(figsize=(8, 6))
             ax.set_xlim(0, 1)
             ax.hist(
-                score_train[mask_train & (y_train == bkg_idx)],
+                score_train[mask_train & (y_train_eval == bkg_idx)],
                 bins=bins,
-                weights=w_train[mask_train & (y_train == bkg_idx)],
+                weights=w_train_eval[mask_train & (y_train_eval == bkg_idx)],
                 density=True,
                 histtype="bar",
                 alpha=0.5,
                 label=f"Train {bkg_name}",
             )
             ax.hist(
-                score_train[mask_train & (y_train == sig_idx)],
+                score_train[mask_train & (y_train_eval == sig_idx)],
                 bins=bins,
-                weights=w_train[mask_train & (y_train == sig_idx)],
+                weights=w_train_eval[mask_train & (y_train_eval == sig_idx)],
                 density=True,
                 histtype="bar",
                 alpha=0.5,
                 label=f"Train {sig_name}",
             )
             ax.hist(
-                score_test[mask_test & (y_test == bkg_idx)],
+                score_test[mask_test & (y_test_eval == bkg_idx)],
                 bins=bins,
-                weights=w_test[mask_test & (y_test == bkg_idx)],
+                weights=w_test_eval[mask_test & (y_test_eval == bkg_idx)],
                 density=True,
                 histtype="step",
                 linewidth=2,
@@ -3159,9 +3184,9 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 label=f"Test {bkg_name}",
             )
             ax.hist(
-                score_test[mask_test & (y_test == sig_idx)],
+                score_test[mask_test & (y_test_eval == sig_idx)],
                 bins=bins,
-                weights=w_test[mask_test & (y_test == sig_idx)],
+                weights=w_test_eval[mask_test & (y_test_eval == sig_idx)],
                 density=True,
                 histtype="step",
                 linewidth=2,
@@ -3194,8 +3219,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 return R
 
             for tag, scores, Xfull, y_true, wv in [
-                ("train", margins_train, X_train_full, y_train, w_train),
-                ("test", margins_test, X_test_full, y_test, w_test),
+                ("train", margins_train_decor, X_train_decor_full, y_train_decor, w_train_decor),
+                ("test", margins_test_decor, X_test_decor_full, y_test_decor, w_test_decor),
             ]:
                 R = _build_corr_matrix(scores, Xfull, y_true, wv)
                 _plot_matrix_heatmap(
@@ -3213,8 +3238,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                     )
                     log_message(f"{tree_name} [{stage_tag}] {tag} decor corr [{cls_name}] {stats}")
 
-        _plot_score_vs_decor_pdf(probs_test, suffix, stage_tag)
-        _plot_decor_shape_by_score_pdf(probs_test, suffix, stage_tag)
+        _plot_score_vs_decor_pdf(probs_test_decor, suffix, stage_tag)
+        _plot_decor_shape_by_score_pdf(probs_test_decor, suffix, stage_tag)
 
     _plot_for_model(stage1_model, "_cls", "stage1")
     _plot_for_model(stage2_model, "_decorr", "stage2")
@@ -3261,7 +3286,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         _plot_loss_metric("total", "total_loss", "loss_total")
     _plot_loss_metric("decorrelation", "decorrelation_loss", "loss_decorrelation")
 
-    X_tr_df = pd.DataFrame(_as_array(X_train_used), columns=feat_names_used)
+    X_tr_df = pd.DataFrame(_as_array(X_train_eval_used), columns=feat_names_used)
     corr = X_tr_df.corr(numeric_only=True).dropna(axis=0, how="all").dropna(axis=1, how="all")
     if not corr.empty:
         _plot_matrix_heatmap(
@@ -3301,6 +3326,22 @@ def _split_mass_thresholds(thresholds):
         else:
             other_thresholds[name] = cond
     return mass_thresholds, other_thresholds
+
+
+def _split_training_thresholds(thresholds, decorrelate_feature_names):
+    decor_threshold_names = {
+        str(name) for name in decorrelate_feature_names
+        if not isinstance(name, (int, np.integer)) and str(name) in thresholds
+    }
+    training_thresholds = {
+        name: cond for name, cond in thresholds.items()
+        if name not in decor_threshold_names
+    }
+    decor_thresholds = {
+        name: cond for name, cond in thresholds.items()
+        if name in decor_threshold_names
+    }
+    return training_thresholds, decor_thresholds
 
 
 def _drop_decorrelated_features(X, decorrelate_feature_names):
@@ -3358,6 +3399,7 @@ def main():
         thresholds = {k: (tuple(v) if isinstance(v, list) else v)
                       for k, v in sel.get("thresholds", {}).items()}
         decorrelate = cfg.get(tree_name, {}).get("decorrelate", [])
+        training_thresholds, decor_thresholds = _split_training_thresholds(thresholds, decorrelate)
         model_path = MODEL_PATTERN.format(output_root=output_root, tree_name=tree_name)
 
         # Threshold and decorrelate branches that are NOT declared in branch.json
@@ -3376,6 +3418,11 @@ def main():
             f"Running train.py for tree = {tree_name}, output = {output_root}, "
             f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
         )
+        if decor_thresholds:
+            log_message(
+                f"Training threshold override for tree = {tree_name}: excluding decorrelate "
+                f"threshold(s) from training/eval loss only: {', '.join(decor_thresholds.keys())}"
+            )
         split_plans = build_split_plans(tree_name)
         write_config_copy(output_root)
         write_branch_copy(output_root)
@@ -3400,18 +3447,47 @@ def main():
         w_test_physics_unfiltered = w_test_physics.copy()
         sample_labels_test_unfiltered = np.asarray(sample_labels_test).copy()
 
-        log_message(f"Applying thresholds for training split of tree = {tree_name}")
+        log_message(f"Applying training thresholds for training split of tree = {tree_name}")
         X_train, y_train, w_train, sample_labels_train = filter_X(
-            X_train, y_train, w_train, load_cols, thresholds, apply_to_sentinel=True,
+            X_train, y_train, w_train, load_cols, training_thresholds, apply_to_sentinel=True,
             sample_labels=sample_labels_train
         )
-        _validate_filtered_split(tree_name, "train", y_train, w_train, sample_labels_train)
-        w_train = _rebalance_filtered_weights("train", y_train, w_train, sample_labels_train)
-        check_weights(w_train, f"{tree_name}_train_weight_after_filter")
+        _validate_filtered_split(
+            tree_name,
+            "train (training thresholds)",
+            y_train,
+            w_train,
+            sample_labels_train,
+        )
 
-        log_message(f"Applying thresholds for test split of tree = {tree_name}")
+        X_train_eval, y_train_eval, w_train_eval, sample_labels_train_eval = filter_X(
+            X_train, y_train, w_train, load_cols, decor_thresholds, apply_to_sentinel=True,
+            sample_labels=sample_labels_train
+        )
+        _validate_filtered_split(
+            tree_name,
+            "train (full evaluation thresholds)",
+            y_train_eval,
+            w_train_eval,
+            sample_labels_train_eval,
+        )
+        w_train = _rebalance_filtered_weights("train", y_train, w_train, sample_labels_train)
+        w_train_eval = _rebalance_filtered_weights(
+            "train (full evaluation thresholds)",
+            y_train_eval,
+            w_train_eval,
+            sample_labels_train_eval,
+        )
+        check_weights(w_train, f"{tree_name}_train_weight_after_filter")
+        check_weights(w_train_eval, f"{tree_name}_train_eval_weight_after_filter")
+
+        log_message(f"Applying training thresholds for test split of tree = {tree_name}")
         X_test, y_test, w_test, sample_labels_test = filter_X(
-            X_test, y_test, w_test, load_cols, thresholds, apply_to_sentinel=True,
+            X_test, y_test, w_test, load_cols, training_thresholds, apply_to_sentinel=True,
+            sample_labels=sample_labels_test
+        )
+        X_test_eval, y_test_eval, w_test_eval, sample_labels_test_eval = filter_X(
+            X_test, y_test, w_test, load_cols, decor_thresholds, apply_to_sentinel=True,
             sample_labels=sample_labels_test
         )
         X_test_ref, y_test_ref, w_test_ref, sample_labels_test_ref = filter_X(
@@ -3423,11 +3499,36 @@ def main():
             apply_to_sentinel=True,
             sample_labels=sample_labels_test_unfiltered.copy(),
         )
-        if not X_test_ref.index.equals(X_test.index):
-            raise RuntimeError("Filtered model/reference test splits are misaligned")
-        _validate_filtered_split(tree_name, "test", y_test, w_test, sample_labels_test)
+        if not X_test_ref.index.equals(X_test_eval.index):
+            raise RuntimeError("Filtered evaluation/reference test splits are misaligned")
+        if (
+            not np.array_equal(y_test_ref, y_test_eval)
+            or not np.array_equal(sample_labels_test_ref, sample_labels_test_eval)
+        ):
+            raise RuntimeError("Filtered evaluation/reference test labels are misaligned")
+        _validate_filtered_split(
+            tree_name,
+            "test (training thresholds)",
+            y_test,
+            w_test,
+            sample_labels_test,
+        )
+        _validate_filtered_split(
+            tree_name,
+            "test (full evaluation thresholds)",
+            y_test_eval,
+            w_test_eval,
+            sample_labels_test_eval,
+        )
         w_test = _rebalance_filtered_weights("test", y_test, w_test, sample_labels_test)
+        w_test_eval = _rebalance_filtered_weights(
+            "test (full evaluation thresholds)",
+            y_test_eval,
+            w_test_eval,
+            sample_labels_test_eval,
+        )
         check_weights(w_test, f"{tree_name}_test_weight_after_filter")
+        check_weights(w_test_eval, f"{tree_name}_test_eval_weight_after_filter")
         check_weights(w_test_ref, f"{tree_name}_test_physics_weight_after_filter")
 
         decor_plot_cols = [c for c in decorrelate if c in X_test.columns]
@@ -3439,19 +3540,24 @@ def main():
         if drop_after_filter:
             X_train = X_train.drop(columns=drop_after_filter, errors="ignore")
             X_test = X_test.drop(columns=drop_after_filter, errors="ignore")
+            X_train_eval = X_train_eval.drop(columns=drop_after_filter, errors="ignore")
+            X_test_eval = X_test_eval.drop(columns=drop_after_filter, errors="ignore")
             X_test_ref = X_test_ref.drop(columns=drop_after_filter, errors="ignore")
 
         log_message(f"Plotting input branch distributions for tree = {tree_name}")
         plot_branch_distributions(
             output_root, branches, clip_ranges,
-            X_train, y_train, w_train, sample_labels_train,
-            X_test, y_test, w_test, sample_labels_test,
+            X_train_eval, y_train_eval, w_train_eval, sample_labels_train_eval,
+            X_test_eval, y_test_eval, w_test_eval, sample_labels_test_eval,
         )
 
         log_message(f"Standardising training split for tree = {tree_name}")
         X_train_std = standardize_X(X_train.copy(), clip_ranges, log_tf)
         log_message(f"Standardising test split for tree = {tree_name}")
         X_test_std = standardize_X(X_test.copy(), clip_ranges, log_tf)
+        log_message(f"Standardising full-threshold evaluation splits for tree = {tree_name}")
+        X_train_eval_std = standardize_X(X_train_eval.copy(), clip_ranges, log_tf)
+        X_test_eval_std = standardize_X(X_test_eval.copy(), clip_ranges, log_tf)
 
         log_message(f"Training model for tree = {tree_name}")
         if MODEL_TYPE == "nn":
@@ -3486,7 +3592,7 @@ def main():
         )
         del X_test_qcd_full_model, proba_qcd_full_test
 
-        X_test_signal_model = _drop_decorrelated_features(X_test_std, decorrelate)
+        X_test_signal_model = _drop_decorrelated_features(X_test_eval_std, decorrelate)
         proba_signal_test = _predict_proba(final_model, X_test_signal_model)
         _write_prediction_reference(
             output_root,
@@ -3552,6 +3658,14 @@ def main():
             decorrelate_feature_names=decorrelate,
             decor_plot_X_test=X_test_decor_plot,
             decor_efficiencies=_decor_efficiencies_for_tree(tree_name),
+            eval_splits=(
+                X_train_eval_std,
+                X_test_eval_std,
+                y_train_eval,
+                y_test_eval,
+                w_train_eval,
+                w_test_eval,
+            ),
         )
         log_message(f"Finished train.py for tree = {tree_name}")
 
