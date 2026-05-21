@@ -327,6 +327,7 @@ struct YieldCov {
 struct ChannelData {
     std::string name;
     int n_sr = 0;
+    std::vector<int> sr_ids;
     std::map<std::string, YieldCov> sample;       // per MC sample (MC true)
     std::map<std::string, YieldCov> group;        // per BDT class (MC true)
     YieldCov qcd_predict;                         // merged ABCD QCD prediction
@@ -344,7 +345,64 @@ double readOneBinHist(TFile& f, const std::string& path) {
     return h->GetBinContent(1);
 }
 
-YieldCov readYieldCov(TFile& f, const std::string& prefix) {
+std::vector<int> defaultSignalRegionIds(int n) {
+    std::vector<int> out;
+    out.reserve(std::max(n, 0));
+    for (int i = 0; i < n; ++i) out.push_back(i + 1);
+    return out;
+}
+
+std::vector<int> readSignalRegionIds(TFile& f) {
+    TTree* t = dynamic_cast<TTree*>(f.Get("metadata/signal_regions"));
+    if (t == nullptr) return {};
+
+    int bin_index = 0;
+    if (t->GetBranch("bin_index") == nullptr) {
+        throw std::runtime_error(
+            "metadata/signal_regions in " + std::string(f.GetName()) +
+            " is missing required branch 'bin_index'");
+    }
+    t->SetBranchAddress("bin_index", &bin_index);
+
+    std::vector<int> ids;
+    std::set<int> seen;
+    const Long64_t n = t->GetEntries();
+    if (n <= 0) {
+        throw std::runtime_error(
+            "metadata/signal_regions in " + std::string(f.GetName()) +
+            " must contain at least one row");
+    }
+    ids.reserve(static_cast<size_t>(n));
+    for (Long64_t i = 0; i < n; ++i) {
+        t->GetEntry(i);
+        if (bin_index <= 0) {
+            throw std::runtime_error(
+                "metadata/signal_regions in " + std::string(f.GetName()) +
+                " contains a non-positive bin_index");
+        }
+        if (!seen.insert(bin_index).second) {
+            throw std::runtime_error(
+                "metadata/signal_regions in " + std::string(f.GetName()) +
+                " contains duplicate bin_index=" + std::to_string(bin_index));
+        }
+        ids.push_back(bin_index);
+    }
+    return ids;
+}
+
+std::string formatSignalRegionIds(const std::vector<int>& ids) {
+    std::ostringstream os;
+    os << "[";
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i) os << ",";
+        os << ids[i];
+    }
+    os << "]";
+    return os.str();
+}
+
+YieldCov readYieldCov(TFile& f, const std::string& prefix,
+                      const std::vector<int>& signal_region_ids) {
     // TFile owns the returned histograms; just copy the contents out.
     TH2* h2 = dynamic_cast<TH2*>(f.Get((prefix + "/covariance_total").c_str()));
     if (h2 == nullptr) {
@@ -354,9 +412,18 @@ YieldCov readYieldCov(TFile& f, const std::string& prefix) {
     if (n <= 0 || h2->GetNbinsY() != n) {
         throw std::runtime_error("Covariance size mismatch for " + prefix);
     }
+    const std::vector<int> sr_ids =
+        signal_region_ids.empty() ? defaultSignalRegionIds(n) : signal_region_ids;
+    if (static_cast<int>(sr_ids.size()) != n) {
+        throw std::runtime_error(
+            "Signal-region metadata size mismatch for " + prefix +
+            " in " + f.GetName() + ": metadata has " +
+            std::to_string(sr_ids.size()) + " entries but covariance has " +
+            std::to_string(n) + " bins");
+    }
     YieldCov out(n);
     for (int i = 0; i < n; ++i) {
-        const std::string sr_prefix = prefix + "/sr" + std::to_string(i + 1);
+        const std::string sr_prefix = prefix + "/sr" + std::to_string(sr_ids[i]);
         out.yields[i] = readOneBinHist(f, sr_prefix + "/yield");
         readOneBinHist(f, sr_prefix + "/stat_error");
         readOneBinHist(f, sr_prefix + "/scale_error");
@@ -398,6 +465,7 @@ ChannelData loadChannel(const ChannelSpec& spec) {
     }
     ChannelData data;
     data.name = spec.name;
+    const std::vector<int> metadata_sr_ids = readSignalRegionIds(*f);
 
     // Samples
     const std::vector<std::string> sample_names = listSubdirs(*f, "samples");
@@ -405,12 +473,15 @@ ChannelData loadChannel(const ChannelSpec& spec) {
         throw std::runtime_error("No samples/ entries in " + spec.root_file);
     }
     for (const auto& s : sample_names) {
-        auto inserted = data.sample.emplace(s, readYieldCov(*f, "samples/" + s));
+        auto inserted = data.sample.emplace(
+            s, readYieldCov(*f, "samples/" + s, metadata_sr_ids));
         if (!inserted.second) {
             throw std::runtime_error("Duplicate sample '" + s + "' in " + spec.root_file);
         }
     }
     data.n_sr = data.sample.begin()->second.n();
+    data.sr_ids =
+        metadata_sr_ids.empty() ? defaultSignalRegionIds(data.n_sr) : metadata_sr_ids;
     for (const auto& kv : data.sample) {
         if (kv.second.n() != data.n_sr) {
             throw std::runtime_error("Inconsistent SR count for sample " + kv.first);
@@ -423,7 +494,8 @@ ChannelData loadChannel(const ChannelSpec& spec) {
     }
     for (const auto& g : group_names) {
         const std::string key = slugify(g);
-        auto inserted = data.group.emplace(key, readYieldCov(*f, "groups/" + g));
+        auto inserted = data.group.emplace(
+            key, readYieldCov(*f, "groups/" + g, data.sr_ids));
         if (!inserted.second) {
             throw std::runtime_error(
                 "Duplicate groups/ entries after case-insensitive matching: '" + g +
@@ -436,12 +508,13 @@ ChannelData loadChannel(const ChannelSpec& spec) {
         }
     }
 
-    data.qcd_predict = readYieldCov(*f, "qcd_predict");
+    data.qcd_predict = readYieldCov(*f, "qcd_predict", data.sr_ids);
     if (data.qcd_predict.n() != data.n_sr) {
         throw std::runtime_error("qcd_predict SR count mismatch for " + spec.name);
     }
 
     logMessage("  channel '" + data.name + "': n_sr=" + std::to_string(data.n_sr) +
+               ", sr_ids=" + formatSignalRegionIds(data.sr_ids) +
                ", samples=" + std::to_string(data.sample.size()) +
                ", groups=" + std::to_string(data.group.size()));
     f->Close();
@@ -917,6 +990,7 @@ struct PerChannelCard {
     std::string name;              // channel name
     std::string datacard_path;
     int n_sr = 0;
+    std::vector<int> sr_ids;
     std::vector<Process> processes;
     // For each process: eigen modes; nuisance name convention below.
     std::vector<std::vector<EigenMode>> modes;
@@ -974,12 +1048,15 @@ void validateProcessShapes(const AppConfig& cfg, const Process& proc,
     }
 }
 
-std::string srBinName(const std::string& channel_name, int sr_index_zero_based) {
-    return channel_name + "_sr" + std::to_string(sr_index_zero_based + 1);
+std::string srBinName(const std::string& channel_name, int sr_id) {
+    return channel_name + "_sr" + std::to_string(sr_id);
 }
 
 void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
                        const std::string& shape_path) {
+    if (static_cast<int>(pc.sr_ids.size()) != pc.n_sr) {
+        throw std::runtime_error("Signal-region id count mismatch in channel '" + pc.name + "'");
+    }
     TFile* f = TFile::Open(shape_path.c_str(), "RECREATE");
     if (f == nullptr || f->IsZombie()) {
         if (f != nullptr) delete f;
@@ -1004,7 +1081,7 @@ void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
     }
 
     for (int sr = 0; sr < pc.n_sr; ++sr) {
-        TDirectory* sr_dir = f->mkdir(srBinName(pc.name, sr).c_str());
+        TDirectory* sr_dir = f->mkdir(srBinName(pc.name, pc.sr_ids[sr]).c_str());
         sr_dir->cd();
         makeHist(sr_dir, "data_obs", pc.data_obs[sr]);
 
@@ -1037,6 +1114,9 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
     if (use_shapes && shape_file.empty()) {
         throw std::runtime_error("Shape file path is required when use_root_covariance=true");
     }
+    if (static_cast<int>(pc.sr_ids.size()) != pc.n_sr) {
+        throw std::runtime_error("Signal-region id count mismatch in channel '" + pc.name + "'");
+    }
     ofs << "# Auto-generated by combine.C\n";
     ofs << "imax " << pc.n_sr << "\njmax *\nkmax *\n";
     ofs << "----------\n";
@@ -1047,7 +1127,7 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
     }
     ofs << "bin";
     for (int sr = 0; sr < pc.n_sr; ++sr) {
-        ofs << " " << srBinName(pc.name, sr);
+        ofs << " " << srBinName(pc.name, pc.sr_ids[sr]);
     }
     ofs << "\n";
     ofs << "observation";
@@ -1061,7 +1141,7 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
     ofs << "bin";
     for (int sr = 0; sr < pc.n_sr; ++sr) {
         for (size_t p = 0; p < pc.processes.size(); ++p) {
-            ofs << " " << srBinName(pc.name, sr);
+            ofs << " " << srBinName(pc.name, pc.sr_ids[sr]);
         }
     }
     ofs << "\n";
@@ -1206,11 +1286,13 @@ std::string csvDouble(double value) {
 void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
                  const std::vector<ChannelData>& channels,
                  const Scenario& sc, bool use_abcd,
+                 const std::string& tag_prefix,
                  CombineOutput& sig_out, CombineOutput& lim_out) {
     const std::string mode_tag = use_abcd ? "abcd" : "mc";
     const std::string scope_tag = slugify(sc.scope);
     const std::string name_tag = slugify(sc.name);
-    const std::string tag = mode_tag + "_" + scope_tag + "_" + name_tag;
+    const std::string prefix_tag = tag_prefix.empty() ? "" : slugify(tag_prefix) + "_";
+    const std::string tag = prefix_tag + mode_tag + "_" + scope_tag + "_" + name_tag;
     const fs::path work = fs::path(cfg.work_dir) / tag;
     fs::create_directories(work);
 
@@ -1222,13 +1304,14 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
         PerChannelCard pc;
         pc.name = ch.name;
         pc.n_sr = ch.n_sr;
+        pc.sr_ids = ch.sr_ids;
         pc.processes = buildProcesses(ch, reg, sc, use_abcd);
         pc.processes = maybeDropZeroBackgroundProcesses(cfg, std::move(pc.processes), sc, ch.name);
         const Process& signal_proc = getRequiredProcess(pc.processes, "signal", sc, ch.name);
         if (isExactlyZeroProcess(signal_proc)) {
-            if (sc.scope == "sample") {
+            if (sc.scope == "sample" || channels.size() == 1u) {
                 logMessage("WARNING: Dropping zero-yield zero-covariance signal channel from "
-                           "sample scenario: channel=" + ch.name +
+                           "scenario: channel=" + ch.name +
                            " scenario=" + sc.scope + "/" + sc.name +
                            " qcd_mode=" + mode_tag);
                 skipped_zero_signal_channels.push_back(ch.name);
@@ -1272,13 +1355,13 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
     }
 
     if (card_tokens.empty()) {
-        if (sc.scope == "sample") {
+        if (sc.scope == "sample" || channels.size() == 1u) {
             std::ostringstream channels_os;
             for (size_t i = 0; i < skipped_zero_signal_channels.size(); ++i) {
                 if (i) channels_os << ",";
                 channels_os << skipped_zero_signal_channels[i];
             }
-            logMessage("WARNING: Signal sample scenario is identically zero in all channels; "
+            logMessage("WARNING: Signal scenario is identically zero in all usable channels; "
                        "storing significance=0 and infinite expected limits: scenario=" +
                        sc.scope + "/" + sc.name +
                        " qcd_mode=" + mode_tag +
@@ -1383,6 +1466,44 @@ void writeLimitsCsv(const std::string& path,
     logMessage("Wrote " + path);
 }
 
+void writeChannelSignificanceCsv(const std::string& path,
+                                 const std::vector<std::string>& channel_names,
+                                 const std::vector<Scenario>& scenarios,
+                                 const std::vector<CombineOutput>& results) {
+    if (channel_names.size() != scenarios.size() || scenarios.size() != results.size()) {
+        throw std::runtime_error("Channel significance CSV row size mismatch");
+    }
+    std::ofstream ofs(path);
+    if (!ofs) throw std::runtime_error("Cannot write " + path);
+    ofs << "channel,scope,name,significance\n";
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        ofs << channel_names[i] << "," << scenarios[i].scope << "," << scenarios[i].name << ","
+            << results[i].significance << "\n";
+    }
+    logMessage("Wrote " + path);
+}
+
+void writeChannelLimitsCsv(const std::string& path,
+                           const std::vector<std::string>& channel_names,
+                           const std::vector<Scenario>& scenarios,
+                           const std::vector<CombineOutput>& results) {
+    if (channel_names.size() != scenarios.size() || scenarios.size() != results.size()) {
+        throw std::runtime_error("Channel limits CSV row size mismatch");
+    }
+    std::ofstream ofs(path);
+    if (!ofs) throw std::runtime_error("Cannot write " + path);
+    ofs << "channel,scope,name,exp_2p5,exp_16,exp_50,exp_84,exp_97p5\n";
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        ofs << channel_names[i] << "," << scenarios[i].scope << "," << scenarios[i].name << ","
+            << csvDouble(results[i].exp_2p5) << ","
+            << csvDouble(results[i].exp_16) << ","
+            << csvDouble(results[i].exp_50) << ","
+            << csvDouble(results[i].exp_84) << ","
+            << csvDouble(results[i].exp_97p5) << "\n";
+    }
+    logMessage("Wrote " + path);
+}
+
 int runMain() {
     AppConfig cfg = loadAppConfig();
     fs::create_directories(cfg.output_dir);
@@ -1420,9 +1541,56 @@ int runMain() {
     for (size_t i = 0; i < scenarios.size(); ++i) {
         const auto& sc = scenarios[i];
         logMessage("=== Scenario: scope=" + sc.scope + " name=" + sc.name + " (MC true QCD) ===");
-        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/false, sig_mc[i], lim_mc[i]);
+        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/false, "", sig_mc[i], lim_mc[i]);
         logMessage("=== Scenario: scope=" + sc.scope + " name=" + sc.name + " (ABCD QCD) ===");
-        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/true, sig_abcd[i], lim_abcd[i]);
+        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/true, "", sig_abcd[i], lim_abcd[i]);
+    }
+
+    std::vector<std::string> channel_result_names;
+    std::vector<Scenario> channel_result_scenarios;
+    std::vector<CombineOutput> sig_channel_mc;
+    std::vector<CombineOutput> lim_channel_mc;
+    std::vector<CombineOutput> sig_channel_abcd;
+    std::vector<CombineOutput> lim_channel_abcd;
+
+    for (const auto& ch : channels) {
+        std::vector<ChannelData> single_channel;
+        single_channel.push_back(ch);
+        const std::string tag_prefix = "channel_" + ch.name;
+        for (const auto& sc : scenarios) {
+            channel_result_names.push_back(ch.name);
+            channel_result_scenarios.push_back(sc);
+            sig_channel_mc.emplace_back();
+            lim_channel_mc.emplace_back();
+            sig_channel_abcd.emplace_back();
+            lim_channel_abcd.emplace_back();
+            const size_t idx = sig_channel_mc.size() - 1;
+
+            logMessage("=== Channel scenario: channel=" + ch.name +
+                       " scope=" + sc.scope + " name=" + sc.name +
+                       " (MC true QCD) ===");
+            buildAndRun(
+                cfg,
+                reg,
+                single_channel,
+                sc,
+                /*use_abcd=*/false,
+                tag_prefix,
+                sig_channel_mc[idx],
+                lim_channel_mc[idx]);
+            logMessage("=== Channel scenario: channel=" + ch.name +
+                       " scope=" + sc.scope + " name=" + sc.name +
+                       " (ABCD QCD) ===");
+            buildAndRun(
+                cfg,
+                reg,
+                single_channel,
+                sc,
+                /*use_abcd=*/true,
+                tag_prefix,
+                sig_channel_abcd[idx],
+                lim_channel_abcd[idx]);
+        }
     }
 
     writeSignificanceCsv((fs::path(cfg.output_dir) / "significance.csv").string(),
@@ -1433,6 +1601,26 @@ int runMain() {
                          scenarios, sig_abcd);
     writeLimitsCsv((fs::path(cfg.output_dir) / "limits_abcd_mc.csv").string(),
                    scenarios, lim_abcd);
+    writeChannelSignificanceCsv(
+        (fs::path(cfg.output_dir) / "significance_by_channel.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        sig_channel_mc);
+    writeChannelLimitsCsv(
+        (fs::path(cfg.output_dir) / "limits_by_channel.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        lim_channel_mc);
+    writeChannelSignificanceCsv(
+        (fs::path(cfg.output_dir) / "significance_by_channel_abcd_mc.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        sig_channel_abcd);
+    writeChannelLimitsCsv(
+        (fs::path(cfg.output_dir) / "limits_by_channel_abcd_mc.csv").string(),
+        channel_result_names,
+        channel_result_scenarios,
+        lim_channel_abcd);
 
     if (!cfg.keep_work) {
         std::error_code ec;

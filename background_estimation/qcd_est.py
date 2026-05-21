@@ -6,18 +6,18 @@
 from __future__ import annotations
 
 import gc
+import colorsys
 import json
 import math
 import os
-import pickle
-from typing import Dict, List, Tuple
+import sys
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import mplhep as hep
 import numpy as np
 import pandas as pd
 import uproot
-import xgboost as xgb
 
 
 # -------------------- Style --------------------
@@ -25,12 +25,59 @@ plt.rcParams["mathtext.fontset"] = "cm"
 plt.rcParams["mathtext.rm"] = "serif"
 plt.style.use(hep.style.CMS)
 
+_CLASS_COLOR_BASE = [
+    "#3f90da",
+    "#ffa90e",
+    "#bd1f01",
+    "#94a4a2",
+    "#832db6",
+    "#a96b59",
+    "#e76300",
+    "#b9ac70",
+    "#717581",
+    "#92dadd",
+]
+
+
+def _plot_colors(n: int) -> List[str]:
+    colors = list(_CLASS_COLOR_BASE)
+    used = {color.lower() for color in colors}
+    hue = 0.13
+    while len(colors) < n:
+        rgb = colorsys.hsv_to_rgb(hue % 1.0, 0.72, 0.86)
+        candidate = "#{:02x}{:02x}{:02x}".format(
+            int(round(rgb[0] * 255.0)),
+            int(round(rgb[1] * 255.0)),
+            int(round(rgb[2] * 255.0)),
+        )
+        if candidate.lower() not in used:
+            colors.append(candidate)
+            used.add(candidate.lower())
+        hue += 0.618033988749895
+    return colors[:n]
+
+
+def _group_color_map(extra_names=None) -> Dict[str, str]:
+    names = list(CLASS_NAMES)
+    if extra_names is not None:
+        for name in extra_names:
+            if name not in names:
+                names.append(name)
+    return dict(zip(names, _plot_colors(len(names))))
+
 
 # -------------------- Paths --------------------
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(_SCRIPT_DIR)
 _SELECTIONS_DIR = os.path.join(_ROOT_DIR, "selections")
 _BDT_DIR = os.path.join(_SELECTIONS_DIR, "BDT")
+if _BDT_DIR not in sys.path:
+    sys.path.insert(0, _BDT_DIR)
+
+from model_io import (
+    load_model as _shared_load_model,
+    predict_model_proba as _shared_predict_model_proba,
+)
 
 
 # -------------------- Logging --------------------
@@ -69,9 +116,10 @@ OUTPUT_DIR = _resolve(qcd_cfg.get("output_dir", "./output"), _SCRIPT_DIR)
 ROOT_FILE_NAME = qcd_cfg.get("root_file_name", "qcd_abcd_yields.root")
 SIGNAL_REGION_CSV_PATH = _resolve(qcd_cfg["signal_region_csv"], _SCRIPT_DIR)
 TEST_REFERENCE_QCD_EST = os.path.join(BDT_ROOT, "test_reference_qcd_est.npz")
+TEST_REFERENCE_QCD_EST_FULL = os.path.join(BDT_ROOT, "test_reference_qcd_est_full.npz")
 
 
-# -------------------- BDT config copies --------------------
+# -------------------- Trained-model config copies --------------------
 cfg = _load_json(os.path.join(BDT_ROOT, "config.json"))
 br_cfg = _load_json(os.path.join(BDT_ROOT, "branch.json"))
 sel_cfg = _load_json(os.path.join(BDT_ROOT, "selection.json"))
@@ -88,6 +136,43 @@ CLASS_GROUPS = cfg["class_groups"]
 CLASS_NAMES = list(CLASS_GROUPS.keys())
 NUM_CLASSES = len(CLASS_NAMES)
 DEFAULT_AXIS_NAMES = CLASS_NAMES[: max(1, NUM_CLASSES - 1)]
+
+
+def _resolve_abcd_branch_names(config: dict, tree_name: str) -> List[str]:
+    if "abcd_branches" not in config:
+        raise RuntimeError(
+            "background_estimation config missing required 'abcd_branches' mapping"
+        )
+    payload = config["abcd_branches"]
+    if not isinstance(payload, dict):
+        raise TypeError("background_estimation config 'abcd_branches' must be a dict")
+    if tree_name not in payload:
+        raise RuntimeError(
+            f"background_estimation config 'abcd_branches' missing tree '{tree_name}'"
+        )
+    value = payload[tree_name]
+    if isinstance(value, str):
+        names = [value]
+    elif isinstance(value, list):
+        names = value
+    else:
+        raise TypeError(f"abcd_branches['{tree_name}'] must be a string or list")
+
+    out = []
+    seen = set()
+    for item in names:
+        if not isinstance(item, str) or not item:
+            raise TypeError(f"abcd_branches['{tree_name}'] entries must be non-empty strings")
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    if not out:
+        raise RuntimeError(f"abcd_branches['{tree_name}'] must not be empty")
+    return out
+
+
+ABCD_BRANCH_NAMES = _resolve_abcd_branch_names(qcd_cfg, TREE_NAME)
 
 QCD_CLASS_NAMES = [class_name for class_name in CLASS_NAMES if "qcd" in class_name.lower()]
 if not QCD_CLASS_NAMES:
@@ -224,30 +309,17 @@ def standardize_X(X: pd.DataFrame, clip_ranges: dict, log_transform: list) -> pd
     return X
 
 
-def _reshape_multiclass_margin(predt, num_class):
-    predt = np.asarray(predt, dtype=float)
-    if predt.ndim == 2:
-        if predt.shape[1] == num_class:
-            return predt
-        if predt.shape[0] == num_class:
-            return predt.T
-    rows = predt.size // num_class
-    return predt.reshape(rows, num_class)
-
-
-def _softmax_rows(logits: np.ndarray) -> np.ndarray:
-    logits = np.asarray(logits, dtype=float)
-    shifted = logits - np.max(logits, axis=1, keepdims=True)
-    exp_v = np.exp(shifted)
-    return exp_v / (np.sum(exp_v, axis=1, keepdims=True) + 1e-12)
+def _drop_decorrelated_features(X: pd.DataFrame, decorrelate: list[str]) -> pd.DataFrame:
+    if not decorrelate:
+        return X
+    drop_cols = [name for name in decorrelate if name in X.columns]
+    if drop_cols:
+        return X.drop(columns=drop_cols)
+    return X
 
 
 def _predict_model_proba(model, X):
-    if isinstance(model, xgb.Booster):
-        dmat = xgb.DMatrix(X, feature_names=list(X.columns) if hasattr(X, "columns") else None)
-        margins = model.predict(dmat, output_margin=True)
-        return _softmax_rows(_reshape_multiclass_margin(margins, NUM_CLASSES))
-    return model.predict_proba(X)
+    return _shared_predict_model_proba(model, X, NUM_CLASSES)
 
 
 def _compare_prediction_reference(path, feature_names, sample_labels, class_idx, weights, proba):
@@ -415,43 +487,36 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
 # -------------------- Model loading --------------------
 def _load_model():
     model_base = MODEL_PATTERN.format(output_root=BDT_ROOT, tree_name=TREE_NAME)
-    if os.path.exists(model_base + ".json"):
-        model_path = model_base + ".json"
-        clf = xgb.Booster()
-        clf.load_model(model_path)
-        log_message(f"Loaded model: {model_path}")
-        return clf
-    if os.path.exists(model_base + ".pkl"):
-        model_path = model_base + ".pkl"
-        with open(model_path, "rb") as handle:
-            clf = pickle.load(handle)
-        log_message(f"Loaded model: {model_path}")
-        return clf
-    raise FileNotFoundError(f"No model found at {model_base}(.json/.pkl)")
+    return _shared_load_model(model_base, cfg, NUM_CLASSES, log_message=log_message)
 
 
 # -------------------- Region helpers --------------------
-def _resolve_mass_thresholds(thresholds: dict) -> Tuple[dict, dict]:
-    mass_thresholds = {}
+def _resolve_abcd_thresholds(thresholds: dict, abcd_branch_names: List[str]) -> Tuple[dict, dict]:
+    abcd_thresholds = {}
     other_thresholds = {}
+    abcd_set = set(abcd_branch_names)
+    missing = [name for name in abcd_branch_names if name not in thresholds]
+    if missing:
+        raise RuntimeError(
+            "Configured ABCD branch is missing from bdt_root selection.json thresholds: "
+            + ", ".join(missing)
+        )
     for name, cond in thresholds.items():
-        if name.startswith("ScoutingFatPFJetRecluster_msoftdrop_"):
-            mass_thresholds[name] = cond
+        if name in abcd_set:
+            abcd_thresholds[name] = cond
         else:
             other_thresholds[name] = cond
-    if not mass_thresholds:
-        raise RuntimeError("No ScoutingFatPFJetRecluster_msoftdrop_* thresholds found in selection.json")
-    return mass_thresholds, other_thresholds
+    return abcd_thresholds, other_thresholds
 
 
-def _mass_pass_fail_masks(df: pd.DataFrame, mass_thresholds: dict) -> Tuple[np.ndarray, np.ndarray]:
+def _abcd_pass_fail_masks(df: pd.DataFrame, abcd_thresholds: dict) -> Tuple[np.ndarray, np.ndarray]:
     pass_mask = np.ones(len(df), dtype=bool)
     fail_mask = np.ones(len(df), dtype=bool)
     valid_mask = np.ones(len(df), dtype=bool)
 
-    for name, cond in mass_thresholds.items():
+    for name, cond in abcd_thresholds.items():
         if name not in df.columns:
-            raise KeyError(f"Mass threshold branch {name!r} not found in DataFrame")
+            raise KeyError(f"ABCD threshold branch {name!r} not found in DataFrame")
         col = df[name]
         values = col.to_numpy(dtype=float, copy=False)
         sentinel = values < -990
@@ -506,6 +571,20 @@ def _load_signal_regions() -> Tuple[pd.DataFrame, List[str]]:
             f"Signal region CSV missing required columns: {', '.join(missing)}"
         )
 
+    bin_values = pd.to_numeric(df["bin_index"], errors="raise").to_numpy(dtype=float)
+    rounded_bins = np.rint(bin_values)
+    if (
+        not np.all(np.isfinite(bin_values))
+        or not np.allclose(bin_values, rounded_bins)
+        or np.any(rounded_bins <= 0)
+    ):
+        raise RuntimeError("Signal region CSV bin_index values must be positive integers")
+    bin_ids = [int(value) for value in rounded_bins]
+    if len(set(bin_ids)) != len(bin_ids):
+        raise RuntimeError("Signal region CSV bin_index values must be unique")
+    df = df.copy()
+    df["bin_index"] = bin_ids
+
     return df.sort_values("bin_index").reset_index(drop=True), axis_names
 
 
@@ -553,29 +632,58 @@ def _add_uncert_band(ax, edges: np.ndarray, lower: np.ndarray, upper: np.ndarray
     )
 
 
+def _qcd_merged_group_maps(
+    group_vals: Dict[str, np.ndarray],
+    group_vars: Dict[str, np.ndarray],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], List[str]]:
+    merged_vals = {}
+    merged_vars = {}
+    merged_groups = []
+    n_regions = len(next(iter(group_vals.values())))
+    qcd_vals = np.zeros(n_regions, dtype=float)
+    qcd_vars = np.zeros(n_regions, dtype=float)
+
+    for name in CLASS_NAMES:
+        if name in QCD_CLASS_SET:
+            qcd_vals += group_vals[name]
+            qcd_vars += group_vars[name]
+        else:
+            merged_vals[name] = group_vals[name].copy()
+            merged_vars[name] = group_vars[name].copy()
+            merged_groups.append(name)
+
+    merged_vals[QCD_PREDICT_GROUP_NAME] = qcd_vals
+    merged_vars[QCD_PREDICT_GROUP_NAME] = qcd_vars
+    merged_groups.append(QCD_PREDICT_GROUP_NAME)
+    return merged_vals, merged_vars, merged_groups
+
+
 def plot_abcd_region_counts(
     region_labels: List[str],
     group_vals: Dict[str, np.ndarray],
     group_vars: Dict[str, np.ndarray],
     out_path: str,
     normalize_per_bin: bool = False,
+    groups: Optional[List[str]] = None,
+    log_y: bool = True,
 ) -> None:
     edges = np.arange(len(region_labels) + 1, dtype=float)
     centers = edges[:-1] + 0.5
     widths = np.full(len(region_labels), 1.0)
+    plot_groups = list(groups) if groups is not None else list(CLASS_NAMES)
 
-    vals_map = {name: group_vals[name].copy() for name in CLASS_NAMES}
-    vars_map = {name: group_vars[name].copy() for name in CLASS_NAMES}
+    vals_map = {name: group_vals[name].copy() for name in plot_groups}
+    vars_map = {name: group_vars[name].copy() for name in plot_groups}
 
     totals = np.zeros(len(region_labels), dtype=float)
     total_vars = np.zeros(len(region_labels), dtype=float)
-    for name in CLASS_NAMES:
+    for name in plot_groups:
         totals += vals_map[name]
         total_vars += vars_map[name]
 
     if normalize_per_bin:
         scale = np.where(totals > 0, 1.0 / totals, 0.0)
-        for name in CLASS_NAMES:
+        for name in plot_groups:
             vals_map[name] *= scale
             vars_map[name] *= scale ** 2
         totals *= scale
@@ -583,12 +691,9 @@ def plot_abcd_region_counts(
 
     fig, ax = plt.subplots(figsize=(11, 7))
     bottom = np.zeros(len(region_labels), dtype=float)
-    order = np.argsort([float(np.sum(vals_map[name])) for name in CLASS_NAMES])
-    ordered_groups = [CLASS_NAMES[idx] for idx in order]
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get(
-        "color", ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
-    )
-    color_map = {name: colors[i % len(colors)] for i, name in enumerate(CLASS_NAMES)}
+    order = np.argsort([float(np.sum(vals_map[name])) for name in plot_groups])
+    ordered_groups = [plot_groups[idx] for idx in order]
+    color_map = _group_color_map(plot_groups)
 
     for name in ordered_groups:
         ax.bar(
@@ -608,11 +713,16 @@ def plot_abcd_region_counts(
 
     if not normalize_per_bin:
         sigma = np.sqrt(np.maximum(total_vars, 0.0))
-        lower = np.clip(totals - sigma, 1e-12, None)
-        upper = np.clip(totals + sigma, 1e-12, None)
+        lower_clip = 1e-12 if log_y else 0.0
+        lower = np.clip(totals - sigma, lower_clip, None)
+        upper = np.clip(totals + sigma, lower_clip, None)
         _add_uncert_band(ax, edges, lower, upper)
-        ax.set_yscale("log")
-        ax.set_ylim(0.1, max(1.0, float(np.max(totals[totals > 0])) * 3.0 if np.any(totals > 0) else 1.0))
+        if log_y:
+            ax.set_yscale("log")
+            ax.set_ylim(0.1, max(1.0, float(np.max(totals[totals > 0])) * 3.0 if np.any(totals > 0) else 1.0))
+        else:
+            max_upper = float(np.max(upper)) if len(upper) else 0.0
+            ax.set_ylim(0.0, max(1.0, max_upper * 1.25))
         ax.set_ylabel("Events", fontsize=22)
     else:
         ax.set_ylim(0.0, 1.0)
@@ -645,10 +755,7 @@ def plot_signal_region_prediction(
     edges = np.arange(n + 1, dtype=float)
     centers = edges[:-1] + 0.5
     widths = np.full(n, 1.0)
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get(
-        "color", ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
-    )
-    color_map = {name: colors[i % len(colors)] for i, name in enumerate(CLASS_NAMES)}
+    color_map = _group_color_map(groups)
 
     fig, (ax, axr) = plt.subplots(
         2,
@@ -758,6 +865,7 @@ def plot_signal_region_prediction(
 def write_root_output(
     root_path: str,
     edges: np.ndarray,
+    signal_region_ids: List[int],
     sample_yields: Dict[str, np.ndarray],
     sample_vars: Dict[str, np.ndarray],
     group_yields: Dict[str, np.ndarray],
@@ -775,6 +883,12 @@ def write_root_output(
     true_total_vals: np.ndarray,
     true_total_vars: np.ndarray,
 ) -> None:
+    sr_ids = np.asarray(signal_region_ids, dtype=np.int32)
+    if sr_ids.ndim != 1 or len(sr_ids) == 0:
+        raise RuntimeError("Signal region ids must be a non-empty one-dimensional list")
+    if len(set(int(value) for value in sr_ids)) != len(sr_ids) or np.any(sr_ids <= 0):
+        raise RuntimeError("Signal region ids must be unique positive integers")
+
     def _write_bundle(
         root_file,
         prefix: str,
@@ -795,6 +909,8 @@ def write_root_output(
             covariance_total = np.asarray(covariance_total, dtype=float)
 
         n_sr = len(vals)
+        if n_sr != len(sr_ids):
+            raise RuntimeError(f"Signal-region count mismatch for ROOT bundle '{prefix}'")
         if stat_vars.shape != vals.shape or scale_vars.shape != vals.shape:
             raise RuntimeError(f"Uncertainty size mismatch for ROOT bundle '{prefix}'")
         if covariance_total.shape != (n_sr, n_sr):
@@ -804,7 +920,7 @@ def write_root_output(
         stat_err = np.sqrt(np.maximum(stat_vars, 0.0))
         scale_err = np.sqrt(np.maximum(scale_vars, 0.0))
         for idx in range(n_sr):
-            sr_prefix = f"{prefix}/sr{idx + 1}"
+            sr_prefix = f"{prefix}/sr{int(sr_ids[idx])}"
             root_file[f"{sr_prefix}/yield"] = (np.array([vals[idx]], dtype=float), one_bin_edges)
             root_file[f"{sr_prefix}/stat_error"] = (
                 np.array([stat_err[idx]], dtype=float),
@@ -817,6 +933,8 @@ def write_root_output(
         root_file[f"{prefix}/covariance_total"] = (covariance_total, edges, edges)
 
     with uproot.recreate(root_path) as root_file:
+        root_file["metadata/signal_regions"] = {"bin_index": sr_ids}
+
         for sample_name in sorted(sample_yields):
             _write_bundle(
                 root_file,
@@ -861,7 +979,7 @@ def main() -> None:
         f"Running qcd_est.py: tree={TREE_NAME}, lumi={LUMI} fb^-1, "
         f"bdt_root={BDT_ROOT}, signal_region_csv={SIGNAL_REGION_CSV_PATH}, output_dir={OUTPUT_DIR}"
     )
-    log_message("Loading BDT config copies")
+    log_message("Loading trained-model config copies")
 
     model_branches = [item["name"] for item in br_cfg[TREE_NAME]]
     selection = sel_cfg[TREE_NAME]
@@ -871,14 +989,14 @@ def main() -> None:
         key: (tuple(val) if isinstance(val, list) else val)
         for key, val in selection.get("thresholds", {}).items()
     }
-    mass_thresholds, bdt_thresholds = _resolve_mass_thresholds(thresholds)
+    abcd_thresholds, bdt_thresholds = _resolve_abcd_thresholds(thresholds, ABCD_BRANCH_NAMES)
     decorrelate = cfg.get(TREE_NAME, {}).get("decorrelate", [])
 
     log_message("Loading signal region file")
-    # Load every branch needed downstream: BDT features (model_branches), all
-    # threshold branches (for filter_X and the mass pass/fail masks), and every
+    # Load every branch needed downstream: model features (model_branches), all
+    # threshold branches (for filter_X and the ABCD pass/fail masks), and every
     # decorrelate branch (in case decorrelation references a branch not in
-    # branch.json). BDT inference still uses only model_branches.
+    # branch.json). Model inference still uses only model_branches.
     load_branches = sorted(set(model_branches) | set(thresholds.keys()) | set(decorrelate))
     signal_regions, axis_names = _load_signal_regions()
     region_labels = [f"SR{int(idx)}" for idx in signal_regions["bin_index"].tolist()]
@@ -886,8 +1004,8 @@ def main() -> None:
     log_message(
         f"Resolved inputs: model_branches={len(model_branches)}, "
         f"load_branches={len(load_branches)}, signal_regions={len(region_labels)}, "
-        f"score_axes={axis_names}, non_mass_thresholds={len(bdt_thresholds)}, "
-        f"mass_thresholds={len(mass_thresholds)}"
+        f"score_axes={axis_names}, non_abcd_thresholds={len(bdt_thresholds)}, "
+        f"abcd_thresholds={list(abcd_thresholds)}"
     )
     log_message(
         "QCD classes for ABCD merge: "
@@ -905,7 +1023,27 @@ def main() -> None:
     del df_all
     gc.collect()
 
-    log_message("Applying non-mass thresholds")
+    clf = _load_model()
+    have_full_reference = os.path.exists(TEST_REFERENCE_QCD_EST_FULL)
+    if have_full_reference:
+        log_message("Validating full test-set prediction reference")
+        X_model_full = standardize_X(X_raw[model_branches].copy(), clip_ranges, log_transform)
+        X_model_full = _drop_decorrelated_features(X_model_full, decorrelate)
+        proba_full = _predict_model_proba(clf, X_model_full)
+        _compare_prediction_reference(
+            TEST_REFERENCE_QCD_EST_FULL,
+            X_model_full.columns
+            if hasattr(X_model_full, "columns")
+            else [f"f{i}" for i in range(X_model_full.shape[1])],
+            sample_labels,
+            y,
+            w,
+            proba_full,
+        )
+        del X_model_full, proba_full
+        gc.collect()
+
+    log_message("Applying non-ABCD thresholds")
     X_raw, y, w, sample_labels = filter_X(
         X_raw,
         y,
@@ -916,38 +1054,41 @@ def main() -> None:
         sample_labels=sample_labels,
     )
     group_labels = np.asarray([SAMPLE_TO_GROUP[name] for name in sample_labels], dtype=object)
-    log_message(f"After non-mass filtering: {len(X_raw)} events")
+    log_message(f"After non-ABCD filtering: {len(X_raw)} events")
 
-    log_message("Evaluating mass pass/fail masks")
-    mass_pass, mass_fail = _mass_pass_fail_masks(X_raw, mass_thresholds)
-    mass_mixed = ~(mass_pass | mass_fail)
+    log_message("Evaluating ABCD pass/fail masks")
+    abcd_pass, abcd_fail = _abcd_pass_fail_masks(X_raw, abcd_thresholds)
+    abcd_mixed = ~(abcd_pass | abcd_fail)
     log_message(
-        f"Mass categories: pass={int(np.count_nonzero(mass_pass))}, "
-        f"fail={int(np.count_nonzero(mass_fail))}, excluded_mixed={int(np.count_nonzero(mass_mixed))}"
+        f"ABCD branch categories: pass={int(np.count_nonzero(abcd_pass))}, "
+        f"fail={int(np.count_nonzero(abcd_fail))}, excluded_mixed={int(np.count_nonzero(abcd_mixed))}"
     )
 
     log_message("Standardising model features")
     X_model = standardize_X(X_raw[model_branches].copy(), clip_ranges, log_transform)
     if decorrelate:
-        name_to_idx = {name: idx for idx, name in enumerate(X_model.columns)}
-        decor_idx = sorted(name_to_idx[name] for name in decorrelate if name in name_to_idx)
-        keep_idx = [idx for idx in range(len(X_model.columns)) if idx not in decor_idx]
-        X_model = X_model.iloc[:, keep_idx]
+        X_model = _drop_decorrelated_features(X_model, decorrelate)
         log_message(f"Removed decorrelated features: {decorrelate}")
 
-    clf = _load_model()
-    log_message("Running BDT prediction")
+    log_message("Running model prediction")
     proba = _predict_model_proba(clf, X_model)
     log_message(f"Predicted probabilities shape: {proba.shape}")
-    log_message("Validating test-set prediction reference")
-    _compare_prediction_reference(
-        TEST_REFERENCE_QCD_EST,
-        X_model.columns if hasattr(X_model, "columns") else [f"f{i}" for i in range(X_model.shape[1])],
-        sample_labels,
-        y,
-        w,
-        proba,
-    )
+    if not have_full_reference:
+        log_warning(
+            "Full qcd_est reference missing; using legacy filtered reference. "
+            "Re-run train.py to produce test_reference_qcd_est_full.npz for configurable ABCD branches."
+        )
+        log_message("Validating filtered test-set prediction reference")
+        _compare_prediction_reference(
+            TEST_REFERENCE_QCD_EST,
+            X_model.columns
+            if hasattr(X_model, "columns")
+            else [f"f{i}" for i in range(X_model.shape[1])],
+            sample_labels,
+            y,
+            w,
+            proba,
+        )
 
     log_message("Building ABCD regions")
     region_score_masks = []
@@ -962,11 +1103,11 @@ def main() -> None:
     if np.any(membership > 1):
         raise RuntimeError("Signal region definitions overlap on the current event set")
 
-    region_a_masks = [mask & mass_pass for mask in region_score_masks]
-    a_union_mask = union_score_mask & mass_pass
-    b_mask = (~union_score_mask) & mass_pass
-    c_mask = union_score_mask & mass_fail
-    d_mask = (~union_score_mask) & mass_fail
+    region_a_masks = [mask & abcd_pass for mask in region_score_masks]
+    a_union_mask = union_score_mask & abcd_pass
+    b_mask = (~union_score_mask) & abcd_pass
+    c_mask = union_score_mask & abcd_fail
+    d_mask = (~union_score_mask) & abcd_fail
 
     log_message(
         f"ABCD event counts: A_union={int(np.count_nonzero(a_union_mask))}, "
@@ -1112,12 +1253,17 @@ def main() -> None:
             vals = weights[group_mask]
             abcd_group_vals[group_name][reg_idx] = float(np.sum(vals))
             abcd_group_vars[group_name][reg_idx] = float(np.sum(vals ** 2))
+    abcd_qcd_merged_vals, abcd_qcd_merged_vars, abcd_qcd_merged_groups = _qcd_merged_group_maps(
+        abcd_group_vals,
+        abcd_group_vars,
+    )
 
     root_path = os.path.join(OUTPUT_DIR, ROOT_FILE_NAME)
     log_message("Writing summary ROOT file")
     write_root_output(
         root_path,
         edges,
+        [int(idx) for idx in signal_regions["bin_index"].tolist()],
         sample_yields,
         sample_root_vars,
         group_yields,
@@ -1148,8 +1294,41 @@ def main() -> None:
         ["A union", "B", "C", "D"],
         abcd_group_vals,
         abcd_group_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_counts_linear.pdf"),
+        normalize_per_bin=False,
+        log_y=False,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_group_vals,
+        abcd_group_vars,
         os.path.join(OUTPUT_DIR, "qcd_abcd_region_fractions.pdf"),
         normalize_per_bin=True,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_qcd_merged_vals,
+        abcd_qcd_merged_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_counts_qcd_merged.pdf"),
+        normalize_per_bin=False,
+        groups=abcd_qcd_merged_groups,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_qcd_merged_vals,
+        abcd_qcd_merged_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_counts_qcd_merged_linear.pdf"),
+        normalize_per_bin=False,
+        groups=abcd_qcd_merged_groups,
+        log_y=False,
+    )
+    plot_abcd_region_counts(
+        ["A union", "B", "C", "D"],
+        abcd_qcd_merged_vals,
+        abcd_qcd_merged_vars,
+        os.path.join(OUTPUT_DIR, "qcd_abcd_region_fractions_qcd_merged.pdf"),
+        normalize_per_bin=True,
+        groups=abcd_qcd_merged_groups,
     )
     plot_signal_region_prediction(
         region_labels,

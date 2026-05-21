@@ -1,6 +1,8 @@
 {
   "fat2": [
     { "name": "ScoutingFatPFJetRecluster_selected_pt_sum" },
+    { "name": "ScoutingFatPFJetRecluster_sphere_mass" },
+    { "name": "ScoutingFatPFJetRecluster_msoftdrop_2" },
     { "name": "ScoutingFatPFJetRecluster_mass" },
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_mass" },
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_pt" },
@@ -11,7 +13,6 @@
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_pt_fraction_1" },
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_pt_fraction_2" },
     { "name": "ScoutingFatPFJetReclusterScoutingPFJetRecluster2_pt_balance" },
-    { "name": "ScoutingFatPFJetRecluster_sphere_mass" },
     { "name": "ScoutingPFJetRecluster2_deltaR_min_ScoutingFatPFJetRecluster" },
     { "name": "ScoutingPFJetRecluster2_deltaR_min" },
     { "name": "SelectedLepton_deltaR_min_ScoutingFatPFJetRecluster" },
@@ -42,6 +43,9 @@
   ],
   "fat3": [
     { "name": "ScoutingFatPFJetRecluster_selected_pt_sum" },
+    { "name": "ScoutingFatPFJetRecluster_sphere_mass" },
+    { "name": "ScoutingFatPFJetRecluster_msoftdrop_2" },
+    { "name": "ScoutingFatPFJetRecluster_msoftdrop_3" },
     { "name": "ScoutingFatPFJetRecluster_mass" },
     { "name": "ScoutingFatPFJetRecluster_pt" },
     { "name": "ScoutingFatPFJetRecluster_mass_fraction_1" },
@@ -51,7 +55,6 @@
     { "name": "ScoutingFatPFJetRecluster_pt_fraction_2" },
     { "name": "ScoutingFatPFJetRecluster_pt_fraction_3" },
     { "name": "ScoutingFatPFJetRecluster_pt_balance" },
-    { "name": "ScoutingFatPFJetRecluster_sphere_mass" },
     { "name": "ScoutingFatPFJetRecluster_deltaR_min" },
     { "name": "ScoutingFatPFJetRecluster_deltaR_max" },
     { "name": "ScoutingFatPFJetRecluster_deltaPhi_min" },

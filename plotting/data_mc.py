@@ -4,7 +4,7 @@
 """Data vs MC histogram comparison plotter.
 
 Reads convert_branch.C output ROOT files directly (per-sample trees), applies
-the BDT selection.json clip/threshold cuts (no log transform), and draws a
+the trained-model selection.json clip/threshold cuts (no log transform), and draws a
 stacked MC + data panel with a Data/MC ratio sub-panel.
 """
 
@@ -21,6 +21,15 @@ import uproot
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_SCRIPT_DIR)
+_BDT_DIR = os.path.join(_ROOT_DIR, "selections", "BDT")
+if _BDT_DIR not in sys.path:
+    sys.path.insert(0, _BDT_DIR)
+
+from model_io import (
+    load_model as _shared_load_model,
+    predict_model_proba as _shared_predict_model_proba,
+)
 
 # -------------------- Style --------------------
 plt.rcParams["mathtext.fontset"] = "cm"
@@ -42,6 +51,10 @@ def _resolve(path, base):
     if os.path.isabs(path):
         return os.path.normpath(path)
     return os.path.normpath(os.path.join(base, path))
+
+
+def _score_branch_name(class_name):
+    return f"score_{class_name}"
 
 
 # -------------------- Config loading --------------------
@@ -130,7 +143,7 @@ def _plot_branches_for_tree(tree_name):
     return out
 
 
-# -------------------- BDT config copies --------------------
+# -------------------- Trained-model config copies --------------------
 def _bdt_root_for_tree(tree_name):
     return _resolve(BDT_ROOT_PATT.format(tree_name=tree_name), _SCRIPT_DIR)
 
@@ -138,8 +151,10 @@ def _bdt_root_for_tree(tree_name):
 def _bdt_configs_for_tree(tree_name):
     bdt_root = _bdt_root_for_tree(tree_name)
     cfg = _load_json(os.path.join(bdt_root, "config.json"))
+    br = _load_json(os.path.join(bdt_root, "branch.json"))
     sel = _load_json(os.path.join(bdt_root, "selection.json"))
-    return cfg, sel
+    meta = _load_json(os.path.join(bdt_root, "test_ranges.json"))
+    return cfg, br, sel, meta
 
 
 # -------------------- Input file resolution --------------------
@@ -202,12 +217,29 @@ def _mask_from_cond(col, cond):
         if mx is not None:
             m &= col < mx
         return m
+    if isinstance(cond, (list, tuple)):
+        masks = [_mask_from_cond(col, item) for item in cond]
+        out = pd.Series(False, index=idx)
+        for mask in masks:
+            out |= mask
+        return out
+    if isinstance(cond, dict):
+        for key, is_and in (("&", True), ("and", True), ("|", False), ("or", False)):
+            if key not in cond:
+                continue
+            items = cond[key]
+            out = pd.Series(True if is_and else False, index=idx)
+            for item in items:
+                mask = _mask_from_cond(col, item)
+                out = (out & mask) if is_and else (out | mask)
+            return out
+        raise ValueError(f"Unsupported dict condition keys: {cond}")
     raise TypeError(f"Unsupported threshold condition: {cond!r}")
 
 
-def _apply_thresholds(df, thresholds):
+def _threshold_mask(df, thresholds):
     if not thresholds or df is None or len(df) == 0:
-        return df
+        return pd.Series(True, index=df.index if df is not None else None)
     mask = pd.Series(True, index=df.index)
     for b, cond in thresholds.items():
         if b not in df.columns:
@@ -216,6 +248,13 @@ def _apply_thresholds(df, thresholds):
         sentinel = col < -990
         mask &= ~sentinel
         mask &= _mask_from_cond(col, cond)
+    return mask
+
+
+def _apply_thresholds(df, thresholds):
+    if not thresholds or df is None or len(df) == 0:
+        return df
+    mask = _threshold_mask(df, thresholds)
     return df.loc[mask].reset_index(drop=True)
 
 
@@ -234,6 +273,108 @@ def _apply_clip(df, clip_ranges):
             arr[valid & (arr > hi)] = hi
         df[col] = arr
     return df
+
+
+def _standardize_model_X(X, clip_ranges, log_transform):
+    log_set = set(log_transform)
+    for col in X.columns:
+        arr = X[col].values.copy()
+        sentinel = arr < -990
+        valid = ~sentinel
+        if not valid.any():
+            continue
+        lo, hi = clip_ranges.get(col, (None, None))
+        if lo is not None:
+            arr[valid & (arr < lo)] = lo
+        if hi is not None:
+            arr[valid & (arr > hi)] = hi
+        if col in log_set:
+            pos = valid & (arr > 0)
+            if pos.any():
+                if not np.issubdtype(arr.dtype, np.floating):
+                    arr = arr.astype(float)
+                arr[pos] = np.log(arr[pos])
+        X[col] = arr
+    return X
+
+
+def _drop_decorrelated_features(X, decorrelate):
+    if not decorrelate:
+        return X
+    drop_cols = [name for name in decorrelate if name in X.columns]
+    if drop_cols:
+        return X.drop(columns=drop_cols)
+    return X
+
+
+def _predict_model_proba(model, X, num_classes):
+    return _shared_predict_model_proba(model, X, num_classes)
+
+
+def _load_score_model(bdt_root, bdt_cfg, tree_name):
+    model_pattern = bdt_cfg.get("model_pattern", "{output_root}/{tree_name}_model")
+    model_base = model_pattern.format(output_root=bdt_root, tree_name=tree_name)
+    class_groups = bdt_cfg["class_groups"]
+    return _shared_load_model(
+        model_base,
+        bdt_cfg,
+        len(class_groups),
+        log_message=log_message,
+    )
+
+
+def _compare_score_reference(path, feature_names, sample_labels, class_idx, weights, proba):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Prediction reference not found: {path}. Re-run train.py before data_mc.py."
+        )
+
+    ref = np.load(path, allow_pickle=False)
+    ref_features = ref["feature_names"].astype(str).tolist()
+    cur_features = list(feature_names)
+    if cur_features != ref_features:
+        raise RuntimeError(
+            "Prediction reference mismatch for score model features: "
+            f"current={cur_features}, reference={ref_features}"
+        )
+
+    ref_samples = ref["sample_name"].astype(str)
+    cur_samples = np.asarray(sample_labels, dtype=str)
+    if not np.array_equal(cur_samples, ref_samples):
+        raise RuntimeError("Prediction reference mismatch for score sample order/content")
+
+    ref_class_idx = ref["class_idx"].astype(int)
+    cur_class_idx = np.asarray(class_idx, dtype=int)
+    if not np.array_equal(cur_class_idx, ref_class_idx):
+        raise RuntimeError("Prediction reference mismatch for score class labels")
+
+    ref_weights = ref["weight"].astype(float) * LUMI_TOTAL
+    cur_weights = np.asarray(weights, dtype=float)
+    weight_rtol = float(ref["weight_rtol"])
+    weight_atol = float(ref["weight_atol"])
+    if not np.allclose(cur_weights, ref_weights, rtol=weight_rtol, atol=weight_atol):
+        diff = float(np.max(np.abs(cur_weights - ref_weights)))
+        raise RuntimeError(
+            "Prediction reference mismatch for score weights: "
+            f"max_abs_diff={diff:.6g}, rtol={weight_rtol}, atol={weight_atol}"
+        )
+
+    ref_proba = ref["proba"].astype(float)
+    cur_proba = np.asarray(proba, dtype=float)
+    proba_rtol = float(ref["proba_rtol"])
+    proba_atol = float(ref["proba_atol"])
+    if cur_proba.shape != ref_proba.shape:
+        raise RuntimeError(
+            "Prediction reference mismatch for score probabilities shape: "
+            f"current={cur_proba.shape}, reference={ref_proba.shape}"
+        )
+    if not np.allclose(cur_proba, ref_proba, rtol=proba_rtol, atol=proba_atol):
+        diff = float(np.max(np.abs(cur_proba - ref_proba)))
+        raise RuntimeError(
+            "Prediction reference mismatch for score probabilities: "
+            f"max_abs_diff={diff:.6g}, rtol={proba_rtol}, atol={proba_atol}"
+        )
+    log_message(f"Validated score prediction reference: {path}")
 
 
 # -------------------- Weight assignment --------------------
@@ -284,6 +425,77 @@ def _assign_mc_weight(df, sample_name, tree_entries_total, n_loaded, reweight_br
     return df
 
 
+def _load_test_segments(tree_name, branches, sample_meta):
+    parts = []
+    for seg in sample_meta["test_segments"]:
+        fpath = seg["file"]
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(f"Test split file not found: {fpath}")
+        with uproot.open(fpath) as uf:
+            if tree_name not in uf:
+                raise KeyError(f"Tree '{tree_name}' not in {fpath}")
+            tree = uf[tree_name]
+            avail = set(tree.keys())
+            missing = [branch for branch in branches if branch not in avail]
+            if missing:
+                raise KeyError(
+                    f"Missing branches in {fpath}:{tree_name}: "
+                    f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else "")
+                )
+            parts.append(
+                tree.arrays(
+                    branches,
+                    library="pd",
+                    entry_start=int(seg["entry_start"]),
+                    entry_stop=int(seg["entry_stop"]),
+                )
+            )
+    if not parts:
+        return None
+    return pd.concat(parts, ignore_index=True)
+
+
+def _assign_test_split_mc_weight(df, sample_name, total_entries, reweight_branches=None):
+    reweight_branches = list(reweight_branches or [])
+    n_loaded = len(df)
+    if reweight_branches:
+        missing = [rb for rb in reweight_branches if rb not in df.columns]
+        if missing:
+            raise KeyError(
+                f"Sample '{sample_name}' missing score reweight branches: {', '.join(missing)}"
+            )
+        raw_w = np.ones(n_loaded, dtype=float)
+        for rb in reweight_branches:
+            raw_w *= df[rb].to_numpy(dtype=float, copy=False)
+        df = df.drop(columns=reweight_branches)
+    else:
+        raw_w = np.ones(n_loaded, dtype=float)
+
+    info = SAMPLE_INFO[sample_name]
+    xsec = float(info.get("xsection", 0.0))
+    raw_entries = float(info.get("raw_entries", 0.0))
+    if raw_entries <= 0.0:
+        raise RuntimeError(f"Sample '{sample_name}' has raw_entries={raw_entries}; fill src/sample.json")
+    if n_loaded == 0 or total_entries == 0 or xsec <= 0.0:
+        df["weight"] = 0.0
+        return df
+    raw_w_sum = float(raw_w.sum())
+    if raw_w_sum <= 0.0:
+        raise RuntimeError(
+            f"Sample '{sample_name}' has non-positive score raw weight sum {raw_w_sum:.6g}"
+        )
+    target_total = LUMI_TOTAL * xsec * float(total_entries) / raw_entries
+    df["weight"] = raw_w * (target_total / raw_w_sum)
+    return df
+
+
+def _add_score_columns(df, proba, class_names):
+    out = pd.DataFrame({"weight": df["weight"].to_numpy(dtype=float, copy=False)})
+    for idx, class_name in enumerate(class_names):
+        out[_score_branch_name(class_name)] = proba[:, idx]
+    return out
+
+
 # -------------------- Binning --------------------
 def _branch_override(tree_name, branch):
     tree_ov = _tree_plot_cfg(tree_name)
@@ -319,13 +531,15 @@ def _auto_range(arrs, logx):
 def _resolve_binning(tree_name, branch, arrs, log_tf_set):
     override = _branch_override(tree_name, branch)
     bins     = int(override.get("bins", DEFAULT_BINS))
-    logx     = bool(override.get("logx", branch in log_tf_set))
+    logx     = bool(override.get("logx", False if branch.startswith("score_") else branch in log_tf_set))
     logy     = bool(override.get("logy", True))
     y_range  = tuple(override["y_range"]) if "y_range" in override else None
 
     if "x_range" in override:
         x_lo, x_hi = override["x_range"]
         x_range = (float(x_lo), float(x_hi))
+    elif branch.startswith("score_"):
+        x_range = (0.0, 1.0)
     else:
         x_range = _auto_range(arrs, logx)
         if x_range is None:
@@ -367,10 +581,12 @@ def _ratio_data_over_mc(data_vals, data_vars, mc_vals, mc_vars):
 def _process_tree(tree_name):
     log_message(f"Running data_mc.py: tree={tree_name}")
 
-    log_message("Loading BDT config copies")
-    bdt_cfg, bdt_sel = _bdt_configs_for_tree(tree_name)
+    log_message("Loading trained-model config copies")
+    bdt_cfg, bdt_br, bdt_sel, test_meta = _bdt_configs_for_tree(tree_name)
     class_groups     = bdt_cfg["class_groups"]
     class_names      = list(class_groups.keys())
+    model_branches   = [item["name"] for item in bdt_br[tree_name]]
+    score_branches   = [_score_branch_name(class_name) for class_name in class_names]
 
     # Resolve input_root relative to the BDT script directory used by train.py.
     bdt_root_dir   = _bdt_root_for_tree(tree_name)
@@ -384,17 +600,24 @@ def _process_tree(tree_name):
                    for k, v in sel.get("thresholds", {}).items()}
     log_tf_set  = set(sel.get("log_transform", []))
 
+    skip_score = _skip_branches_for_tree(tree_name)
     branches_to_plot = _plot_branches_for_tree(tree_name)
-    need_load        = sorted(set(branches_to_plot)
+    score_branches = [branch for branch in score_branches if branch not in skip_score]
+    for branch in score_branches:
+        if branch not in branches_to_plot:
+            branches_to_plot.append(branch)
+    root_plot_branches = [branch for branch in branches_to_plot if branch not in score_branches]
+    need_load        = sorted(set(root_plot_branches)
                               | set(thresholds.keys())
                               | set(clip_ranges.keys()))
     reweight_cfg      = plot_cfg.get("event_reweight_branches", {})
     reweight_branches = list(reweight_cfg.get(tree_name, []))
     mc_need_load     = sorted(set(need_load) | set(reweight_branches))
+    score_reweight_branches = list(bdt_cfg.get(tree_name, {}).get("event_reweight_branches", []))
     log_message(
         f"Resolved plotting config: branches={len(branches_to_plot)}, "
         f"threshold_branches={len(thresholds)}, clip_branches={len(clip_ranges)}, "
-        f"reweight_branches={len(reweight_branches)}"
+        f"reweight_branches={len(reweight_branches)}, score_branches={len(score_branches)}"
     )
 
     out_dir = _resolve(OUTPUT_ROOT_PATT.format(tree_name=tree_name), _SCRIPT_DIR)
@@ -451,6 +674,109 @@ def _process_tree(tree_name):
     else:
         log_message(f"Loaded data events: {len(data_df)}")
 
+    # Build derived model score branches. MC scores use the saved test split and
+    # are validated against train.py's signal-region reference; data scores use
+    # the full configured data input, matching the ordinary branch plots.
+    score_class_dfs = {}
+    score_data_df = None
+    if score_branches:
+        log_message("Preparing model score branches")
+        clf = _load_score_model(bdt_root_dir, bdt_cfg, tree_name)
+        decorrelate = list(bdt_cfg.get(tree_name, {}).get("decorrelate", []))
+        score_load = sorted(set(model_branches) | set(thresholds.keys()) | set(score_reweight_branches))
+        sample_to_class_name = {}
+        sample_to_class_idx = {}
+        for idx, (cls_name, samples) in enumerate(class_groups.items()):
+            for sample_name in samples:
+                sample_to_class_name[sample_name] = cls_name
+                sample_to_class_idx[sample_name] = idx
+
+        score_parts_by_class = {cls_name: [] for cls_name in class_names}
+        ref_sample_labels = []
+        ref_class_idx = []
+        ref_weights = []
+        ref_proba_parts = []
+        ref_feature_names = None
+
+        log_message(f"Loading MC score test split samples: n={len(test_meta['samples'])}")
+        for sample_name, sample_meta in test_meta["samples"].items():
+            if sample_name not in sample_to_class_name:
+                raise RuntimeError(f"Test split sample '{sample_name}' is not in class_groups")
+            df = _load_test_segments(tree_name, score_load, sample_meta)
+            if df is None or len(df) == 0:
+                raise RuntimeError(f"No test split events loaded for sample '{sample_name}'")
+            df = _assign_test_split_mc_weight(
+                df,
+                sample_name,
+                int(sample_meta["total_entries"]),
+                score_reweight_branches,
+            )
+            mask = _threshold_mask(df, thresholds)
+            df = df.loc[mask].reset_index(drop=True)
+            if len(df) == 0:
+                log_message(f"  [WARN] score sample '{sample_name}' has zero events after filtering")
+                continue
+            X_model = _standardize_model_X(df[model_branches].copy(), clip_ranges, list(log_tf_set))
+            X_model = _drop_decorrelated_features(X_model, decorrelate)
+            proba = _predict_model_proba(clf, X_model, len(class_names))
+            if ref_feature_names is None:
+                ref_feature_names = list(X_model.columns)
+            score_df = _add_score_columns(df, proba, class_names)
+            cls_name = sample_to_class_name[sample_name]
+            score_parts_by_class[cls_name].append(score_df)
+            ref_sample_labels.extend([sample_name] * len(df))
+            ref_class_idx.extend([sample_to_class_idx[sample_name]] * len(df))
+            ref_weights.extend(score_df["weight"].to_numpy(dtype=float, copy=False))
+            ref_proba_parts.append(proba)
+            log_message(
+                f"  score {sample_name}: class={cls_name}, test_loaded={len(df)}, "
+                f"weight_sum={float(score_df['weight'].sum()):.6g}"
+            )
+
+        for cls_name, parts in score_parts_by_class.items():
+            if parts:
+                score_class_dfs[cls_name] = pd.concat(parts, ignore_index=True)
+
+        if not ref_proba_parts:
+            raise RuntimeError(f"No MC score events after filtering for tree '{tree_name}'")
+        score_proba_ref = np.concatenate(ref_proba_parts, axis=0)
+        _compare_score_reference(
+            os.path.join(bdt_root_dir, "test_reference_signal_region.npz"),
+            ref_feature_names,
+            ref_sample_labels,
+            ref_class_idx,
+            ref_weights,
+            score_proba_ref,
+        )
+
+        if DATA_SAMPLES:
+            score_data_load = sorted(set(model_branches) | set(thresholds.keys()))
+            score_data_parts = []
+            log_message(f"Loading data score samples: n={len(DATA_SAMPLES)}")
+            for sname in DATA_SAMPLES:
+                files = _input_files(sname, input_root, input_pattern)
+                if not files:
+                    raise RuntimeError(f"No ROOT files found for data score sample '{sname}'")
+                df = _load_tree(files, tree_name, score_data_load)
+                if df is None or len(df) == 0:
+                    log_message(f"  [WARN] data score sample '{sname}' has zero entries")
+                    continue
+                df = _apply_thresholds(df, thresholds)
+                if df is None or len(df) == 0:
+                    log_message(f"  [WARN] data score sample '{sname}' has zero events after filtering")
+                    continue
+                df["weight"] = 1.0
+                X_model = _standardize_model_X(df[model_branches].copy(), clip_ranges, list(log_tf_set))
+                X_model = _drop_decorrelated_features(X_model, decorrelate)
+                proba = _predict_model_proba(clf, X_model, len(class_names))
+                score_data_parts.append(_add_score_columns(df, proba, class_names))
+                log_message(f"  data score {sname}: events={len(df)}")
+            if score_data_parts:
+                score_data_df = pd.concat(score_data_parts, ignore_index=True)
+                log_message(f"Loaded data score events: {len(score_data_df)}")
+            else:
+                log_message("Loaded data score events: 0")
+
     # Apply thresholds and then clip ranges; the weights stay fixed.
     def _prepare(df):
         if df is None or len(df) == 0:
@@ -484,12 +810,15 @@ def _process_tree(tree_name):
 
     for idx, branch in enumerate(branches_to_plot, start=1):
         log_message(f"Plotting branch {idx}/{len(branches_to_plot)}: {branch}")
+        is_score_branch = branch in score_branches
+        plot_class_dfs = score_class_dfs if is_score_branch else class_dfs
+        plot_data_df = score_data_df if is_score_branch else data_df
         arrs = []
         for cls in class_names:
-            if cls in class_dfs and branch in class_dfs[cls].columns:
-                arrs.append(class_dfs[cls][branch].values)
-        if data_df is not None and branch in data_df.columns:
-            arrs.append(data_df[branch].values)
+            if cls in plot_class_dfs and branch in plot_class_dfs[cls].columns:
+                arrs.append(plot_class_dfs[cls][branch].values)
+        if plot_data_df is not None and branch in plot_data_df.columns:
+            arrs.append(plot_data_df[branch].values)
 
         binning = _resolve_binning(tree_name, branch, arrs, log_tf_set)
         if binning is None:
@@ -505,10 +834,10 @@ def _process_tree(tree_name):
         mc_per_cls  = {}
         mc_yields   = {}
         for cls in class_names:
-            if cls in class_dfs and branch in class_dfs[cls].columns:
+            if cls in plot_class_dfs and branch in plot_class_dfs[cls].columns:
                 h, h2 = _weighted_hist(
-                    class_dfs[cls][branch].values,
-                    class_dfs[cls]["weight"].values, edges
+                    plot_class_dfs[cls][branch].values,
+                    plot_class_dfs[cls]["weight"].values, edges
                 )
             else:
                 h  = np.zeros(bins)
@@ -518,9 +847,9 @@ def _process_tree(tree_name):
             mc_total_w2 += h2
             mc_yields[cls] = float(h.sum())
 
-        if data_df is not None and branch in data_df.columns:
+        if plot_data_df is not None and branch in plot_data_df.columns:
             data_v, data_w2 = _weighted_hist(
-                data_df[branch].values, data_df["weight"].values, edges
+                plot_data_df[branch].values, plot_data_df["weight"].values, edges
             )
         else:
             data_v  = np.zeros(bins)

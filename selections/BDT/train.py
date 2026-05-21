@@ -14,6 +14,15 @@ from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.metrics import roc_auc_score, roc_curve
 from typing import List
 
+from model_io import (
+    TorchModelHandle,
+    build_torch_mlp,
+    import_torch,
+    model_type_from_config,
+    predict_model_logits as _shared_predict_model_logits,
+    predict_model_proba as _shared_predict_model_proba,
+)
+
 plt.rcParams['mathtext.fontset'] = 'cm'
 plt.rcParams['mathtext.rm'] = 'serif'
 plt.style.use(hep.style.CMS)
@@ -67,6 +76,7 @@ INPUT_ROOT         = os.path.normpath(os.path.join(_SCRIPT_DIR, cfg["input_root"
 INPUT_PATTERN      = cfg["input_pattern"]
 OUTPUT_ROOT_PATTERN = cfg.get("output_root", ".")
 MODEL_PATTERN      = cfg.get("model_pattern", "{output_root}/{tree_name}_model")
+MODEL_TYPE         = model_type_from_config(cfg)
 
 if not 0.0 < TRAIN_FRACTION < 1.0:
     raise ValueError(f"train_fraction must be in (0, 1), got {TRAIN_FRACTION}")
@@ -961,40 +971,115 @@ def _build_decor_state(Z: np.ndarray, mode: str):
     raise ValueError(f"Unsupported decorrelation loss mode: {mode}")
 
 
-def _smooth_cvm_value_and_grad_1d(score, memberships, weights, thresholds, score_tau):
-    score = np.asarray(score, dtype=float).ravel()
+def _prepare_decor_state_for_labels(decor_state, labels, weights, num_class):
+    mode = decor_state.get("mode", "none")
+    if mode == "none":
+        return decor_state
+
+    labels = np.asarray(labels, dtype=int).ravel()
     weights = np.asarray(weights, dtype=float).ravel()
+    class_states = []
+
+    for cls_idx in range(int(num_class)):
+        idx = np.nonzero(labels == cls_idx)[0]
+        cls_weights = weights[idx]
+        state = {"indices": idx, "weights": cls_weights}
+
+        if mode == "smooth_cvm":
+            feature_states = []
+            for memberships in decor_state.get("memberships", []):
+                feature_memberships = memberships[idx, :] if memberships is not None else None
+                feature_states.append(
+                    _prepare_smooth_cvm_feature_state(feature_memberships, cls_weights)
+                )
+            state["features"] = feature_states
+        elif mode == "cvm":
+            feature_groups = []
+            for groups in decor_state.get("groups", []):
+                if not groups:
+                    feature_groups.append(None)
+                    continue
+                local_groups = []
+                for group_idx in groups:
+                    group_idx = np.asarray(group_idx, dtype=int)
+                    cls_group_idx = group_idx[labels[group_idx] == cls_idx]
+                    if cls_group_idx.size >= 3:
+                        local_groups.append(np.searchsorted(idx, cls_group_idx))
+                feature_groups.append(local_groups if local_groups else None)
+            state["groups"] = feature_groups
+        else:
+            raise ValueError(f"Unsupported decorrelation loss mode: {mode}")
+
+        class_states.append(state)
+
+    prepared = dict(decor_state)
+    prepared["class_states"] = class_states
+    if mode == "smooth_cvm":
+        prepared.pop("memberships", None)
+    return prepared
+
+
+def _prepare_smooth_cvm_feature_state(memberships, weights):
+    if memberships is None:
+        return None
+    memberships = np.asarray(memberships, dtype=float)
+    weights = np.asarray(weights, dtype=float).ravel()
+    if memberships.ndim != 2 or memberships.shape[0] != weights.size:
+        raise ValueError("Smooth-CvM memberships and weights have incompatible shapes.")
+    total_w = float(np.sum(weights))
+    if memberships.shape[0] == 0 or total_w <= _EPS:
+        return None
+
+    weighted_memberships = weights[:, None] * memberships
+    bin_totals = np.sum(weighted_memberships, axis=0)
+    valid_bins = bin_totals > _EPS
+    if not np.any(valid_bins):
+        return None
+
+    bin_totals_v = bin_totals[valid_bins]
+    memberships_v = memberships[:, valid_bins]
+    return {
+        "weights": weights,
+        "total_w": total_w,
+        "weighted_memberships_t": np.ascontiguousarray(weighted_memberships[:, valid_bins].T),
+        "bin_totals": bin_totals_v,
+        "rho": bin_totals_v / total_w,
+        "membership_over_bin_total": np.ascontiguousarray(memberships_v / bin_totals_v),
+    }
+
+
+def _smooth_cvm_value_and_grad_1d(score, feature_state, thresholds, score_tau,
+                                  need_derivatives=True):
+    score = np.asarray(score, dtype=float).ravel()
     n = score.size
     grad = np.zeros(n, dtype=float)
     hess = np.zeros(n, dtype=float)
-    if memberships is None or n == 0:
+    if feature_state is None or n == 0:
         return 0.0, grad, hess
 
-    total_w = float(np.sum(weights))
+    weights = feature_state["weights"]
+    total_w = float(feature_state["total_w"])
+    if weights.size != n:
+        raise ValueError("Smooth-CvM feature state and score have incompatible shapes.")
     if total_w <= _EPS:
         return 0.0, grad, hess
 
     thresholds = np.asarray(thresholds, dtype=float).ravel()
     sig = _sigmoid((score[:, None] - thresholds[None, :]) / score_tau)
-    dsig = sig * (1.0 - sig) / score_tau
 
     global_eff = np.sum(weights[:, None] * sig, axis=0) / total_w
-    weighted_memberships = weights[:, None] * memberships
-    bin_totals = np.sum(weighted_memberships, axis=0)
-    valid_bins = bin_totals > _EPS
-    if not np.any(valid_bins):
-        return 0.0, grad, hess
-
-    memberships_v = memberships[:, valid_bins]
-    bin_totals_v = bin_totals[valid_bins]
-    rho = bin_totals_v / total_w
-    local_eff = (weighted_memberships[:, valid_bins].T @ sig) / bin_totals_v[:, None]
+    local_eff = (feature_state["weighted_memberships_t"] @ sig) / feature_state["bin_totals"][:, None]
     delta = local_eff - global_eff[None, :]
     n_thr = float(sig.shape[1])
 
-    loss = float(np.sum(rho[:, None] * delta * delta) / n_thr)
-    local_term = (memberships_v / bin_totals_v) @ (rho[:, None] * delta)
-    global_term = np.sum(rho[:, None] * delta, axis=0) / total_w
+    weighted_delta = feature_state["rho"][:, None] * delta
+    loss = float(np.sum(weighted_delta * delta) / n_thr)
+    if not need_derivatives:
+        return loss, grad, hess
+
+    dsig = sig * (1.0 - sig) / score_tau
+    local_term = feature_state["membership_over_bin_total"] @ weighted_delta
+    global_term = np.sum(weighted_delta, axis=0) / total_w
     coeff = local_term - global_term[None, :]
     grad = (2.0 * weights[:, None] * dsig * coeff).sum(axis=1) / n_thr
     # Positive Gauss-Newton-style diagonal surrogate for the coupled decorrelation term.
@@ -1074,7 +1159,8 @@ def _weighted_mlogloss(loss_sum, weights):
     return float(loss_sum / weight_sum)
 
 
-def _decorrelation_loss_components(logits, labels, weights, decor_state, num_class, decor_scale=1.0):
+def _decorrelation_loss_components(logits, labels, weights, decor_state, num_class,
+                                   decor_scale=1.0, need_derivatives=True):
     labels = np.asarray(labels, dtype=int).ravel()
     weights = np.asarray(weights, dtype=float).ravel()
     logits = _reshape_multiclass_margin(logits, num_class, labels.size)
@@ -1085,6 +1171,57 @@ def _decorrelation_loss_components(logits, labels, weights, decor_state, num_cla
 
     if mode == "none":
         return loss, grad, hess
+
+    class_states = decor_state.get("class_states")
+    if class_states is not None:
+        for cls_idx in range(num_class):
+            state = class_states[cls_idx]
+            idx = state["indices"]
+            if idx.size == 0:
+                continue
+            cls_weights = state["weights"]
+            score = logits[idx, cls_idx]
+
+            if mode == "cvm":
+                groups_by_feature = state.get("groups", [])
+                cls_loss = _cvm_flatness_value_from_groups(score, groups_by_feature, cls_weights, power=2.0)
+                cls_grad = np.zeros_like(score)
+                cls_hess = np.zeros_like(score)
+                if need_derivatives:
+                    for groups in groups_by_feature:
+                        if not groups:
+                            continue
+                        # Hard-bin CvM is non-smooth; keep the legacy surrogate gradient but
+                        # make it consistent with the loss recorded below.
+                        cls_grad += -_cvm_flatness_neg_grad_wrt_y(score, groups, cls_weights, power=2.0)
+                    cls_hess = np.maximum(np.abs(cls_grad), 1e-6)
+            elif mode == "smooth_cvm":
+                cls_loss = 0.0
+                cls_grad = np.zeros_like(score)
+                cls_hess = np.zeros_like(score)
+                for feature_state in state.get("features", []):
+                    part_loss, part_grad, part_hess = _smooth_cvm_value_and_grad_1d(
+                        score,
+                        feature_state,
+                        decor_state["score_thresholds"],
+                        decor_state["score_tau"],
+                        need_derivatives=need_derivatives,
+                    )
+                    cls_loss += part_loss
+                    if need_derivatives:
+                        cls_grad += part_grad
+                        cls_hess += part_hess
+                if need_derivatives:
+                    cls_hess = np.maximum(cls_hess, 1e-6)
+            else:
+                raise ValueError(f"Unsupported decorrelation loss mode: {mode}")
+
+            loss += float(decor_scale * cls_loss)
+            if need_derivatives:
+                grad[idx, cls_idx] = decor_scale * cls_grad
+                hess[idx, cls_idx] = decor_scale * cls_hess
+
+        return float(loss), grad, hess
 
     for cls_idx in range(num_class):
         mask_cls = labels == cls_idx
@@ -1110,23 +1247,27 @@ def _decorrelation_loss_components(logits, labels, weights, decor_state, num_cla
             cls_grad = np.zeros_like(score)
             cls_hess = np.zeros_like(score)
             for memberships in decor_state.get("memberships", []):
+                feature_state = _prepare_smooth_cvm_feature_state(memberships, cls_weights)
                 part_loss, part_grad, part_hess = _smooth_cvm_value_and_grad_1d(
                     score,
-                    memberships,
-                    cls_weights,
+                    feature_state,
                     decor_state["score_thresholds"],
                     decor_state["score_tau"],
+                    need_derivatives=need_derivatives,
                 )
                 cls_loss += part_loss
-                cls_grad += part_grad
-                cls_hess += part_hess
-            cls_hess = np.maximum(cls_hess, 1e-6)
+                if need_derivatives:
+                    cls_grad += part_grad
+                    cls_hess += part_hess
+            if need_derivatives:
+                cls_hess = np.maximum(cls_hess, 1e-6)
         else:
             raise ValueError(f"Unsupported decorrelation loss mode: {mode}")
 
         loss += float(decor_scale * cls_loss)
-        grad[:, cls_idx] = decor_scale * cls_grad
-        hess[:, cls_idx] = decor_scale * cls_hess
+        if need_derivatives:
+            grad[:, cls_idx] = decor_scale * cls_grad
+            hess[:, cls_idx] = decor_scale * cls_hess
 
     return float(loss), grad, hess
 
@@ -1144,7 +1285,8 @@ def _loss_components(predt, labels, weights, decor_state, num_class, lam, decor_
         if prediction_mode != "margin":
             raise ValueError("Decorrelation loss requires raw margin predictions.")
         decor_loss_raw, _, _ = _decorrelation_loss_components(
-            predt, labels, weights, decor_state, num_class, decor_scale
+            predt, labels, weights, decor_state, num_class, decor_scale,
+            need_derivatives=False,
         )
     decor_loss = float(lam * decor_loss_raw)
     return {
@@ -1153,6 +1295,51 @@ def _loss_components(predt, labels, weights, decor_state, num_class, lam, decor_
         "decorrelation": decor_loss,
         "regularization": 0.0,
         "total": float(cls_loss + decor_loss),
+    }
+
+
+def _nn_loss_components_from_epoch_sums(epoch_sums, n_steps):
+    if int(n_steps) <= 0:
+        return {
+            "classification": float("nan"),
+            "mlogloss": float("nan"),
+            "decorrelation": float("nan"),
+            "regularization": 0.0,
+            "objective": float("nan"),
+            "total": float("nan"),
+        }
+    inv = 1.0 / float(n_steps)
+    cls_loss = float(epoch_sums.get("classification", 0.0) * inv)
+    decor_loss = float(epoch_sums.get("decorrelation", 0.0) * inv)
+    reg_loss = float(epoch_sums.get("regularization", 0.0) * inv)
+    objective_sum = epoch_sums.get("total")
+    objective_loss = (
+        float(objective_sum * inv)
+        if objective_sum is not None
+        else float(cls_loss + decor_loss)
+    )
+    return {
+        "classification": cls_loss,
+        "mlogloss": cls_loss,
+        "decorrelation": decor_loss,
+        "regularization": reg_loss,
+        "objective": objective_loss,
+        "total": objective_loss,
+    }
+
+
+def _nn_loss_components_from_values(cls_loss, decor_loss=0.0, reg_loss=0.0):
+    cls_loss = float(cls_loss)
+    decor_loss = float(decor_loss)
+    reg_loss = float(reg_loss)
+    objective_loss = float(cls_loss + decor_loss)
+    return {
+        "classification": cls_loss,
+        "mlogloss": cls_loss,
+        "decorrelation": decor_loss,
+        "regularization": reg_loss,
+        "objective": objective_loss,
+        "total": objective_loss,
     }
 
 
@@ -1425,7 +1612,9 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     early-stops on test ``total_loss = classification_loss +
     decorrelation_loss``. The sum-scale ``classification_loss``, exact
     native-style ``regularization_loss``, and ``total_loss`` remain
-    diagnostic outputs shared across both stages.
+    diagnostic outputs shared across both stages. When configured,
+    stage 1 and stage 2 both defer early stopping until the dynamic
+    learning-rate schedule has reached ``min_learning_rate``.
 
     Returns ``(stage1_model, stage2_model_or_None, splits, combined_loss_history, stage_boundary)``
     where ``stage_boundary`` is the number of stage-1 iterations kept.
@@ -1497,11 +1686,22 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         disable_default_eval_metric=1,
         tree_method="hist",
     )
+    for optional_param in ("colsample_bylevel", "colsample_bynode", "max_bin"):
+        if optional_param in hp:
+            base_params[optional_param] = hp[optional_param]
 
     # Build decor state on both splits when decor is enabled; stage-1 recorder
     # uses an explicit "none" decor_state so it contributes zero loss/grad/hess.
-    train_decor_state = _build_decor_state(Z_train, DECOR_LOSS_MODE) if use_decor else {"mode": "none"}
-    test_decor_state = _build_decor_state(Z_test, DECOR_LOSS_MODE) if use_decor else {"mode": "none"}
+    if use_decor:
+        train_decor_state = _prepare_decor_state_for_labels(
+            _build_decor_state(Z_train, DECOR_LOSS_MODE), y_train, w_train, NUM_CLASSES
+        )
+        test_decor_state = _prepare_decor_state_for_labels(
+            _build_decor_state(Z_test, DECOR_LOSS_MODE), y_test, w_test, NUM_CLASSES
+        )
+    else:
+        train_decor_state = {"mode": "none"}
+        test_decor_state = {"mode": "none"}
 
     # ---------- Stage 1: native cls-only ----------
     stage1_params = dict(base_params)
@@ -1528,6 +1728,8 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
             compact_log=True,
             monitor_metric_key="classification",
             monitor_metric_label="classification_loss",
+            lr_reduce_patience=lr_reduce_patience,
+            min_learning_rate=min_learning_rate,
         )
         train_kwargs = dict(
             params={**stage1_params, **extra_params},
@@ -1558,6 +1760,9 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     if stage1_model.num_boosted_rounds() != stage1_rounds:
         stage1_model = stage1_model[:stage1_rounds]
     stage1_history = _trim_loss_history(stage1_recorder.history, stage1_rounds)
+    stage1_reg_loss = _loss_value_at(
+        stage1_history, "train", "regularization", stage1_rounds - 1
+    )
 
     base_path = model_name[:-5] if model_name.endswith(".json") else model_name
     stage1_save_path = f"{base_path}_stage1.json"
@@ -1581,15 +1786,10 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     _, _, _, cls_loss_ref = _multiclass_classification_terms(
         y_train, stage1_logits, w_train, NUM_CLASSES
     )
-    reg_loss_ref = _booster_regularization_loss(
-        stage1_model,
-        stage1_params["reg_lambda"],
-        stage1_params["reg_alpha"],
-        stage1_params["gamma"],
-        stage1_params["eta"],
-    )
+    reg_loss_ref = float(stage1_reg_loss)
     decor_loss_ref_raw, _, _ = _decorrelation_loss_components(
-        stage1_logits, y_train, w_train, train_decor_state, NUM_CLASSES, decor_scale=1.0
+        stage1_logits, y_train, w_train, train_decor_state, NUM_CLASSES,
+        decor_scale=1.0, need_derivatives=False,
     )
     numerator = max(float(cls_loss_ref) + float(reg_loss_ref), _EPS)
     if not np.isfinite(decor_loss_ref_raw) or decor_loss_ref_raw <= _EPS:
@@ -1690,40 +1890,708 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     return stage1_model, stage2_model, splits, combined_history, stage1_rounds
 
 
+def _nn_config_for_tree(tree_name):
+    hp = dict(cfg.get(f"{tree_name}_nn", {}))
+    if not hp:
+        raise RuntimeError(
+            f"model_type='nn' requires a '{tree_name}_nn' configuration block"
+        )
+    return hp
+
+
+def _torch_state_copy(model):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def _torch_predict_logits_numpy(torch, model, device, X_np, batch_size):
+    model.eval()
+    parts = []
+    batch_size = max(1, int(batch_size))
+    with torch.no_grad():
+        for start in range(0, X_np.shape[0], batch_size):
+            xb = torch.as_tensor(
+                X_np[start:start + batch_size],
+                dtype=torch.float32,
+                device=device,
+            )
+            parts.append(model(xb).detach().cpu().numpy())
+    if not parts:
+        return np.zeros((0, NUM_CLASSES), dtype=float)
+    return np.concatenate(parts, axis=0)
+
+
+def _nn_build_decor_edges(torch, Z_train, device):
+    edges = []
+    for j in range(Z_train.shape[1]):
+        z = np.asarray(Z_train[:, j], dtype=float)
+        z = z[np.isfinite(z)]
+        if z.size == 0:
+            edges.append(None)
+            continue
+        z_min = float(np.min(z))
+        z_max = float(np.max(z))
+        if not np.isfinite(z_min) or not np.isfinite(z_max) or z_min == z_max:
+            edges.append(None)
+            continue
+        edge_np = np.linspace(z_min, z_max, max(2, DECOR_N_BINS) + 1, dtype=np.float32)
+        edges.append(torch.as_tensor(edge_np, dtype=torch.float32, device=device))
+    return edges
+
+
+def _torch_smooth_decor_loss(torch, logits, labels, weights, Z, decor_edges,
+                             score_thresholds, score_tau):
+    if Z is None or Z.shape[1] == 0 or not decor_edges:
+        return logits.new_tensor(0.0)
+
+    total_loss = logits.new_tensor(0.0)
+    eps = logits.new_tensor(_EPS)
+    score_tau_t = logits.new_tensor(max(float(score_tau), _EPS))
+
+    for cls_idx in range(NUM_CLASSES):
+        cls_mask = labels == int(cls_idx)
+        if int(cls_mask.sum().item()) < 3:
+            continue
+        score = logits[cls_mask, cls_idx]
+        cls_weights = weights[cls_mask]
+        total_w = torch.sum(cls_weights)
+        if not bool((total_w > eps).item()):
+            continue
+
+        sig = torch.sigmoid(
+            (score[:, None] - score_thresholds[None, :]) / score_tau_t
+        )
+        global_eff = torch.sum(cls_weights[:, None] * sig, dim=0) / torch.clamp(total_w, min=eps)
+
+        for feat_idx, edges in enumerate(decor_edges):
+            if edges is None:
+                continue
+            z = Z[cls_mask, feat_idx]
+            if z.numel() < 3:
+                continue
+            width = torch.clamp(edges[1] - edges[0], min=eps)
+            tau_z = torch.clamp(width * float(DECOR_BIN_TAU_SCALE), min=eps)
+            left = torch.sigmoid((z[:, None] - edges[:-1][None, :]) / tau_z)
+            right = torch.sigmoid((edges[1:][None, :] - z[:, None]) / tau_z)
+            memberships = left * right
+            row_sum = torch.sum(memberships, dim=1, keepdim=True)
+            memberships = memberships / torch.clamp(row_sum, min=eps)
+
+            weighted_memberships = cls_weights[:, None] * memberships
+            bin_totals = torch.sum(weighted_memberships, dim=0)
+            valid_bins = bin_totals > eps
+            if not bool(torch.any(valid_bins).item()):
+                continue
+            weighted_memberships = weighted_memberships[:, valid_bins]
+            bin_totals = bin_totals[valid_bins]
+            local_eff = weighted_memberships.transpose(0, 1).matmul(sig) / torch.clamp(
+                bin_totals[:, None], min=eps
+            )
+            rho = bin_totals / torch.clamp(total_w, min=eps)
+            delta = local_eff - global_eff[None, :]
+            total_loss = total_loss + torch.sum(rho[:, None] * delta * delta) / float(sig.shape[1])
+
+    return total_loss
+
+
+def _save_nn_checkpoint(torch, path, model, feature_names, hp, input_dim):
+    checkpoint = {
+        "model_type": "nn",
+        "num_classes": int(NUM_CLASSES),
+        "input_dim": int(input_dim),
+        "feature_names": list(feature_names),
+        "hidden_layers": [int(v) for v in hp.get("hidden_layers", [])],
+        "activation": str(hp.get("activation", "silu")),
+        "dropout": float(hp.get("dropout", 0.0)),
+        "batch_norm": bool(hp.get("batch_norm", False)),
+        "state_dict": _torch_state_copy(model),
+        "training_config": dict(hp),
+        "class_names": list(CLASS_NAMES),
+    }
+    torch.save(checkpoint, path)
+    log_message(f"Wrote model file: {path}")
+    return checkpoint
+
+
+def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
+                   model_name, tree_name, decorrelate_feature_names=None):
+    """Two-stage PyTorch MLP training with one NN objective-loss definition.
+
+    Stage 1 uses weighted CE. Stage 2 uses weighted CE plus scaled smooth-CvM
+    decorrelation. AdamW weight decay keeps the native decoupled optimizer
+    semantics and is not added to the objective loss.
+    """
+    torch, nn, F = import_torch()
+
+    hp = _nn_config_for_tree(tree_name)
+    requested_decor = bool(decorrelate_feature_names) and DECOR_LAMBDA > 0.0
+    if requested_decor and DECOR_LOSS_MODE != "smooth_cvm":
+        raise RuntimeError(
+            "model_type='nn' currently supports decor_loss_mode='smooth_cvm' only"
+        )
+
+    torch.manual_seed(int(RANDOM_STATE))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(RANDOM_STATE))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    X_train_all = X_train_all if isinstance(X_train_all, pd.DataFrame) else pd.DataFrame(X_train_all)
+    X_test_all = X_test_all if isinstance(X_test_all, pd.DataFrame) else pd.DataFrame(X_test_all)
+    y_train = np.asarray(y_train, dtype=int)
+    y_test = np.asarray(y_test, dtype=int)
+    w_train = np.asarray(w_train, dtype=float)
+    w_test = np.asarray(w_test, dtype=float)
+
+    decor_idx = _resolve_decor_indices(X_train_all, decorrelate_feature_names)
+    all_idx = np.arange(len(X_train_all.columns))
+    if decor_idx:
+        keep_idx = np.setdiff1d(all_idx, decor_idx)
+        if keep_idx.size == 0:
+            raise ValueError("Decorrelation columns cover all features; nothing left to train on.")
+        X_train = X_train_all.iloc[:, keep_idx]
+        X_test = X_test_all.iloc[:, keep_idx]
+        Z_train = X_train_all.iloc[:, decor_idx].to_numpy(dtype=np.float32, copy=True)
+        Z_test = X_test_all.iloc[:, decor_idx].to_numpy(dtype=np.float32, copy=True)
+    else:
+        X_train = X_train_all
+        X_test = X_test_all
+        Z_train = np.zeros((len(X_train_all), 0), dtype=np.float32)
+        Z_test = np.zeros((len(X_test_all), 0), dtype=np.float32)
+
+    feature_names = list(X_train.columns)
+    X_train_np = X_train.to_numpy(dtype=np.float32, copy=True)
+    X_test_np = X_test.to_numpy(dtype=np.float32, copy=True)
+
+    log_message(
+        f"Training arrays: X_train={X_train_np.shape}, Z_train={Z_train.shape}, "
+        f"decor_mode={DECOR_LOSS_MODE}"
+    )
+
+    hidden_layers = [int(v) for v in hp.get("hidden_layers", [256, 128, 64])]
+    batch_size = max(1, int(hp.get("batch_size", 8192)))
+    epochs = max(1, int(hp.get("epochs", 100)))
+    epochs_decorr = max(1, int(hp.get("epochs_decorr", 50)))
+    learning_rate = float(hp.get("learning_rate", 1e-3))
+    learning_rate_decorr = float(hp.get("learning_rate_decorr", learning_rate * 0.5))
+    min_learning_rate = float(hp.get("min_learning_rate", 0.0))
+    lr_reduce_patience = int(hp.get("lr_reduce_patience", 0))
+    early_stopping_rounds = int(hp.get("early_stopping_rounds", 10))
+    weight_decay = float(hp.get("weight_decay", 0.0))
+    grad_clip_norm = float(hp.get("grad_clip_norm", 0.0))
+    batch_norm = bool(hp.get("batch_norm", False))
+    if early_stopping_rounds <= 0:
+        raise ValueError(
+            f"early_stopping_rounds must be a positive integer, got {early_stopping_rounds}"
+        )
+
+    n_train = X_train_np.shape[0]
+    X_train_t = torch.as_tensor(X_train_np, dtype=torch.float32, device=device)
+    y_train_t = torch.as_tensor(y_train, dtype=torch.long, device=device)
+    Z_train_t = torch.as_tensor(Z_train, dtype=torch.float32, device=device)
+
+    use_decor = Z_train.shape[1] > 0 and DECOR_LAMBDA > 0.0
+    if use_decor:
+        decor_edges = _nn_build_decor_edges(torch, Z_train, device)
+        prob_grid = np.linspace(0.02, 0.98, max(3, DECOR_N_THRESHOLDS))
+        score_thresholds = torch.as_tensor(
+            np.log(prob_grid / (1.0 - prob_grid)).astype(np.float32),
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        decor_edges = []
+        score_thresholds = torch.zeros(1, dtype=torch.float32, device=device)
+
+    model = build_torch_mlp(
+        nn,
+        input_dim=X_train_np.shape[1],
+        hidden_layers=hidden_layers,
+        output_dim=NUM_CLASSES,
+        activation=hp.get("activation", "silu"),
+        dropout=float(hp.get("dropout", 0.0)),
+        batch_norm=batch_norm,
+    ).to(device)
+
+    log_message(
+        f"Thread mode: PyTorch, device = {device}, batch_size = {batch_size}, "
+        f"hidden_layers = {hidden_layers}"
+    )
+    log_message(
+        "NN objective diagnostics: backward() uses class-balanced mini-batches "
+        "with sampling-corrected event weights; train_objective_loss and "
+        "test_objective_loss are epoch-end eval-mode full-split batch objectives "
+        "using the same criterion formula. AdamW weight_decay remains a "
+        "decoupled optimizer update, not a logged loss term."
+    )
+
+    splits = (X_train_all, X_test_all, y_train, y_test, w_train, w_test)
+
+    if batch_size < NUM_CLASSES:
+        raise ValueError(
+            f"NN batch_size={batch_size} is smaller than NUM_CLASSES={NUM_CLASSES}; "
+            "class-balanced batching needs at least one event per class."
+        )
+    class_indices_train = []
+    for cls_idx, cls_name in enumerate(CLASS_NAMES):
+        idx = np.flatnonzero(y_train == cls_idx).astype(np.int64, copy=False)
+        if idx.size == 0:
+            raise RuntimeError(
+                f"Cannot build NN class-balanced batches: no training events for class '{cls_name}'"
+            )
+        class_indices_train.append(idx)
+    class_batch_counts = np.full(NUM_CLASSES, batch_size // NUM_CLASSES, dtype=np.int64)
+    remainder = int(batch_size - int(np.sum(class_batch_counts)))
+    if remainder > 0:
+        class_batch_counts[:remainder] += 1
+    steps_per_epoch = max(1, int(np.ceil(float(n_train) / float(batch_size))))
+    class_counts_train = np.asarray([idx.size for idx in class_indices_train], dtype=float)
+    class_sampling_factors = class_counts_train / class_batch_counts.astype(float)
+    mean_sampling_factor = float(np.mean(class_sampling_factors))
+    if not np.isfinite(mean_sampling_factor) or mean_sampling_factor <= 0.0:
+        raise RuntimeError("Invalid NN class-balanced sampling correction factors")
+    class_sampling_factors /= mean_sampling_factor
+    w_train_update = w_train * class_sampling_factors[y_train]
+    w_train_update_t = torch.as_tensor(w_train_update, dtype=torch.float32, device=device)
+    log_message(
+        "NN batch sampler: class-balanced, "
+        f"steps_per_epoch={steps_per_epoch}, "
+        f"per_class_batch={class_batch_counts.tolist()}, "
+        f"sampling_weight_factors={class_sampling_factors.tolist()}"
+    )
+
+    def _set_lr(optimizer, value):
+        for group in optimizer.param_groups:
+            group["lr"] = float(value)
+
+    def _make_optimizer(lr):
+        return torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=weight_decay)
+
+    def _torch_batch_loss(logits, labels, weights, Z_batch, lam, decor_scale):
+        ce = F.cross_entropy(logits, labels, reduction="none")
+        weight_sum = torch.clamp(torch.sum(weights), min=logits.new_tensor(_EPS))
+        cls_loss = torch.sum(weights * ce) / weight_sum
+        decor_loss = logits.new_tensor(0.0)
+        if lam > 0.0 and use_decor:
+            decor_raw = _torch_smooth_decor_loss(
+                torch,
+                logits,
+                labels,
+                weights,
+                Z_batch,
+                decor_edges,
+                score_thresholds,
+                DECOR_SCORE_TAU,
+            )
+            decor_loss = float(lam) * float(decor_scale) * decor_raw
+        return cls_loss + decor_loss, cls_loss, decor_loss
+
+    def _evaluate_torch_split(X_np, y_np, w_np, Z_np, lam, decor_scale):
+        model.eval()
+        epoch_sums = {
+            "classification": 0.0,
+            "decorrelation": 0.0,
+            "regularization": 0.0,
+            "total": 0.0,
+        }
+        n_steps_eval = 0
+        with torch.no_grad():
+            for start in range(0, X_np.shape[0], batch_size):
+                end = min(start + batch_size, X_np.shape[0])
+                if end <= start:
+                    continue
+                xb = torch.as_tensor(X_np[start:end], dtype=torch.float32, device=device)
+                yb = torch.as_tensor(y_np[start:end], dtype=torch.long, device=device)
+                wb = torch.as_tensor(w_np[start:end], dtype=torch.float32, device=device)
+                if use_decor:
+                    zb = torch.as_tensor(Z_np[start:end], dtype=torch.float32, device=device)
+                else:
+                    zb = None
+                logits = model(xb)
+                loss, cls_loss, decor_loss = _torch_batch_loss(
+                    logits, yb, wb, zb, lam, decor_scale
+                )
+                epoch_sums["classification"] += float(cls_loss.detach().cpu().item())
+                epoch_sums["decorrelation"] += float(decor_loss.detach().cpu().item())
+                epoch_sums["total"] += float(loss.detach().cpu().item())
+                n_steps_eval += 1
+        return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)
+
+    def _class_balanced_epoch_batches(rng):
+        shuffled = [rng.permutation(idx) for idx in class_indices_train]
+        positions = np.zeros(NUM_CLASSES, dtype=np.int64)
+        for _ in range(steps_per_epoch):
+            parts = []
+            for cls_idx, need_raw in enumerate(class_batch_counts):
+                need = int(need_raw)
+                take_parts = []
+                remaining = need
+                while remaining > 0:
+                    idx = shuffled[cls_idx]
+                    pos = int(positions[cls_idx])
+                    available = int(idx.size - pos)
+                    if available <= 0:
+                        shuffled[cls_idx] = rng.permutation(class_indices_train[cls_idx])
+                        positions[cls_idx] = 0
+                        continue
+                    take_now = min(remaining, available)
+                    take_parts.append(idx[pos:pos + take_now])
+                    positions[cls_idx] = pos + take_now
+                    remaining -= take_now
+                parts.append(np.concatenate(take_parts))
+            batch = np.concatenate(parts).astype(np.int64, copy=False)
+            rng.shuffle(batch)
+            yield batch
+
+    def _batch_mean_ce_from_logits(logits_np, y_np, w_np):
+        cls_loss_sum = 0.0
+        n_steps_eval = 0
+        for start in range(0, len(y_np), batch_size):
+            end = min(start + batch_size, len(y_np))
+            if end <= start:
+                continue
+            _, _, _, batch_cls_sum = _multiclass_classification_terms(
+                y_np[start:end],
+                logits_np[start:end],
+                w_np[start:end],
+                NUM_CLASSES,
+            )
+            batch_weight_sum = float(np.sum(w_np[start:end]))
+            if not np.isfinite(batch_weight_sum) or batch_weight_sum <= 0.0:
+                continue
+            cls_loss_sum += float(batch_cls_sum) / batch_weight_sum
+            n_steps_eval += 1
+        if n_steps_eval <= 0:
+            return float("nan")
+        return cls_loss_sum / float(n_steps_eval)
+
+    def _batch_mean_raw_decor_from_logits(logits_np, y_np, w_np, Z_np):
+        if not use_decor:
+            return 0.0
+        raw_sum = 0.0
+        n_steps_eval = 0
+        with torch.no_grad():
+            for start in range(0, len(y_np), batch_size):
+                end = min(start + batch_size, len(y_np))
+                if end <= start:
+                    continue
+                logits_t = torch.as_tensor(
+                    logits_np[start:end], dtype=torch.float32, device=device
+                )
+                y_t = torch.as_tensor(y_np[start:end], dtype=torch.long, device=device)
+                w_t = torch.as_tensor(w_np[start:end], dtype=torch.float32, device=device)
+                Z_t = torch.as_tensor(Z_np[start:end], dtype=torch.float32, device=device)
+                decor_raw = _torch_smooth_decor_loss(
+                    torch,
+                    logits_t,
+                    y_t,
+                    w_t,
+                    Z_t,
+                    decor_edges,
+                    score_thresholds,
+                    DECOR_SCORE_TAU,
+                )
+                raw_sum += float(decor_raw.detach().cpu().item())
+                n_steps_eval += 1
+        if n_steps_eval <= 0:
+            return float("nan")
+        return raw_sum / float(n_steps_eval)
+
+    def _format_nn_loss_line(epoch, stage_label, train_comp, test_comp, compact=False):
+        head = f"[{stage_label}][{epoch}]"
+        if compact:
+            return (
+                f"{head}"
+                f"\ttrain_objective_loss:{train_comp['objective']:.5f}"
+                f"\ttest_objective_loss:{test_comp['objective']:.5f}"
+                f"\ttrain_weighted_ce_loss:{train_comp['classification']:.5f}"
+                f"\ttest_weighted_ce_loss:{test_comp['classification']:.5f}"
+            )
+        return (
+            f"{head}"
+            f"\ttrain_objective_loss:{train_comp['objective']:.5f}"
+            f"\ttest_objective_loss:{test_comp['objective']:.5f}"
+            f"\ttrain_weighted_ce_loss:{train_comp['classification']:.5f}"
+            f"\ttrain_decorrelation_loss:{train_comp['decorrelation']:.5f}"
+            f"\ttest_weighted_ce_loss:{test_comp['classification']:.5f}"
+            f"\ttest_decorrelation_loss:{test_comp['decorrelation']:.5f}"
+        )
+
+    def _append_history(history, train_comp, test_comp):
+        for key in ("classification", "mlogloss", "decorrelation", "regularization", "objective", "total"):
+            history["train"][key].append(float(train_comp[key]))
+            history["test"][key].append(float(test_comp[key]))
+
+    def _run_stage(stage_label, n_epochs, lr, lam, decor_scale,
+                   monitor_metric_key, monitor_metric_label, compact_log):
+        optimizer = _make_optimizer(lr)
+        current_lr = float(lr)
+        dynamic_lr = (
+            lr_reduce_patience > 0
+            and min_learning_rate > 0.0
+            and current_lr > min_learning_rate + 1e-12
+        )
+        history = {
+            tag: {
+                "classification": [],
+                "mlogloss": [],
+                "decorrelation": [],
+                "regularization": [],
+                "objective": [],
+                "total": [],
+            }
+            for tag in ("train", "test")
+        }
+        best_state = None
+        best_iteration = None
+        best_score = float("inf")
+        stale_rounds = 0
+        lr_stale_rounds = 0
+        rng = np.random.default_rng(int(RANDOM_STATE))
+
+        for epoch in range(int(n_epochs)):
+            model.train()
+            for idx_np in _class_balanced_epoch_batches(rng):
+                if idx_np.size == 0:
+                    continue
+                if batch_norm and idx_np.size < 2:
+                    continue
+                idx = torch.as_tensor(idx_np, dtype=torch.long, device=device)
+                xb = X_train_t.index_select(0, idx)
+                yb = y_train_t.index_select(0, idx)
+                wb = w_train_update_t.index_select(0, idx)
+                logits = model(xb)
+                if use_decor:
+                    zb = Z_train_t.index_select(0, idx)
+                else:
+                    zb = None
+                loss, _, _ = _torch_batch_loss(
+                    logits, yb, wb, zb, lam, decor_scale
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer.step()
+
+            train_comp = _evaluate_torch_split(X_train_np, y_train, w_train, Z_train, lam, decor_scale)
+            test_comp = _evaluate_torch_split(X_test_np, y_test, w_test, Z_test, lam, decor_scale)
+            _append_history(history, train_comp, test_comp)
+            log_message(_format_nn_loss_line(
+                epoch, stage_label, train_comp, test_comp, compact=compact_log
+            ))
+
+            current_score = _loss_value_at(history, "test", monitor_metric_key, epoch)
+            improved = np.isfinite(current_score) and (
+                best_iteration is None or current_score < best_score - 1e-12
+            )
+            if improved:
+                best_iteration = int(epoch)
+                best_score = float(current_score)
+                best_state = _torch_state_copy(model)
+                stale_rounds = 0
+                lr_stale_rounds = 0
+                continue
+
+            if dynamic_lr and current_lr > min_learning_rate + 1e-12:
+                lr_stale_rounds += 1
+                if lr_stale_rounds >= lr_reduce_patience:
+                    old_lr = current_lr
+                    current_lr = max(old_lr * 0.5, min_learning_rate)
+                    _set_lr(optimizer, current_lr)
+                    log_message(
+                        f"Info: lr reduced ({stage_label}) at epoch {epoch} "
+                        f"(old_lr={old_lr:.6g}, new_lr={current_lr:.6g}, "
+                        f"best_test_{monitor_metric_label}={best_score:.5f})"
+                    )
+                    lr_stale_rounds = 0
+                    stale_rounds = 0
+                continue
+
+            stale_rounds += 1
+            if stale_rounds >= early_stopping_rounds:
+                log_message(
+                    f"Info: early stopping ({stage_label}) on {monitor_metric_label} "
+                    f"(best_iteration={best_iteration}, "
+                    f"best_test_{monitor_metric_label}={best_score:.5f})"
+                )
+                break
+
+        if best_state is None:
+            best_state = _torch_state_copy(model)
+            best_iteration = len(history["test"][monitor_metric_key]) - 1
+        model.load_state_dict(best_state)
+        kept = int(best_iteration) + 1
+        return _trim_loss_history(history, kept), kept
+
+    base_path = model_name[:-3] if model_name.endswith(".pt") else model_name
+    if base_path.endswith(".json"):
+        base_path = base_path[:-5]
+
+    # ---------- Stage 1: classification-only ----------
+    log_message(
+        f"Starting stage 1 (PyTorch MLP cls-only, epochs={epochs}, lr={learning_rate})"
+    )
+    stage1_history, stage1_rounds = _run_stage(
+        "stage1",
+        epochs,
+        learning_rate,
+        0.0,
+        1.0,
+        "objective",
+        "objective_loss",
+        True,
+    )
+
+    stage1_save_path = f"{base_path}_stage1.pt"
+    stage1_checkpoint = _save_nn_checkpoint(
+        torch,
+        stage1_save_path,
+        model,
+        feature_names,
+        hp,
+        X_train_np.shape[1],
+    )
+    stage1_model_eval = build_torch_mlp(
+        nn,
+        input_dim=X_train_np.shape[1],
+        hidden_layers=hidden_layers,
+        output_dim=NUM_CLASSES,
+        activation=hp.get("activation", "silu"),
+        dropout=float(hp.get("dropout", 0.0)),
+        batch_norm=batch_norm,
+    ).to(device)
+    stage1_model_eval.load_state_dict(stage1_checkpoint["state_dict"])
+    stage1_model_eval.eval()
+    stage1_handle = TorchModelHandle(
+        stage1_model_eval, device, feature_names, NUM_CLASSES, stage1_checkpoint
+    )
+
+    if not use_decor:
+        main_save_path = f"{base_path}.pt"
+        main_checkpoint = _save_nn_checkpoint(
+            torch,
+            main_save_path,
+            model,
+            feature_names,
+            hp,
+            X_train_np.shape[1],
+        )
+        stage1_handle.checkpoint = main_checkpoint
+        return stage1_handle, None, splits, stage1_history, stage1_rounds
+
+    # ---------- Stage 2: classification + smooth-CvM decorrelation ----------
+    stage1_logits = _torch_predict_logits_numpy(torch, model, device, X_train_np, batch_size)
+    cls_loss_ref = _batch_mean_ce_from_logits(stage1_logits, y_train, w_train)
+    decor_loss_ref_raw = _batch_mean_raw_decor_from_logits(stage1_logits, y_train, w_train, Z_train)
+    if not np.isfinite(decor_loss_ref_raw) or decor_loss_ref_raw <= _EPS:
+        raise RuntimeError(
+            f"Stage-1 raw decorrelation loss is non-positive ({decor_loss_ref_raw:.6g}); "
+            "cannot calibrate decorrelation scale"
+        )
+    decor_scale = max(float(cls_loss_ref), _EPS) / float(decor_loss_ref_raw)
+    log_message(
+        f"Stage-1 end: best_iter={stage1_rounds - 1}, cls_loss={cls_loss_ref:.6g}, "
+        f"reg_loss=0, raw_decor_loss={decor_loss_ref_raw:.6g}"
+    )
+    log_message(f"Decorrelation scale: mode={DECOR_LOSS_MODE}, fixed_scale={decor_scale:.6g}")
+
+    log_message(
+        f"Starting stage 2 (PyTorch MLP cls+decor, epochs_decorr={epochs_decorr}, "
+        f"lr={learning_rate_decorr})"
+    )
+    stage2_history, stage2_rounds = _run_stage(
+        "stage2",
+        epochs_decorr,
+        learning_rate_decorr,
+        DECOR_LAMBDA,
+        decor_scale,
+        "objective",
+        "objective_loss",
+        False,
+    )
+
+    combined_history = {
+        "train": {
+            k: list(stage1_history["train"].get(k, [])) + list(stage2_history["train"].get(k, []))
+            for k in ("classification", "mlogloss", "decorrelation", "regularization", "objective", "total")
+        },
+        "test": {
+            k: list(stage1_history["test"].get(k, [])) + list(stage2_history["test"].get(k, []))
+            for k in ("classification", "mlogloss", "decorrelation", "regularization", "objective", "total")
+        },
+    }
+
+    main_save_path = f"{base_path}.pt"
+    main_checkpoint = _save_nn_checkpoint(
+        torch,
+        main_save_path,
+        model,
+        feature_names,
+        hp,
+        X_train_np.shape[1],
+    )
+    model.eval()
+    stage2_handle = TorchModelHandle(model, device, feature_names, NUM_CLASSES, main_checkpoint)
+    return stage1_handle, stage2_handle, splits, combined_history, stage1_rounds
+
+
 # -------------------- Plotting --------------------
 def _booster_from_model(model):
+    if isinstance(model, TorchModelHandle):
+        return None
     return model.get_booster() if hasattr(model, "get_booster") else model
 
 
 def _predict_margins(model, Xlike):
-    booster = _booster_from_model(model)
-    dmat = _make_dmatrix(Xlike)
-    pred = booster.predict(dmat, output_margin=True)
-    return _reshape_multiclass_margin(pred, NUM_CLASSES, len(Xlike))
+    return _shared_predict_model_logits(model, Xlike, NUM_CLASSES)
 
 
 def _predict_proba(model, Xlike):
-    return _softmax_rows(_predict_margins(model, Xlike))
+    return _shared_predict_model_proba(model, Xlike, NUM_CLASSES)
 
 
 def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                  loss_history, stage_boundary, decorrelate_feature_names=None,
-                 decor_plot_X_test=None, decor_efficiencies=None):
+                 decor_plot_X_test=None, decor_efficiencies=None,
+                 eval_splits=None):
     """ROC curves, feature importance, score distributions, loss curves, and decorrelation checks.
 
     Model-dependent plots (ROC, importance, score distributions, decor_corr,
     and decor diagnostic multipage PDFs) are saved twice with ``_cls`` /
     ``_decorr`` suffixes (for the stage-1 baseline and stage-2 final model
-    respectively). ``feature_corr.pdf`` and the shared ``loss_mlogloss.pdf`` /
-    ``loss_classification.pdf`` / ``loss_decorrelation.pdf`` /
-    ``loss_total.pdf`` files are saved once. ``stage_boundary`` is the number
-    of stage-1 iterations kept; it is drawn as a dotted vertical line on the
-    loss curves.
+    respectively). ``feature_corr.pdf`` and the shared BDT
+    ``loss_mlogloss.pdf`` / ``loss_classification.pdf`` / ``loss_total.pdf``
+    or NN ``loss_weighted_ce.pdf`` / ``loss_objective.pdf`` plus
+    ``loss_decorrelation.pdf`` files are saved once. ``stage_boundary`` is the
+    number of stage-1 iterations kept; it is drawn as a dotted vertical line
+    on the loss curves. ``splits`` are the training-objective splits; when
+    ``eval_splits`` is provided, ordinary ROC, score, importance, and feature
+    correlation plots use those full-threshold evaluation splits while
+    decorrelation diagnostics keep using ``splits``.
     """
-    X_train_full, X_test_full, y_train, y_test, w_train, w_test = splits
+    (
+        X_train_decor_full,
+        X_test_decor_full,
+        y_train_decor,
+        y_test_decor,
+        w_train_decor,
+        w_test_decor,
+    ) = splits
+    if eval_splits is None:
+        eval_splits = splits
+    (
+        X_train_eval_full,
+        X_test_eval_full,
+        y_train_eval,
+        y_test_eval,
+        w_train_eval,
+        w_test_eval,
+    ) = eval_splits
 
-    full_feature_names = list(X_train_full.columns) if hasattr(X_train_full, "columns") \
-        else [f"f{i}" for i in range(X_train_full.shape[1])]
+    full_feature_names = list(X_train_decor_full.columns) if hasattr(X_train_decor_full, "columns") \
+        else [f"f{i}" for i in range(X_train_decor_full.shape[1])]
 
     def _resolve(names_or_idx):
         if not names_or_idx:
@@ -1753,19 +2621,23 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     def _slice(Xlike, idx):
         return Xlike.iloc[:, idx] if hasattr(Xlike, "iloc") else Xlike[:, idx]
 
-    X_train_used = _slice(X_train_full, keep_idx)
-    X_test_used = _slice(X_test_full, keep_idx)
+    X_train_decor_used = _slice(X_train_decor_full, keep_idx)
+    X_test_decor_used = _slice(X_test_decor_full, keep_idx)
+    X_train_eval_used = _slice(X_train_eval_full, keep_idx)
+    X_test_eval_used = _slice(X_test_eval_full, keep_idx)
     feat_names_used = [full_feature_names[i] for i in keep_idx]
 
     booster_ref = _booster_from_model(stage1_model if stage1_model is not None else stage2_model)
-    booster_features = booster_ref.feature_names or []
+    booster_features = (booster_ref.feature_names or []) if booster_ref is not None else []
     if booster_features and len(booster_features) == len(full_feature_names):
-        X_train_used, X_test_used = X_train_full, X_test_full
+        X_train_decor_used, X_test_decor_used = X_train_decor_full, X_test_decor_full
+        X_train_eval_used, X_test_eval_used = X_train_eval_full, X_test_eval_full
         feat_names_used = full_feature_names
         decor_idx_full = []
 
     n_classes = NUM_CLASSES
     class_names = CLASS_NAMES
+    is_nn_model = isinstance(stage1_model, TorchModelHandle) or isinstance(stage2_model, TorchModelHandle)
     palette = plt.cm.get_cmap("tab10", max(n_classes, 3))(np.arange(max(n_classes, 3)))
 
     def _savefig(stem, fig=None, tight=True):
@@ -1980,8 +2852,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 f"{tree_name} [{stage_tag}] no valid decorrelation plot data for score-vs-branch PDF"
             )
         scores = np.asarray(scores, dtype=float)
-        y_true = np.asarray(y_test, dtype=int)
-        wv_all = np.asarray(w_test, dtype=float)
+        y_true = np.asarray(y_test_decor, dtype=int)
+        wv_all = np.asarray(w_test_decor, dtype=float)
         path = _figure_path(output_root, f"decor_score_vs_branch{suffix}")
         pdf_state = {"pdf": None, "pages": 0}
         for cls_idx, cls_name in enumerate(class_names):
@@ -2047,8 +2919,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 f"{tree_name} [{stage_tag}] cannot build signal-score-shape PDF without signal classes"
             )
         scores = np.asarray(scores, dtype=float)
-        y_true = np.asarray(y_test, dtype=int)
-        wv_all = np.asarray(w_test, dtype=float)
+        y_true = np.asarray(y_test_decor, dtype=int)
+        wv_all = np.asarray(w_test_decor, dtype=float)
         path = _figure_path(output_root, f"decor_branch_shapes_by_signal_score{suffix}")
         pdf_state = {"pdf": None, "pages": 0}
         colors = plt.cm.get_cmap("viridis", max(len(decor_efficiencies), 2))(
@@ -2131,13 +3003,55 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             raise RuntimeError(f"{tree_name} [{stage_tag}] no pages written for signal-score-shape PDF")
         _close_pdf(pdf_state, path)
 
+    def _classification_loss_from_probs(probs, labels, weights):
+        probs = np.asarray(probs, dtype=float)
+        labels = np.asarray(labels, dtype=int)
+        weights = np.asarray(weights, dtype=float)
+        return float(np.sum(weights * (-np.log(probs[np.arange(labels.size), labels] + _EPS))))
+
+    def _subset_for_permutation_importance(Xlike, labels, weights):
+        max_events = int(cfg.get(f"{tree_name}_nn", {}).get("permutation_importance_events", 50000))
+        n_events = len(labels)
+        if max_events > 0 and n_events > max_events:
+            rng = np.random.default_rng(int(RANDOM_STATE))
+            idx = np.sort(rng.choice(n_events, size=max_events, replace=False))
+            if hasattr(Xlike, "iloc"):
+                return Xlike.iloc[idx].reset_index(drop=True), labels[idx], weights[idx]
+            return np.asarray(Xlike)[idx], labels[idx], weights[idx]
+        if hasattr(Xlike, "reset_index"):
+            return Xlike.reset_index(drop=True), labels, weights
+        return Xlike, labels, weights
+
+    def _permutation_importance(model, Xlike, labels, weights):
+        X_ref, y_ref, w_ref = _subset_for_permutation_importance(Xlike, labels, weights)
+        if len(y_ref) == 0:
+            return np.zeros(Xlike.shape[1], dtype=float)
+        baseline = _classification_loss_from_probs(_predict_proba(model, X_ref), y_ref, w_ref)
+        importances = []
+        rng = np.random.default_rng(int(RANDOM_STATE) + 17)
+        for col_idx in range(X_ref.shape[1]):
+            if hasattr(X_ref, "iloc"):
+                X_perm = X_ref.copy()
+                values = X_perm.iloc[:, col_idx].to_numpy(copy=True)
+                rng.shuffle(values)
+                X_perm.iloc[:, col_idx] = values
+            else:
+                X_perm = np.asarray(X_ref).copy()
+                values = X_perm[:, col_idx].copy()
+                rng.shuffle(values)
+                X_perm[:, col_idx] = values
+            loss = _classification_loss_from_probs(_predict_proba(model, X_perm), y_ref, w_ref)
+            importances.append(max(0.0, float(loss - baseline)))
+        return np.asarray(importances, dtype=float)
+
     def _plot_for_model(model, suffix, stage_tag):
         if model is None:
             return
-        probs_train = _predict_proba(model, X_train_used)
-        probs_test = _predict_proba(model, X_test_used)
-        margins_train = _predict_margins(model, X_train_used)
-        margins_test = _predict_margins(model, X_test_used)
+        probs_train = _predict_proba(model, X_train_eval_used)
+        probs_test = _predict_proba(model, X_test_eval_used)
+        probs_test_decor = _predict_proba(model, X_test_decor_used)
+        margins_train_decor = _predict_margins(model, X_train_decor_used)
+        margins_test_decor = _predict_margins(model, X_test_decor_used)
         booster = _booster_from_model(model)
 
         # ROC plots
@@ -2153,11 +3067,11 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 score_test = probs_test[:, sig_idx] / np.clip(
                     probs_test[:, sig_idx] + probs_test[:, bkg_idx], _EPS, None
                 )
-                mask_train = (y_train == sig_idx) | (y_train == bkg_idx)
-                mask_test = (y_test == sig_idx) | (y_test == bkg_idx)
+                mask_train = (y_train_eval == sig_idx) | (y_train_eval == bkg_idx)
+                mask_test = (y_test_eval == sig_idx) | (y_test_eval == bkg_idx)
                 color = palette[bkg_idx]
-                r_tst = _roc_binary(mask_test, score_test, y_test, w_test, sig_idx)
-                r_trn = _roc_binary(mask_train, score_train, y_train, w_train, sig_idx)
+                r_tst = _roc_binary(mask_test, score_test, y_test_eval, w_test_eval, sig_idx)
+                r_trn = _roc_binary(mask_train, score_train, y_train_eval, w_train_eval, sig_idx)
                 if r_tst:
                     fpr, tpr, auc = r_tst
                     ax.plot(tpr, fpr, color=color, linestyle="-",
@@ -2189,11 +3103,16 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             _plot_roc_for_signal(sig_idx, bkg_indices)
 
         # Importance plot
-        score_map = booster.get_score(importance_type="gain")
-        importances = []
-        for i, name in enumerate(feat_names_used):
-            importances.append(float(score_map.get(name, score_map.get(f"f{i}", 0.0))))
-        importances = np.asarray(importances, dtype=float)
+        if isinstance(model, TorchModelHandle):
+            importances = _permutation_importance(model, X_test_eval_used, y_test_eval, w_test_eval)
+            importance_label = "Permutation loss increase"
+        else:
+            score_map = booster.get_score(importance_type="gain")
+            importances = []
+            for i, name in enumerate(feat_names_used):
+                importances.append(float(score_map.get(name, score_map.get(f"f{i}", 0.0))))
+            importances = np.asarray(importances, dtype=float)
+            importance_label = "Gain"
         positive = importances > 0.0
         if not np.any(positive):
             positive = np.ones_like(importances, dtype=bool)
@@ -2212,7 +3131,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         ax.set_yticks(y_pos)
         ax.set_yticklabels(imp_names, fontsize=10)
         ax.set_title(f"{tree_name} Feature Importance [{stage_tag}]", fontsize=16)
-        ax.set_xlabel("Gain", fontsize=12)
+        ax.set_xlabel(importance_label, fontsize=12)
         positive_vals = imp_vals[imp_vals > 0.0]
         if positive_vals.size > 0:
             ax.set_xscale("log")
@@ -2231,33 +3150,33 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             score_test = probs_test[:, sig_idx] / np.clip(
                 probs_test[:, sig_idx] + probs_test[:, bkg_idx], _EPS, None
             )
-            mask_train = (y_train == sig_idx) | (y_train == bkg_idx)
-            mask_test = (y_test == sig_idx) | (y_test == bkg_idx)
+            mask_train = (y_train_eval == sig_idx) | (y_train_eval == bkg_idx)
+            mask_test = (y_test_eval == sig_idx) | (y_test_eval == bkg_idx)
             bins = np.linspace(0, 1, 31)
             fig, ax = plt.subplots(figsize=(8, 6))
             ax.set_xlim(0, 1)
             ax.hist(
-                score_train[mask_train & (y_train == bkg_idx)],
+                score_train[mask_train & (y_train_eval == bkg_idx)],
                 bins=bins,
-                weights=w_train[mask_train & (y_train == bkg_idx)],
+                weights=w_train_eval[mask_train & (y_train_eval == bkg_idx)],
                 density=True,
                 histtype="bar",
                 alpha=0.5,
                 label=f"Train {bkg_name}",
             )
             ax.hist(
-                score_train[mask_train & (y_train == sig_idx)],
+                score_train[mask_train & (y_train_eval == sig_idx)],
                 bins=bins,
-                weights=w_train[mask_train & (y_train == sig_idx)],
+                weights=w_train_eval[mask_train & (y_train_eval == sig_idx)],
                 density=True,
                 histtype="bar",
                 alpha=0.5,
                 label=f"Train {sig_name}",
             )
             ax.hist(
-                score_test[mask_test & (y_test == bkg_idx)],
+                score_test[mask_test & (y_test_eval == bkg_idx)],
                 bins=bins,
-                weights=w_test[mask_test & (y_test == bkg_idx)],
+                weights=w_test_eval[mask_test & (y_test_eval == bkg_idx)],
                 density=True,
                 histtype="step",
                 linewidth=2,
@@ -2265,9 +3184,9 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 label=f"Test {bkg_name}",
             )
             ax.hist(
-                score_test[mask_test & (y_test == sig_idx)],
+                score_test[mask_test & (y_test_eval == sig_idx)],
                 bins=bins,
-                weights=w_test[mask_test & (y_test == sig_idx)],
+                weights=w_test_eval[mask_test & (y_test_eval == sig_idx)],
                 density=True,
                 histtype="step",
                 linewidth=2,
@@ -2300,8 +3219,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 return R
 
             for tag, scores, Xfull, y_true, wv in [
-                ("train", margins_train, X_train_full, y_train, w_train),
-                ("test", margins_test, X_test_full, y_test, w_test),
+                ("train", margins_train_decor, X_train_decor_full, y_train_decor, w_train_decor),
+                ("test", margins_test_decor, X_test_decor_full, y_test_decor, w_test_decor),
             ]:
                 R = _build_corr_matrix(scores, Xfull, y_true, wv)
                 _plot_matrix_heatmap(
@@ -2319,8 +3238,8 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                     )
                     log_message(f"{tree_name} [{stage_tag}] {tag} decor corr [{cls_name}] {stats}")
 
-        _plot_score_vs_decor_pdf(probs_test, suffix, stage_tag)
-        _plot_decor_shape_by_score_pdf(probs_test, suffix, stage_tag)
+        _plot_score_vs_decor_pdf(probs_test_decor, suffix, stage_tag)
+        _plot_decor_shape_by_score_pdf(probs_test_decor, suffix, stage_tag)
 
     _plot_for_model(stage1_model, "_cls", "stage1")
     _plot_for_model(stage2_model, "_decorr", "stage2")
@@ -2343,7 +3262,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
                 color="gray", linestyle=":", alpha=0.7,
                 label="stage 2 start",
             )
-        ax.set_xlabel("Boosting Round")
+        ax.set_xlabel("Epoch" if is_nn_model else "Boosting Round")
         ax.set_ylabel(ylabel)
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend()
@@ -2358,12 +3277,16 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             ax.set_ylim(bottom=0.0)
         _savefig(stem, fig=fig)
 
-    _plot_loss_metric("classification", "classification_loss", "loss_classification")
-    _plot_loss_metric("mlogloss", "mlogloss", "loss_mlogloss")
+    if is_nn_model:
+        _plot_loss_metric("classification", "weighted_ce_loss", "loss_weighted_ce")
+        _plot_loss_metric("objective", "objective_loss", "loss_objective")
+    else:
+        _plot_loss_metric("classification", "classification_loss", "loss_classification")
+        _plot_loss_metric("mlogloss", "mlogloss", "loss_mlogloss")
+        _plot_loss_metric("total", "total_loss", "loss_total")
     _plot_loss_metric("decorrelation", "decorrelation_loss", "loss_decorrelation")
-    _plot_loss_metric("total", "total_loss", "loss_total")
 
-    X_tr_df = pd.DataFrame(_as_array(X_train_used), columns=feat_names_used)
+    X_tr_df = pd.DataFrame(_as_array(X_train_eval_used), columns=feat_names_used)
     corr = X_tr_df.corr(numeric_only=True).dropna(axis=0, how="all").dropna(axis=1, how="all")
     if not corr.empty:
         _plot_matrix_heatmap(
@@ -2403,6 +3326,22 @@ def _split_mass_thresholds(thresholds):
         else:
             other_thresholds[name] = cond
     return mass_thresholds, other_thresholds
+
+
+def _split_training_thresholds(thresholds, decorrelate_feature_names):
+    decor_threshold_names = {
+        str(name) for name in decorrelate_feature_names
+        if not isinstance(name, (int, np.integer)) and str(name) in thresholds
+    }
+    training_thresholds = {
+        name: cond for name, cond in thresholds.items()
+        if name not in decor_threshold_names
+    }
+    decor_thresholds = {
+        name: cond for name, cond in thresholds.items()
+        if name in decor_threshold_names
+    }
+    return training_thresholds, decor_thresholds
 
 
 def _drop_decorrelated_features(X, decorrelate_feature_names):
@@ -2460,6 +3399,7 @@ def main():
         thresholds = {k: (tuple(v) if isinstance(v, list) else v)
                       for k, v in sel.get("thresholds", {}).items()}
         decorrelate = cfg.get(tree_name, {}).get("decorrelate", [])
+        training_thresholds, decor_thresholds = _split_training_thresholds(thresholds, decorrelate)
         model_path = MODEL_PATTERN.format(output_root=output_root, tree_name=tree_name)
 
         # Threshold and decorrelate branches that are NOT declared in branch.json
@@ -2475,8 +3415,14 @@ def main():
         drop_after_filter = [c for c in extra_cols if c not in decorrelate]
 
         log_message(
-            f"Running train.py for tree = {tree_name}, output = {output_root}, classes = {NUM_CLASSES}"
+            f"Running train.py for tree = {tree_name}, output = {output_root}, "
+            f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
         )
+        if decor_thresholds:
+            log_message(
+                f"Training threshold override for tree = {tree_name}: excluding decorrelate "
+                f"threshold(s) from training/eval loss only: {', '.join(decor_thresholds.keys())}"
+            )
         split_plans = build_split_plans(tree_name)
         write_config_copy(output_root)
         write_branch_copy(output_root)
@@ -2501,18 +3447,47 @@ def main():
         w_test_physics_unfiltered = w_test_physics.copy()
         sample_labels_test_unfiltered = np.asarray(sample_labels_test).copy()
 
-        log_message(f"Applying thresholds for training split of tree = {tree_name}")
+        log_message(f"Applying training thresholds for training split of tree = {tree_name}")
         X_train, y_train, w_train, sample_labels_train = filter_X(
-            X_train, y_train, w_train, load_cols, thresholds, apply_to_sentinel=True,
+            X_train, y_train, w_train, load_cols, training_thresholds, apply_to_sentinel=True,
             sample_labels=sample_labels_train
         )
-        _validate_filtered_split(tree_name, "train", y_train, w_train, sample_labels_train)
-        w_train = _rebalance_filtered_weights("train", y_train, w_train, sample_labels_train)
-        check_weights(w_train, f"{tree_name}_train_weight_after_filter")
+        _validate_filtered_split(
+            tree_name,
+            "train (training thresholds)",
+            y_train,
+            w_train,
+            sample_labels_train,
+        )
 
-        log_message(f"Applying thresholds for test split of tree = {tree_name}")
+        X_train_eval, y_train_eval, w_train_eval, sample_labels_train_eval = filter_X(
+            X_train, y_train, w_train, load_cols, decor_thresholds, apply_to_sentinel=True,
+            sample_labels=sample_labels_train
+        )
+        _validate_filtered_split(
+            tree_name,
+            "train (full evaluation thresholds)",
+            y_train_eval,
+            w_train_eval,
+            sample_labels_train_eval,
+        )
+        w_train = _rebalance_filtered_weights("train", y_train, w_train, sample_labels_train)
+        w_train_eval = _rebalance_filtered_weights(
+            "train (full evaluation thresholds)",
+            y_train_eval,
+            w_train_eval,
+            sample_labels_train_eval,
+        )
+        check_weights(w_train, f"{tree_name}_train_weight_after_filter")
+        check_weights(w_train_eval, f"{tree_name}_train_eval_weight_after_filter")
+
+        log_message(f"Applying training thresholds for test split of tree = {tree_name}")
         X_test, y_test, w_test, sample_labels_test = filter_X(
-            X_test, y_test, w_test, load_cols, thresholds, apply_to_sentinel=True,
+            X_test, y_test, w_test, load_cols, training_thresholds, apply_to_sentinel=True,
+            sample_labels=sample_labels_test
+        )
+        X_test_eval, y_test_eval, w_test_eval, sample_labels_test_eval = filter_X(
+            X_test, y_test, w_test, load_cols, decor_thresholds, apply_to_sentinel=True,
             sample_labels=sample_labels_test
         )
         X_test_ref, y_test_ref, w_test_ref, sample_labels_test_ref = filter_X(
@@ -2524,11 +3499,36 @@ def main():
             apply_to_sentinel=True,
             sample_labels=sample_labels_test_unfiltered.copy(),
         )
-        if not X_test_ref.index.equals(X_test.index):
-            raise RuntimeError("Filtered model/reference test splits are misaligned")
-        _validate_filtered_split(tree_name, "test", y_test, w_test, sample_labels_test)
+        if not X_test_ref.index.equals(X_test_eval.index):
+            raise RuntimeError("Filtered evaluation/reference test splits are misaligned")
+        if (
+            not np.array_equal(y_test_ref, y_test_eval)
+            or not np.array_equal(sample_labels_test_ref, sample_labels_test_eval)
+        ):
+            raise RuntimeError("Filtered evaluation/reference test labels are misaligned")
+        _validate_filtered_split(
+            tree_name,
+            "test (training thresholds)",
+            y_test,
+            w_test,
+            sample_labels_test,
+        )
+        _validate_filtered_split(
+            tree_name,
+            "test (full evaluation thresholds)",
+            y_test_eval,
+            w_test_eval,
+            sample_labels_test_eval,
+        )
         w_test = _rebalance_filtered_weights("test", y_test, w_test, sample_labels_test)
+        w_test_eval = _rebalance_filtered_weights(
+            "test (full evaluation thresholds)",
+            y_test_eval,
+            w_test_eval,
+            sample_labels_test_eval,
+        )
         check_weights(w_test, f"{tree_name}_test_weight_after_filter")
+        check_weights(w_test_eval, f"{tree_name}_test_eval_weight_after_filter")
         check_weights(w_test_ref, f"{tree_name}_test_physics_weight_after_filter")
 
         decor_plot_cols = [c for c in decorrelate if c in X_test.columns]
@@ -2540,30 +3540,59 @@ def main():
         if drop_after_filter:
             X_train = X_train.drop(columns=drop_after_filter, errors="ignore")
             X_test = X_test.drop(columns=drop_after_filter, errors="ignore")
+            X_train_eval = X_train_eval.drop(columns=drop_after_filter, errors="ignore")
+            X_test_eval = X_test_eval.drop(columns=drop_after_filter, errors="ignore")
             X_test_ref = X_test_ref.drop(columns=drop_after_filter, errors="ignore")
 
         log_message(f"Plotting input branch distributions for tree = {tree_name}")
         plot_branch_distributions(
             output_root, branches, clip_ranges,
-            X_train, y_train, w_train, sample_labels_train,
-            X_test, y_test, w_test, sample_labels_test,
+            X_train_eval, y_train_eval, w_train_eval, sample_labels_train_eval,
+            X_test_eval, y_test_eval, w_test_eval, sample_labels_test_eval,
         )
 
         log_message(f"Standardising training split for tree = {tree_name}")
         X_train_std = standardize_X(X_train.copy(), clip_ranges, log_tf)
         log_message(f"Standardising test split for tree = {tree_name}")
         X_test_std = standardize_X(X_test.copy(), clip_ranges, log_tf)
+        log_message(f"Standardising full-threshold evaluation splits for tree = {tree_name}")
+        X_train_eval_std = standardize_X(X_train_eval.copy(), clip_ranges, log_tf)
+        X_test_eval_std = standardize_X(X_test_eval.copy(), clip_ranges, log_tf)
 
         log_message(f"Training model for tree = {tree_name}")
-        stage1_model, stage2_model, splits, loss_history, stage_boundary = train_multi_model(
-            X_train_std, y_train, w_train,
-            X_test_std, y_test, w_test,
-            model_path, tree_name,
-            decorrelate_feature_names=decorrelate
-        )
+        if MODEL_TYPE == "nn":
+            stage1_model, stage2_model, splits, loss_history, stage_boundary = train_nn_model(
+                X_train_std, y_train, w_train,
+                X_test_std, y_test, w_test,
+                model_path, tree_name,
+                decorrelate_feature_names=decorrelate
+            )
+        else:
+            stage1_model, stage2_model, splits, loss_history, stage_boundary = train_multi_model(
+                X_train_std, y_train, w_train,
+                X_test_std, y_test, w_test,
+                model_path, tree_name,
+                decorrelate_feature_names=decorrelate
+            )
         final_model = stage2_model if stage2_model is not None else stage1_model
 
-        X_test_signal_model = _drop_decorrelated_features(X_test_std, decorrelate)
+        X_test_qcd_full_model = standardize_X(X_test_unfiltered[branches].copy(), clip_ranges, log_tf)
+        X_test_qcd_full_model = _drop_decorrelated_features(X_test_qcd_full_model, decorrelate)
+        proba_qcd_full_test = _predict_proba(final_model, X_test_qcd_full_model)
+        _write_prediction_reference(
+            output_root,
+            "test_reference_qcd_est_full",
+            tree_name,
+            "qcd_est_full",
+            X_test_qcd_full_model.columns,
+            sample_labels_test_unfiltered,
+            y_test_unfiltered,
+            w_test_physics_unfiltered,
+            proba_qcd_full_test,
+        )
+        del X_test_qcd_full_model, proba_qcd_full_test
+
+        X_test_signal_model = _drop_decorrelated_features(X_test_eval_std, decorrelate)
         proba_signal_test = _predict_proba(final_model, X_test_signal_model)
         _write_prediction_reference(
             output_root,
@@ -2629,6 +3658,14 @@ def main():
             decorrelate_feature_names=decorrelate,
             decor_plot_X_test=X_test_decor_plot,
             decor_efficiencies=_decor_efficiencies_for_tree(tree_name),
+            eval_splits=(
+                X_train_eval_std,
+                X_test_eval_std,
+                y_train_eval,
+                y_test_eval,
+                w_train_eval,
+                w_test_eval,
+            ),
         )
         log_message(f"Finished train.py for tree = {tree_name}")
 
