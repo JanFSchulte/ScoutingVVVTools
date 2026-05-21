@@ -2089,7 +2089,6 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     n_train = X_train_np.shape[0]
     X_train_t = torch.as_tensor(X_train_np, dtype=torch.float32, device=device)
     y_train_t = torch.as_tensor(y_train, dtype=torch.long, device=device)
-    w_train_t = torch.as_tensor(w_train, dtype=torch.float32, device=device)
     Z_train_t = torch.as_tensor(Z_train, dtype=torch.float32, device=device)
 
     use_decor = Z_train.shape[1] > 0 and DECOR_LAMBDA > 0.0
@@ -2120,13 +2119,47 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         f"hidden_layers = {hidden_layers}"
     )
     log_message(
-        "NN objective diagnostics: train_objective_loss is the train-mode "
-        "mini-batch objective averaged over optimizer steps; test_objective_loss "
-        "uses the same batch objective in eval mode. AdamW weight_decay remains "
-        "a decoupled optimizer update, not a logged loss term."
+        "NN objective diagnostics: backward() uses class-balanced mini-batches "
+        "with sampling-corrected event weights; train_objective_loss and "
+        "test_objective_loss are epoch-end eval-mode full-split batch objectives "
+        "using the same criterion formula. AdamW weight_decay remains a "
+        "decoupled optimizer update, not a logged loss term."
     )
 
     splits = (X_train_all, X_test_all, y_train, y_test, w_train, w_test)
+
+    if batch_size < NUM_CLASSES:
+        raise ValueError(
+            f"NN batch_size={batch_size} is smaller than NUM_CLASSES={NUM_CLASSES}; "
+            "class-balanced batching needs at least one event per class."
+        )
+    class_indices_train = []
+    for cls_idx, cls_name in enumerate(CLASS_NAMES):
+        idx = np.flatnonzero(y_train == cls_idx).astype(np.int64, copy=False)
+        if idx.size == 0:
+            raise RuntimeError(
+                f"Cannot build NN class-balanced batches: no training events for class '{cls_name}'"
+            )
+        class_indices_train.append(idx)
+    class_batch_counts = np.full(NUM_CLASSES, batch_size // NUM_CLASSES, dtype=np.int64)
+    remainder = int(batch_size - int(np.sum(class_batch_counts)))
+    if remainder > 0:
+        class_batch_counts[:remainder] += 1
+    steps_per_epoch = max(1, int(np.ceil(float(n_train) / float(batch_size))))
+    class_counts_train = np.asarray([idx.size for idx in class_indices_train], dtype=float)
+    class_sampling_factors = class_counts_train / class_batch_counts.astype(float)
+    mean_sampling_factor = float(np.mean(class_sampling_factors))
+    if not np.isfinite(mean_sampling_factor) or mean_sampling_factor <= 0.0:
+        raise RuntimeError("Invalid NN class-balanced sampling correction factors")
+    class_sampling_factors /= mean_sampling_factor
+    w_train_update = w_train * class_sampling_factors[y_train]
+    w_train_update_t = torch.as_tensor(w_train_update, dtype=torch.float32, device=device)
+    log_message(
+        "NN batch sampler: class-balanced, "
+        f"steps_per_epoch={steps_per_epoch}, "
+        f"per_class_batch={class_batch_counts.tolist()}, "
+        f"sampling_weight_factors={class_sampling_factors.tolist()}"
+    )
 
     def _set_lr(optimizer, value):
         for group in optimizer.param_groups:
@@ -2184,6 +2217,32 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 epoch_sums["total"] += float(loss.detach().cpu().item())
                 n_steps_eval += 1
         return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)
+
+    def _class_balanced_epoch_batches(rng):
+        shuffled = [rng.permutation(idx) for idx in class_indices_train]
+        positions = np.zeros(NUM_CLASSES, dtype=np.int64)
+        for _ in range(steps_per_epoch):
+            parts = []
+            for cls_idx, need_raw in enumerate(class_batch_counts):
+                need = int(need_raw)
+                take_parts = []
+                remaining = need
+                while remaining > 0:
+                    idx = shuffled[cls_idx]
+                    pos = int(positions[cls_idx])
+                    available = int(idx.size - pos)
+                    if available <= 0:
+                        shuffled[cls_idx] = rng.permutation(class_indices_train[cls_idx])
+                        positions[cls_idx] = 0
+                        continue
+                    take_now = min(remaining, available)
+                    take_parts.append(idx[pos:pos + take_now])
+                    positions[cls_idx] = pos + take_now
+                    remaining -= take_now
+                parts.append(np.concatenate(take_parts))
+            batch = np.concatenate(parts).astype(np.int64, copy=False)
+            rng.shuffle(batch)
+            yield batch
 
     def _batch_mean_ce_from_logits(logits_np, y_np, w_np):
         cls_loss_sum = 0.0
@@ -2293,16 +2352,7 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
         for epoch in range(int(n_epochs)):
             model.train()
-            order = rng.permutation(n_train)
-            epoch_sums = {
-                "classification": 0.0,
-                "decorrelation": 0.0,
-                "regularization": 0.0,
-                "total": 0.0,
-            }
-            n_steps_update = 0
-            for start in range(0, n_train, batch_size):
-                idx_np = order[start:start + batch_size]
+            for idx_np in _class_balanced_epoch_batches(rng):
                 if idx_np.size == 0:
                     continue
                 if batch_norm and idx_np.size < 2:
@@ -2310,30 +2360,26 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 idx = torch.as_tensor(idx_np, dtype=torch.long, device=device)
                 xb = X_train_t.index_select(0, idx)
                 yb = y_train_t.index_select(0, idx)
-                wb = w_train_t.index_select(0, idx)
+                wb = w_train_update_t.index_select(0, idx)
                 logits = model(xb)
                 if use_decor:
                     zb = Z_train_t.index_select(0, idx)
                 else:
                     zb = None
-                loss, cls_loss, decor_loss = _torch_batch_loss(
+                loss, _, _ = _torch_batch_loss(
                     logits, yb, wb, zb, lam, decor_scale
                 )
-                epoch_sums["classification"] += float(cls_loss.detach().cpu().item())
-                epoch_sums["decorrelation"] += float(decor_loss.detach().cpu().item())
-                epoch_sums["total"] += float(loss.detach().cpu().item())
-                n_steps_update += 1
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if grad_clip_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-            update_comp = _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_update)
+            train_comp = _evaluate_torch_split(X_train_np, y_train, w_train, Z_train, lam, decor_scale)
             test_comp = _evaluate_torch_split(X_test_np, y_test, w_test, Z_test, lam, decor_scale)
-            _append_history(history, update_comp, test_comp)
+            _append_history(history, train_comp, test_comp)
             log_message(_format_nn_loss_line(
-                epoch, stage_label, update_comp, test_comp, compact=compact_log
+                epoch, stage_label, train_comp, test_comp, compact=compact_log
             ))
 
             current_score = _loss_value_at(history, "test", monitor_metric_key, epoch)
