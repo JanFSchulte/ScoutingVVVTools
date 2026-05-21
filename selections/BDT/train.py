@@ -1305,18 +1305,26 @@ def _nn_loss_components_from_epoch_sums(epoch_sums, n_steps):
             "mlogloss": float("nan"),
             "decorrelation": float("nan"),
             "regularization": 0.0,
+            "objective": float("nan"),
             "total": float("nan"),
         }
     inv = 1.0 / float(n_steps)
     cls_loss = float(epoch_sums.get("classification", 0.0) * inv)
     decor_loss = float(epoch_sums.get("decorrelation", 0.0) * inv)
     reg_loss = float(epoch_sums.get("regularization", 0.0) * inv)
+    objective_sum = epoch_sums.get("total")
+    objective_loss = (
+        float(objective_sum * inv)
+        if objective_sum is not None
+        else float(cls_loss + decor_loss)
+    )
     return {
         "classification": cls_loss,
         "mlogloss": cls_loss,
         "decorrelation": decor_loss,
         "regularization": reg_loss,
-        "total": float(cls_loss + decor_loss + reg_loss),
+        "objective": objective_loss,
+        "total": objective_loss,
     }
 
 
@@ -1324,12 +1332,14 @@ def _nn_loss_components_from_values(cls_loss, decor_loss=0.0, reg_loss=0.0):
     cls_loss = float(cls_loss)
     decor_loss = float(decor_loss)
     reg_loss = float(reg_loss)
+    objective_loss = float(cls_loss + decor_loss)
     return {
         "classification": cls_loss,
         "mlogloss": cls_loss,
         "decorrelation": decor_loss,
         "regularization": reg_loss,
-        "total": float(cls_loss + decor_loss + reg_loss),
+        "objective": objective_loss,
+        "total": objective_loss,
     }
 
 
@@ -2007,7 +2017,12 @@ def _save_nn_checkpoint(torch, path, model, feature_names, hp, input_dim):
 
 def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                    model_name, tree_name, decorrelate_feature_names=None):
-    """Two-stage PyTorch MLP training with the same data and reference flow as BDT mode."""
+    """Two-stage PyTorch MLP training with one NN objective-loss definition.
+
+    Stage 1 uses weighted CE. Stage 2 uses weighted CE plus scaled smooth-CvM
+    decorrelation. AdamW weight decay keeps the native decoupled optimizer
+    semantics and is not added to the objective loss.
+    """
     torch, nn, F = import_torch()
 
     hp = _nn_config_for_tree(tree_name)
@@ -2105,9 +2120,10 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         f"hidden_layers = {hidden_layers}"
     )
     log_message(
-        "NN loss diagnostics: train-update is the train-mode mini-batch loss used "
-        "for backward(); train-eval/test-eval are eval-mode full-split weighted CE "
-        "computed as sum(w*CE)/sum(w)."
+        "NN objective diagnostics: train_objective_loss is the train-mode "
+        "mini-batch objective averaged over optimizer steps; test_objective_loss "
+        "uses the same batch objective in eval mode. AdamW weight_decay remains "
+        "a decoupled optimizer update, not a logged loss term."
     )
 
     splits = (X_train_all, X_test_all, y_train, y_test, w_train, w_test)
@@ -2140,10 +2156,13 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
     def _evaluate_torch_split(X_np, y_np, w_np, Z_np, lam, decor_scale):
         model.eval()
-        cls_sum = 0.0
-        weight_sum = 0.0
-        decor_sum = 0.0
-        n_decor_steps = 0
+        epoch_sums = {
+            "classification": 0.0,
+            "decorrelation": 0.0,
+            "regularization": 0.0,
+            "total": 0.0,
+        }
+        n_steps_eval = 0
         with torch.no_grad():
             for start in range(0, X_np.shape[0], batch_size):
                 end = min(start + batch_size, X_np.shape[0])
@@ -2157,32 +2176,18 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 else:
                     zb = None
                 logits = model(xb)
-                ce = F.cross_entropy(logits, yb, reduction="none")
-                cls_sum += float(torch.sum(wb * ce).detach().cpu().item())
-                weight_sum += float(torch.sum(wb).detach().cpu().item())
-                if lam > 0.0 and use_decor:
-                    decor_raw = _torch_smooth_decor_loss(
-                        torch,
-                        logits,
-                        yb,
-                        wb,
-                        zb,
-                        decor_edges,
-                        score_thresholds,
-                        DECOR_SCORE_TAU,
-                    )
-                    decor_sum += float((float(lam) * float(decor_scale) * decor_raw).detach().cpu().item())
-                    n_decor_steps += 1
-        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
-            cls_loss = float("nan")
-        else:
-            cls_loss = cls_sum / weight_sum
-        decor_loss = decor_sum / float(n_decor_steps) if n_decor_steps > 0 else 0.0
-        return _nn_loss_components_from_values(cls_loss, decor_loss)
+                loss, cls_loss, decor_loss = _torch_batch_loss(
+                    logits, yb, wb, zb, lam, decor_scale
+                )
+                epoch_sums["classification"] += float(cls_loss.detach().cpu().item())
+                epoch_sums["decorrelation"] += float(decor_loss.detach().cpu().item())
+                epoch_sums["total"] += float(loss.detach().cpu().item())
+                n_steps_eval += 1
+        return _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_eval)
 
-    def _full_sample_ce_from_logits(logits_np, y_np, w_np):
+    def _batch_mean_ce_from_logits(logits_np, y_np, w_np):
         cls_loss_sum = 0.0
-        weight_sum = 0.0
+        n_steps_eval = 0
         for start in range(0, len(y_np), batch_size):
             end = min(start + batch_size, len(y_np))
             if end <= start:
@@ -2193,11 +2198,14 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 w_np[start:end],
                 NUM_CLASSES,
             )
-            cls_loss_sum += float(batch_cls_sum)
-            weight_sum += float(np.sum(w_np[start:end]))
-        if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+            batch_weight_sum = float(np.sum(w_np[start:end]))
+            if not np.isfinite(batch_weight_sum) or batch_weight_sum <= 0.0:
+                continue
+            cls_loss_sum += float(batch_cls_sum) / batch_weight_sum
+            n_steps_eval += 1
+        if n_steps_eval <= 0:
             return float("nan")
-        return cls_loss_sum / weight_sum
+        return cls_loss_sum / float(n_steps_eval)
 
     def _batch_mean_raw_decor_from_logits(logits_np, y_np, w_np, Z_np):
         if not use_decor:
@@ -2231,31 +2239,28 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
             return float("nan")
         return raw_sum / float(n_steps_eval)
 
-    def _format_nn_loss_line(epoch, stage_label, update_comp, train_eval_comp, test_eval_comp,
-                             compact=False):
+    def _format_nn_loss_line(epoch, stage_label, train_comp, test_comp, compact=False):
         head = f"[{stage_label}][{epoch}]"
         if compact:
             return (
                 f"{head}"
-                f"\ttrain-update-weighted_ce_loss:{update_comp['classification']:.5f}"
-                f"\ttrain-eval-weighted_ce_loss:{train_eval_comp['classification']:.5f}"
-                f"\ttest-eval-weighted_ce_loss:{test_eval_comp['classification']:.5f}"
+                f"\ttrain_objective_loss:{train_comp['objective']:.5f}"
+                f"\ttest_objective_loss:{test_comp['objective']:.5f}"
+                f"\ttrain_weighted_ce_loss:{train_comp['classification']:.5f}"
+                f"\ttest_weighted_ce_loss:{test_comp['classification']:.5f}"
             )
         return (
             f"{head}"
-            f"\ttrain-update-weighted_ce_loss:{update_comp['classification']:.5f}"
-            f"\ttrain-update-decorrelation_loss:{update_comp['decorrelation']:.5f}"
-            f"\ttrain-update-total_loss:{update_comp['total']:.5f}"
-            f"\ttrain-eval-weighted_ce_loss:{train_eval_comp['classification']:.5f}"
-            f"\ttrain-eval-decorrelation_loss:{train_eval_comp['decorrelation']:.5f}"
-            f"\ttrain-eval-total_loss:{train_eval_comp['total']:.5f}"
-            f"\ttest-eval-weighted_ce_loss:{test_eval_comp['classification']:.5f}"
-            f"\ttest-eval-decorrelation_loss:{test_eval_comp['decorrelation']:.5f}"
-            f"\ttest-eval-total_loss:{test_eval_comp['total']:.5f}"
+            f"\ttrain_objective_loss:{train_comp['objective']:.5f}"
+            f"\ttest_objective_loss:{test_comp['objective']:.5f}"
+            f"\ttrain_weighted_ce_loss:{train_comp['classification']:.5f}"
+            f"\ttrain_decorrelation_loss:{train_comp['decorrelation']:.5f}"
+            f"\ttest_weighted_ce_loss:{test_comp['classification']:.5f}"
+            f"\ttest_decorrelation_loss:{test_comp['decorrelation']:.5f}"
         )
 
     def _append_history(history, train_comp, test_comp):
-        for key in ("classification", "mlogloss", "decorrelation", "regularization", "total"):
+        for key in ("classification", "mlogloss", "decorrelation", "regularization", "objective", "total"):
             history["train"][key].append(float(train_comp[key]))
             history["test"][key].append(float(test_comp[key]))
 
@@ -2274,6 +2279,7 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 "mlogloss": [],
                 "decorrelation": [],
                 "regularization": [],
+                "objective": [],
                 "total": [],
             }
             for tag in ("train", "test")
@@ -2324,11 +2330,10 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
                 optimizer.step()
 
             update_comp = _nn_loss_components_from_epoch_sums(epoch_sums, n_steps_update)
-            train_comp = _evaluate_torch_split(X_train_np, y_train, w_train, Z_train, lam, decor_scale)
             test_comp = _evaluate_torch_split(X_test_np, y_test, w_test, Z_test, lam, decor_scale)
-            _append_history(history, train_comp, test_comp)
+            _append_history(history, update_comp, test_comp)
             log_message(_format_nn_loss_line(
-                epoch, stage_label, update_comp, train_comp, test_comp, compact=compact_log
+                epoch, stage_label, update_comp, test_comp, compact=compact_log
             ))
 
             current_score = _loss_value_at(history, "test", monitor_metric_key, epoch)
@@ -2388,8 +2393,8 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         learning_rate,
         0.0,
         1.0,
-        "classification",
-        "weighted_ce_loss",
+        "objective",
+        "objective_loss",
         True,
     )
 
@@ -2432,7 +2437,7 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
 
     # ---------- Stage 2: classification + smooth-CvM decorrelation ----------
     stage1_logits = _torch_predict_logits_numpy(torch, model, device, X_train_np, batch_size)
-    cls_loss_ref = _full_sample_ce_from_logits(stage1_logits, y_train, w_train)
+    cls_loss_ref = _batch_mean_ce_from_logits(stage1_logits, y_train, w_train)
     decor_loss_ref_raw = _batch_mean_raw_decor_from_logits(stage1_logits, y_train, w_train, Z_train)
     if not np.isfinite(decor_loss_ref_raw) or decor_loss_ref_raw <= _EPS:
         raise RuntimeError(
@@ -2456,19 +2461,19 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
         learning_rate_decorr,
         DECOR_LAMBDA,
         decor_scale,
-        "total",
-        "total_loss",
+        "objective",
+        "objective_loss",
         False,
     )
 
     combined_history = {
         "train": {
             k: list(stage1_history["train"].get(k, [])) + list(stage2_history["train"].get(k, []))
-            for k in ("classification", "mlogloss", "decorrelation", "regularization", "total")
+            for k in ("classification", "mlogloss", "decorrelation", "regularization", "objective", "total")
         },
         "test": {
             k: list(stage1_history["test"].get(k, [])) + list(stage2_history["test"].get(k, []))
-            for k in ("classification", "mlogloss", "decorrelation", "regularization", "total")
+            for k in ("classification", "mlogloss", "decorrelation", "regularization", "objective", "total")
         },
     }
 
@@ -2510,11 +2515,11 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     and decor diagnostic multipage PDFs) are saved twice with ``_cls`` /
     ``_decorr`` suffixes (for the stage-1 baseline and stage-2 final model
     respectively). ``feature_corr.pdf`` and the shared BDT
-    ``loss_mlogloss.pdf`` / ``loss_classification.pdf`` or NN
-    ``loss_weighted_ce.pdf`` plus ``loss_decorrelation.pdf`` /
-    ``loss_total.pdf`` files are saved once. ``stage_boundary`` is the number
-    of stage-1 iterations kept; it is drawn as a dotted vertical line on the
-    loss curves.
+    ``loss_mlogloss.pdf`` / ``loss_classification.pdf`` / ``loss_total.pdf``
+    or NN ``loss_weighted_ce.pdf`` / ``loss_objective.pdf`` plus
+    ``loss_decorrelation.pdf`` files are saved once. ``stage_boundary`` is the
+    number of stage-1 iterations kept; it is drawn as a dotted vertical line
+    on the loss curves.
     """
     X_train_full, X_test_full, y_train, y_test, w_train, w_test = splits
 
@@ -3203,11 +3208,12 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
 
     if is_nn_model:
         _plot_loss_metric("classification", "weighted_ce_loss", "loss_weighted_ce")
+        _plot_loss_metric("objective", "objective_loss", "loss_objective")
     else:
         _plot_loss_metric("classification", "classification_loss", "loss_classification")
         _plot_loss_metric("mlogloss", "mlogloss", "loss_mlogloss")
+        _plot_loss_metric("total", "total_loss", "loss_total")
     _plot_loss_metric("decorrelation", "decorrelation_loss", "loss_decorrelation")
-    _plot_loss_metric("total", "total_loss", "loss_total")
 
     X_tr_df = pd.DataFrame(_as_array(X_train_used), columns=feat_names_used)
     corr = X_tr_df.corr(numeric_only=True).dropna(axis=0, how="all").dropna(axis=1, how="all")
