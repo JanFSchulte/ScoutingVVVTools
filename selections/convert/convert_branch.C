@@ -389,6 +389,12 @@ struct AppConfig {
     string puWeightPathPattern;
 };
 
+struct BatchRequest {
+    bool printBatchCount = false;
+    bool singleBatch = false;
+    size_t batchIndex = 0;
+};
+
 struct PileupBin {
     float binLow = 0.f;
     float binHigh = 0.f;
@@ -932,24 +938,6 @@ AppConfig loadAppConfig() {
 
     config.puWeightPathPattern = payload.getStringOr("pu_weight_path", "");
     return config;
-}
-
-Long64_t countTreeEntriesInFiles(const vector<string>& inputFiles, const string& treeName) {
-    Long64_t totalEntries = 0;
-    for (const auto& inputFileName : inputFiles) {
-        unique_ptr<TFile> inputFile(TFile::Open(inputFileName.c_str(), "READ"));
-        if (!inputFile || inputFile->IsZombie()) {
-            throw runtime_error("Error opening input file " + inputFileName + " while counting raw_entries");
-        }
-
-        TTree* tree = static_cast<TTree*>(inputFile->Get(treeName.c_str()));
-        if (!tree) {
-            throw runtime_error("Tree " + treeName + " not found in " + inputFileName +
-                                " while counting raw_entries");
-        }
-        totalEntries += tree->GetEntries();
-    }
-    return totalEntries;
 }
 
 void writeSampleRawEntries(const string& sampleConfigPath,
@@ -2221,6 +2209,47 @@ fs::path makeSplitOutputPath(const fs::path& basePath, size_t index) {
     return basePath.parent_path() / (stem + "_" + to_string(index) + extension);
 }
 
+fs::path makeBatchTempOutputDir(const AppConfig& appConfig, const SampleMeta& sampleMeta) {
+    return fs::path(appConfig.outputRoot) / (sampleMeta.sampleGroup() + "_tmp");
+}
+
+fs::path makeBatchTempOutputPath(const AppConfig& appConfig,
+                                 const SampleMeta& sampleMeta,
+                                 size_t batchIndex) {
+    return makeBatchTempOutputDir(appConfig, sampleMeta) /
+           (sampleMeta.sample + "_" + to_string(batchIndex) + ".root");
+}
+
+fs::path makeBatchRawEntriesPath(const fs::path& batchOutputPath) {
+    return fs::path(batchOutputPath.string() + ".raw_entries");
+}
+
+void writeBatchRawEntries(const fs::path& batchOutputPath, Long64_t rawEntries) {
+    const fs::path path = makeBatchRawEntriesPath(batchOutputPath);
+    ofstream fout(path);
+    if (!fout) {
+        throw runtime_error("Cannot write batch raw_entries file: " + path.string());
+    }
+    fout << rawEntries << '\n';
+    fout.close();
+    if (!fout) {
+        throw runtime_error("Failed writing batch raw_entries file: " + path.string());
+    }
+}
+
+Long64_t readBatchRawEntries(const fs::path& batchOutputPath) {
+    const fs::path path = makeBatchRawEntriesPath(batchOutputPath);
+    ifstream fin(path);
+    if (!fin) {
+        throw runtime_error("Missing batch raw_entries file: " + path.string());
+    }
+    Long64_t rawEntries = 0;
+    fin >> rawEntries;
+    if (!fin || rawEntries < 0) {
+        throw runtime_error("Invalid batch raw_entries file: " + path.string());
+    }
+    return rawEntries;
+}
 
 vector<string> listRemoteRootFiles(const string& datasetPath) {
     string query = "file dataset=" + datasetPath;
@@ -2346,6 +2375,48 @@ string resolveRequestedSample(int argc, char** argv, const AppConfig& appConfig)
     throw runtime_error("No sample specified. Pass sample as argv[1] or set run_sample in ./config.json.");
 }
 
+bool parseNonNegativeIndex(const string& text, size_t& value) {
+    if (text.empty()) {
+        return false;
+    }
+    for (char c : text) {
+        if (!isdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    try {
+        value = static_cast<size_t>(stoull(text));
+    } catch (const exception&) {
+        return false;
+    }
+    return true;
+}
+
+BatchRequest resolveBatchRequest(int argc, char** argv) {
+    BatchRequest request;
+    if (argc <= 2) {
+        return request;
+    }
+    if (argc > 3) {
+        throw runtime_error("Usage: convert_branch <sample> [batch_index|--batch-count]");
+    }
+
+    const string arg = argv[2] == nullptr ? "" : argv[2];
+    if (arg == "--batch-count") {
+        request.printBatchCount = true;
+        return request;
+    }
+
+    size_t batchIndex = 0;
+    if (!parseNonNegativeIndex(arg, batchIndex)) {
+        throw runtime_error("Invalid batch argument '" + arg +
+                            "'. Use a non-negative batch index or --batch-count.");
+    }
+    request.singleBatch = true;
+    request.batchIndex = batchIndex;
+    return request;
+}
+
 string resolvePileupWeightPath(const AppConfig& appConfig, const SampleMeta& sampleMeta) {
     unordered_map<string, string> templateValues;
     templateValues["sample"] = sampleMeta.sample;
@@ -2450,19 +2521,24 @@ void destroyOutputTrees(vector<OutputTreeState>& outputTrees, bool deleteTrees) 
     }
 }
 
-string makeThreadTempFilePath(const string& sample, int threadIndex) {
-    fs::path tmpDir = fs::temp_directory_path();
-    const string fileName = "convert_" + sample + "_" + to_string(static_cast<long long>(getpid())) +
+string makeThreadTempFilePath(const fs::path& tempDir,
+                              const string& sample,
+                              size_t batchIndex,
+                              int threadIndex) {
+    const string fileName = "convert_" + sample + "_batch_" + to_string(batchIndex) +
+                            "_" + to_string(static_cast<long long>(getpid())) +
                             "_" + to_string(threadIndex) + ".root";
-    return (tmpDir / fileName).string();
+    return (tempDir / fileName).string();
 }
 
 void initializeThreadResult(ThreadConvertResult& result,
                             const BranchConfig& branchConfig,
                             bool isMC,
                             const string& sample,
+                            const fs::path& tempDir,
+                            size_t batchIndex,
                             int threadIndex) {
-    result.tempFilePath = makeThreadTempFilePath(sample, threadIndex);
+    result.tempFilePath = makeThreadTempFilePath(tempDir, sample, batchIndex, threadIndex);
     result.tempFile = TFile::Open(result.tempFilePath.c_str(), "RECREATE");
     if (!result.tempFile || result.tempFile->IsZombie()) {
         throw runtime_error("Error opening temporary output file " + result.tempFilePath);
@@ -2923,13 +2999,13 @@ vector<string> writeOutputFilesStreaming(const fs::path& baseOutputPath,
     return writtenFiles;
 }
 
-void processInputFile(const string& inputFileName,
-                      const AppConfig& appConfig,
-                      const SelectionConfig& selectionConfig,
-                      const SampleMeta& sampleMeta,
-                      const vector<PileupBin>& pileupWeights,
-                      BranchConfig& branchConfig,
-                      vector<OutputTreeState>& outputTrees) {
+Long64_t processInputFile(const string& inputFileName,
+                          const AppConfig& appConfig,
+                          const SelectionConfig& selectionConfig,
+                          const SampleMeta& sampleMeta,
+                          const vector<PileupBin>& pileupWeights,
+                          BranchConfig& branchConfig,
+                          vector<OutputTreeState>& outputTrees) {
     unique_ptr<TFile> inputFile(TFile::Open(inputFileName.c_str(), "READ"));
     if (!inputFile || inputFile->IsZombie()) {
         throw runtime_error("Error opening input file " + inputFileName);
@@ -2989,6 +3065,110 @@ void processInputFile(const string& inputFileName,
             fillOutputTree(treeState, runtimeCollections, inputCollections, baseVars, rawScalarByName, sampleMeta.isMC);
         }
     }
+    return nEntries;
+}
+
+vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles,
+                                           size_t batchIndex,
+                                           int threadCount,
+                                           const fs::path& batchOutputPath,
+                                           const AppConfig& appConfig,
+                                           const SelectionConfig& selectionConfig,
+                                           const SampleMeta& sampleMeta,
+                                           const vector<PileupBin>& pileupWeights,
+                                           const BranchConfig& branchConfig,
+                                           atomic<size_t>& processedFiles,
+                                           size_t totalFiles,
+                                           atomic<Long64_t>& batchRawEntries) {
+    if (batchInputFiles.empty()) {
+        throw runtime_error("Empty input batch for sample " + sampleMeta.sample);
+    }
+
+    const fs::path tempDir = batchOutputPath.parent_path();
+    if (!tempDir.empty()) {
+        fs::create_directories(tempDir);
+    }
+
+    vector<ThreadConvertResult> threadResults(threadCount);
+    try {
+        for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+            initializeThreadResult(threadResults[threadIndex],
+                                   branchConfig,
+                                   sampleMeta.isMC,
+                                   sampleMeta.sample,
+                                   tempDir,
+                                   batchIndex,
+                                   threadIndex);
+        }
+    } catch (const exception& ex) {
+        for (auto& result : threadResults) {
+            cleanupThreadResult(result);
+        }
+        throw runtime_error("Temporary output initialization error: " + string(ex.what()));
+    }
+
+    vector<BranchConfig> threadConfigs(threadCount, branchConfig);
+    atomic<bool> failed{false};
+    vector<string> errors;
+
+#pragma omp parallel num_threads(threadCount) if(threadCount > 1)
+    {
+        const int tid =
+#ifdef _OPENMP
+            omp_get_thread_num();
+#else
+            0;
+#endif
+
+#pragma omp for schedule(dynamic)
+        for (int index = 0; index < static_cast<int>(batchInputFiles.size()); ++index) {
+            if (failed.load()) {
+                continue;
+            }
+
+            try {
+                const Long64_t fileEntries = processInputFile(batchInputFiles[index],
+                                                              appConfig,
+                                                              selectionConfig,
+                                                              sampleMeta,
+                                                              pileupWeights,
+                                                              threadConfigs[tid],
+                                                              threadResults[tid].outputTrees);
+                batchRawEntries.fetch_add(fileEntries);
+                const size_t done = processedFiles.fetch_add(1) + 1;
+#pragma omp critical(convert_progress)
+                printFileProgress(sampleMeta.sample, done, totalFiles);
+            } catch (const exception& ex) {
+                failed.store(true);
+#pragma omp critical(convert_error)
+                errors.push_back(ex.what());
+            }
+        }
+    }
+
+    if (!errors.empty()) {
+        for (auto& result : threadResults) {
+            cleanupThreadResult(result);
+        }
+        throw runtime_error(errors.front());
+    }
+
+    try {
+        const vector<string> threadTempPaths = finalizeThreadTempFiles(threadResults);
+        const vector<string> writtenFiles = writeOutputFilesStreaming(batchOutputPath,
+                                                                      threadTempPaths,
+                                                                      branchConfig.trees,
+                                                                      0);
+        for (auto& result : threadResults) {
+            cleanupThreadResult(result);
+        }
+        return writtenFiles;
+    } catch (...) {
+        for (auto& result : threadResults) {
+            cleanupThreadResult(result);
+        }
+        throw;
+    }
 }
 
 }  // namespace
@@ -3016,6 +3196,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    BatchRequest batchRequest;
+    try {
+        batchRequest = resolveBatchRequest(argc, argv);
+    } catch (const exception& ex) {
+        cerr << "Batch selection error: " << ex.what() << endl;
+        return 1;
+    }
+
     SampleMeta sampleMeta;
     try {
         sampleMeta = resolveSampleMeta(sample, appConfig);
@@ -3032,8 +3220,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const int threadCount = determineThreadCount(appConfig.maxThreads, inputFiles.size());
+    const size_t batchSize = max<size_t>(1, static_cast<size_t>(threadCount) * 6);
+    const size_t nBatches = (inputFiles.size() + batchSize - 1) / batchSize;
+    if (batchRequest.printBatchCount) {
+        cout << nBatches << endl;
+        return 0;
+    }
+    if (batchRequest.singleBatch && batchRequest.batchIndex >= nBatches) {
+        cerr << "Batch selection error: requested batch " << batchRequest.batchIndex
+             << " but sample has " << nBatches << " batch"
+             << (nBatches == 1 ? "" : "es") << endl;
+        return 1;
+    }
+
     cout << "Running convert_branch for sample = " << sample
          << ", files = " << inputFiles.size();
+    if (batchRequest.singleBatch) {
+        cout << ", batch = " << (batchRequest.batchIndex + 1) << "/" << nBatches;
+    }
     if (sampleMeta.inputPaths.size() == 1) {
         cout << ", source = " << sampleMeta.inputPaths.front()
              << (sampleMeta.remoteSourceCount == 1 ? " [dataset]" : " [local]");
@@ -3043,18 +3248,6 @@ int main(int argc, char** argv) {
              << ", local = " << (sampleMeta.inputPaths.size() - sampleMeta.remoteSourceCount) << ")";
     }
     cout << endl;
-
-    try {
-        const Long64_t rawEntries = countTreeEntriesInFiles(inputFiles, appConfig.treeName);
-        writeSampleRawEntries(appConfig.sampleConfigPath, sampleMeta.sample, rawEntries);
-        cout << "Updated raw_entries in " << appConfig.sampleConfigPath
-             << " for sample = " << sampleMeta.sample
-             << ", tree = " << appConfig.treeName
-             << ", raw_entries = " << rawEntries << endl;
-    } catch (const exception& ex) {
-        cerr << "raw_entries update error: " << ex.what() << endl;
-        return 1;
-    }
 
     vector<PileupBin> pileupWeights;
     if (sampleMeta.isMC && !appConfig.puWeightPathPattern.empty()) {
@@ -3068,7 +3261,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    const int threadCount = determineThreadCount(appConfig.maxThreads, inputFiles.size());
 #ifdef _OPENMP
     if (threadCount > 1) {
         ROOT::EnableThreadSafety();
@@ -3083,63 +3275,82 @@ int main(int argc, char** argv) {
 #endif
     cout << ", threads = " << threadCount << endl;
 
-    vector<ThreadConvertResult> threadResults(threadCount);
+    const fs::path batchTempDir = makeBatchTempOutputDir(appConfig, sampleMeta);
+    cout << "Batch mode: " << nBatches
+         << " batch" << (nBatches == 1 ? "" : "es")
+         << ", max files per batch = " << batchSize
+         << ", temporary output = " << batchTempDir.string() << endl;
+
+    const size_t firstBatchIndex = batchRequest.singleBatch ? batchRequest.batchIndex : 0;
+    const size_t lastBatchIndexExclusive = batchRequest.singleBatch ? (batchRequest.batchIndex + 1) : nBatches;
+    atomic<size_t> processedFiles{firstBatchIndex * batchSize};
+
+    for (size_t batchIndex = firstBatchIndex; batchIndex < lastBatchIndexExclusive; ++batchIndex) {
+        const size_t begin = batchIndex * batchSize;
+        const size_t end = min(inputFiles.size(), begin + batchSize);
+        const auto batchBegin = inputFiles.begin() + static_cast<vector<string>::difference_type>(begin);
+        const auto batchEnd = inputFiles.begin() + static_cast<vector<string>::difference_type>(end);
+        vector<string> batchInputFiles(batchBegin, batchEnd);
+        const int batchThreadCount = determineThreadCount(appConfig.maxThreads, batchInputFiles.size());
+        const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
+        atomic<Long64_t> batchRawEntries{0};
+
+        cout << "Processing batch " << (batchIndex + 1) << "/" << nBatches
+             << ": files " << (begin + 1) << "-" << end
+             << " -> " << batchOutputPath.string()
+             << " using " << batchThreadCount << " thread"
+             << (batchThreadCount == 1 ? "" : "s") << endl;
+
+        try {
+            const vector<string> writtenBatchFiles = processInputBatchToTempFile(batchInputFiles,
+                                                                                 batchIndex,
+                                                                                 batchThreadCount,
+                                                                                 batchOutputPath,
+                                                                                 appConfig,
+                                                                                 selectionConfig,
+                                                                                 sampleMeta,
+                                                                                 pileupWeights,
+                                                                                 branchConfig,
+                                                                                 processedFiles,
+                                                                                 inputFiles.size(),
+                                                                                 batchRawEntries);
+            if (writtenBatchFiles.size() != 1) {
+                throw runtime_error("Expected one temporary batch file, got " +
+                                    to_string(writtenBatchFiles.size()));
+            }
+            writeBatchRawEntries(batchOutputPath, batchRawEntries.load());
+            cout << "Wrote temporary batch file: " << writtenBatchFiles.front() << endl;
+        } catch (const exception& ex) {
+            cerr << "Runtime error: " << ex.what() << endl;
+            return 1;
+        }
+    }
+
+    if (batchRequest.singleBatch && batchRequest.batchIndex + 1 < nBatches) {
+        cout << "Batch " << (batchRequest.batchIndex + 1) << "/" << nBatches
+             << " complete; final merge will run after the last batch" << endl;
+        return 0;
+    }
+
+    vector<string> allBatchTempPaths;
+    allBatchTempPaths.reserve(nBatches);
+    Long64_t rawEntries = 0;
     try {
-        for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
-            initializeThreadResult(threadResults[threadIndex], branchConfig, sampleMeta.isMC, sampleMeta.sample, threadIndex);
+        for (size_t batchIndex = 0; batchIndex < nBatches; ++batchIndex) {
+            const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
+            if (!fs::exists(batchOutputPath)) {
+                throw runtime_error("Missing temporary batch output: " + batchOutputPath.string());
+            }
+            allBatchTempPaths.push_back(batchOutputPath.string());
+            rawEntries += readBatchRawEntries(batchOutputPath);
         }
+        writeSampleRawEntries(appConfig.sampleConfigPath, sampleMeta.sample, rawEntries);
+        cout << "Updated raw_entries in " << appConfig.sampleConfigPath
+             << " for sample = " << sampleMeta.sample
+             << ", tree = " << appConfig.treeName
+             << ", raw_entries = " << rawEntries << endl;
     } catch (const exception& ex) {
-        cerr << "Temporary output initialization error: " << ex.what() << endl;
-        for (auto& result : threadResults) {
-            cleanupThreadResult(result);
-        }
-        return 1;
-    }
-    vector<BranchConfig> threadConfigs(threadCount, branchConfig);
-
-    atomic<size_t> processedFiles{0};
-    atomic<bool> failed{false};
-    vector<string> errors;
-
-#pragma omp parallel num_threads(threadCount) if(threadCount > 1)
-    {
-        const int tid =
-#ifdef _OPENMP
-            omp_get_thread_num();
-#else
-            0;
-#endif
-
-#pragma omp for schedule(dynamic)
-        for (int index = 0; index < static_cast<int>(inputFiles.size()); ++index) {
-            if (failed.load()) {
-                continue;
-            }
-
-            try {
-                processInputFile(inputFiles[index],
-                                 appConfig,
-                                 selectionConfig,
-                                 sampleMeta,
-                                 pileupWeights,
-                                 threadConfigs[tid],
-                                 threadResults[tid].outputTrees);
-                const size_t done = processedFiles.fetch_add(1) + 1;
-#pragma omp critical(convert_progress)
-                printFileProgress(sampleMeta.sample, done, inputFiles.size());
-            } catch (const exception& ex) {
-                failed.store(true);
-#pragma omp critical(convert_error)
-                errors.push_back(ex.what());
-            }
-        }
-    }
-
-    if (!errors.empty()) {
-        cerr << "Runtime error: " << errors.front() << endl;
-        for (auto& result : threadResults) {
-            cleanupThreadResult(result);
-        }
+        cerr << "raw_entries update error: " << ex.what() << endl;
         return 1;
     }
 
@@ -3149,10 +3360,12 @@ int main(int argc, char** argv) {
             fs::create_directories(outputPath.parent_path());
         }
 
-        const vector<string> threadTempPaths = finalizeThreadTempFiles(threadResults);
         const Long64_t maxOutputBytes = outputSizeLimitBytes(appConfig.maxOutputFileSizeGB);
+        cout << "Merging " << allBatchTempPaths.size()
+             << " temporary batch file" << (allBatchTempPaths.size() == 1 ? "" : "s")
+             << " into final output" << endl;
         const vector<string> writtenFiles = writeOutputFilesStreaming(outputPath,
-                                                                      threadTempPaths,
+                                                                      allBatchTempPaths,
                                                                       branchConfig.trees,
                                                                       maxOutputBytes);
         if (writtenFiles.size() <= 1) {
@@ -3168,14 +3381,8 @@ int main(int argc, char** argv) {
         }
     } catch (const exception& ex) {
         cerr << "Output error: " << ex.what() << endl;
-        for (auto& result : threadResults) {
-            cleanupThreadResult(result);
-        }
         return 1;
     }
 
-    for (auto& result : threadResults) {
-        cleanupThreadResult(result);
-    }
     return 0;
 }

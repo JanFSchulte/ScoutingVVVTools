@@ -449,7 +449,22 @@ reap_finished_jobs() {
 
 launch_job() {
   local sample="$1"
-  nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &
+  if [ "${MODE}" = "0" ]; then
+    (
+      set -e
+      batch_count="$(env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" --batch-count)"
+      if [[ ! "${batch_count}" =~ ^[0-9]+$ ]] || [ "${batch_count}" -le 0 ]; then
+        echo "Invalid convert batch count for sample=${sample}: ${batch_count}" >&2
+        exit 1
+      fi
+      for ((batch_index = 0; batch_index < batch_count; batch_index++)); do
+        echo "[$(timestamp)] running sample=${sample} batch=$((batch_index + 1))/${batch_count}"
+        env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" "${batch_index}"
+      done
+    ) &
+  else
+    nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &
+  fi
   local pid=$!
   RUNNING_PIDS+=("${pid}")
   RUNNING_SAMPLES+=("${sample}")
