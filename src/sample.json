@@ -138,7 +138,7 @@
       "is_signal": false,
       "xsection": 13540000,
       "lumi": -1,
-      "raw_entries": 125841081
+      "raw_entries": 126056905
     },
     {
       "name": "qcd_ht800to1000",
@@ -148,7 +148,7 @@
       "is_signal": false,
       "xsection": 3033000,
       "lumi": -1,
-      "raw_entries": 36109396
+      "raw_entries": 125216445
     },
     {
       "name": "qcd_ht1000to1200",
@@ -158,7 +158,7 @@
       "is_signal": false,
       "xsection": 883700,
       "lumi": -1,
-      "raw_entries": 18533136
+      "raw_entries": 111207023
     },
     {
       "name": "qcd_ht1200to1500",
@@ -168,7 +168,7 @@
       "is_signal": false,
       "xsection": 383500,
       "lumi": -1,
-      "raw_entries": 6402807
+      "raw_entries": 50159537
     },
     {
       "name": "qcd_ht1500to2000",
@@ -180,7 +180,7 @@
       "is_signal": false,
       "xsection": 125200,
       "lumi": -1,
-      "raw_entries": 17416036
+      "raw_entries": 91377143
     },
     {
       "name": "qcd_ht2000",
@@ -192,7 +192,7 @@
       "is_signal": false,
       "xsection": 26490,
       "lumi": -1,
-      "raw_entries": 19146618
+      "raw_entries": 97803060
     },
     {
       "name": "ttbar_had",
@@ -232,7 +232,7 @@
       "is_signal": false,
       "xsection": 27950,
       "lumi": -1,
-      "raw_entries": 30547100
+      "raw_entries": 30260725
     },
     {
       "name": "zz",
@@ -262,7 +262,7 @@
       "is_signal": false,
       "xsection": 19971,
       "lumi": -1,
-      "raw_entries": 24003000
+      "raw_entries": 23999000
     }
   ]
 }
