@@ -457,10 +457,35 @@ launch_job() {
         echo "Invalid convert batch count for sample=${sample}: ${batch_count}" >&2
         exit 1
       fi
+      batch_failures=0
+      successful_batches=""
       for ((batch_index = 0; batch_index < batch_count; batch_index++)); do
         echo "[$(timestamp)] running sample=${sample} batch=$((batch_index + 1))/${batch_count}"
-        env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" "${batch_index}"
+        set +e
+        env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
+          "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
+          "CONVERT_DEFER_FINAL_MERGE=1" \
+          "${BIN_PATH}" "${sample}" "${batch_index}"
+        batch_status=$?
+        set -e
+        if [ "${batch_status}" -ne 0 ]; then
+          batch_failures=$((batch_failures + 1))
+          echo "[$(timestamp)] warning: sample=${sample} batch=$((batch_index + 1))/${batch_count} failed status=${batch_status}; continuing"
+          continue
+        fi
+        if [ -z "${successful_batches}" ]; then
+          successful_batches="${batch_index}"
+        else
+          successful_batches="${successful_batches},${batch_index}"
+        fi
       done
+      if [ "${batch_failures}" -gt 0 ]; then
+        echo "[$(timestamp)] warning: sample=${sample} completed with ${batch_failures}/${batch_count} failed batch(es); final output uses successful batches only"
+      fi
+      echo "[$(timestamp)] running sample=${sample} final merge from successful batches"
+      env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
+        "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
+        "${BIN_PATH}" "${sample}" --merge-successful-batches
     ) &
   else
     nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &

@@ -52,6 +52,8 @@ const char* kAppConfigPath = "./config.json";
 const char* kBranchConfigPath = "./branch.json";
 const char* kSelectionConfigPath = "./selection.json";
 const char* kAppConfigEnvVar = "CONVERT_CONFIG_PATH";
+const char* kSuccessfulBatchesEnvVar = "CONVERT_SUCCESSFUL_BATCHES";
+const char* kDeferFinalMergeEnvVar = "CONVERT_DEFER_FINAL_MERGE";
 const char* kDefaultSampleConfigPath = "../../src/sample.json";
 
 enum class DataType {
@@ -391,8 +393,15 @@ struct AppConfig {
 
 struct BatchRequest {
     bool printBatchCount = false;
+    bool mergeSuccessfulBatches = false;
     bool singleBatch = false;
     size_t batchIndex = 0;
+};
+
+struct BatchTempCollection {
+    vector<string> paths;
+    Long64_t rawEntries = 0;
+    size_t skipped = 0;
 };
 
 struct PileupBin {
@@ -2398,7 +2407,7 @@ BatchRequest resolveBatchRequest(int argc, char** argv) {
         return request;
     }
     if (argc > 3) {
-        throw runtime_error("Usage: convert_branch <sample> [batch_index|--batch-count]");
+        throw runtime_error("Usage: convert_branch <sample> [batch_index|--batch-count|--merge-successful-batches]");
     }
 
     const string arg = argv[2] == nullptr ? "" : argv[2];
@@ -2406,15 +2415,81 @@ BatchRequest resolveBatchRequest(int argc, char** argv) {
         request.printBatchCount = true;
         return request;
     }
+    if (arg == "--merge-successful-batches") {
+        request.mergeSuccessfulBatches = true;
+        return request;
+    }
 
     size_t batchIndex = 0;
     if (!parseNonNegativeIndex(arg, batchIndex)) {
         throw runtime_error("Invalid batch argument '" + arg +
-                            "'. Use a non-negative batch index or --batch-count.");
+                            "'. Use a non-negative batch index, --batch-count, or --merge-successful-batches.");
     }
     request.singleBatch = true;
     request.batchIndex = batchIndex;
     return request;
+}
+
+vector<size_t> parseSuccessfulBatchIndicesFromEnv(size_t nBatches, bool& restrictedToEnv) {
+    restrictedToEnv = false;
+    const char* envValue = getenv(kSuccessfulBatchesEnvVar);
+    if (envValue == nullptr) {
+        return {};
+    }
+
+    restrictedToEnv = true;
+    vector<size_t> indices;
+    string text(envValue);
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        const size_t comma = text.find(',', begin);
+        string token = text.substr(begin,
+                                   comma == string::npos ? string::npos : comma - begin);
+        token.erase(remove_if(token.begin(), token.end(),
+                              [](unsigned char ch) { return isspace(ch); }),
+                    token.end());
+        if (!token.empty()) {
+            size_t batchIndex = 0;
+            if (!parseNonNegativeIndex(token, batchIndex) || batchIndex >= nBatches) {
+                throw runtime_error(string("Invalid ") + kSuccessfulBatchesEnvVar +
+                                    " entry: " + token);
+            }
+            indices.push_back(batchIndex);
+        }
+        if (comma == string::npos) {
+            break;
+        }
+        begin = comma + 1;
+    }
+
+    sort(indices.begin(), indices.end());
+    indices.erase(unique(indices.begin(), indices.end()), indices.end());
+    return indices;
+}
+
+vector<size_t> resolveBatchIndicesForFinalMerge(size_t nBatches,
+                                                const BatchRequest& batchRequest) {
+    bool restrictedToEnv = false;
+    vector<size_t> indices = parseSuccessfulBatchIndicesFromEnv(nBatches, restrictedToEnv);
+    if (!restrictedToEnv) {
+        indices.reserve(nBatches);
+        for (size_t batchIndex = 0; batchIndex < nBatches; ++batchIndex) {
+            indices.push_back(batchIndex);
+        }
+        return indices;
+    }
+
+    if (batchRequest.singleBatch && batchRequest.batchIndex + 1 == nBatches) {
+        indices.push_back(batchRequest.batchIndex);
+        sort(indices.begin(), indices.end());
+        indices.erase(unique(indices.begin(), indices.end()), indices.end());
+    }
+    return indices;
+}
+
+bool finalMergeDeferredByEnv() {
+    const char* envValue = getenv(kDeferFinalMergeEnvVar);
+    return envValue != nullptr && string(envValue) != "0";
 }
 
 string resolvePileupWeightPath(const AppConfig& appConfig, const SampleMeta& sampleMeta) {
@@ -3171,6 +3246,103 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
     }
 }
 
+BatchTempCollection collectSuccessfulBatchTempFiles(const AppConfig& appConfig,
+                                                    const SampleMeta& sampleMeta,
+                                                    const vector<size_t>& batchIndices,
+                                                    size_t nBatches) {
+    BatchTempCollection collection;
+    collection.paths.reserve(batchIndices.size());
+    for (const size_t batchIndex : batchIndices) {
+        const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
+        const fs::path rawEntriesPath = makeBatchRawEntriesPath(batchOutputPath);
+        if (!fs::exists(batchOutputPath) || !fs::exists(rawEntriesPath)) {
+            ++collection.skipped;
+            cerr << "Warning: skipping incomplete batch " << (batchIndex + 1)
+                 << "/" << nBatches << " for sample = " << sampleMeta.sample
+                 << " (missing"
+                 << (fs::exists(batchOutputPath) ? "" : " ROOT output")
+                 << ((!fs::exists(batchOutputPath) && !fs::exists(rawEntriesPath)) ? " and" : "")
+                 << (fs::exists(rawEntriesPath) ? "" : " raw_entries")
+                 << ")" << endl;
+            continue;
+        }
+
+        try {
+            collection.rawEntries += readBatchRawEntries(batchOutputPath);
+        } catch (const exception& ex) {
+            ++collection.skipped;
+            cerr << "Warning: skipping batch " << (batchIndex + 1)
+                 << "/" << nBatches << " for sample = " << sampleMeta.sample
+                 << ": " << ex.what() << endl;
+            continue;
+        }
+        collection.paths.push_back(batchOutputPath.string());
+    }
+
+    if (collection.paths.empty()) {
+        throw runtime_error("No successful temporary batch outputs found for sample " +
+                            sampleMeta.sample);
+    }
+    return collection;
+}
+
+int finalizeSuccessfulBatches(const AppConfig& appConfig,
+                              const SampleMeta& sampleMeta,
+                              const BranchConfig& branchConfig,
+                              const vector<size_t>& batchIndices,
+                              size_t nBatches) {
+    BatchTempCollection batchFiles;
+    try {
+        batchFiles = collectSuccessfulBatchTempFiles(appConfig, sampleMeta, batchIndices, nBatches);
+        writeSampleRawEntries(appConfig.sampleConfigPath, sampleMeta.sample, batchFiles.rawEntries);
+        cout << "Updated raw_entries in " << appConfig.sampleConfigPath
+             << " for sample = " << sampleMeta.sample
+             << ", tree = " << appConfig.treeName
+             << ", raw_entries = " << batchFiles.rawEntries << endl;
+    } catch (const exception& ex) {
+        cerr << "raw_entries update error: " << ex.what() << endl;
+        return 1;
+    }
+
+    try {
+        const fs::path outputPath(sampleMeta.outputFileName);
+        if (!outputPath.parent_path().empty()) {
+            fs::create_directories(outputPath.parent_path());
+        }
+
+        const Long64_t maxOutputBytes = outputSizeLimitBytes(appConfig.maxOutputFileSizeGB);
+        cout << "Merging " << batchFiles.paths.size()
+             << " successful temporary batch file" << (batchFiles.paths.size() == 1 ? "" : "s")
+             << " out of " << nBatches << endl;
+        const vector<string> writtenFiles = writeOutputFilesStreaming(outputPath,
+                                                                      batchFiles.paths,
+                                                                      branchConfig.trees,
+                                                                      maxOutputBytes);
+        if (writtenFiles.size() <= 1) {
+            cout << "Wrote output file: "
+                 << (writtenFiles.empty() ? sampleMeta.outputFileName : writtenFiles.front())
+                 << endl;
+        } else {
+            cout << "Wrote output files:";
+            for (const auto& fileName : writtenFiles) {
+                cout << ' ' << fileName;
+            }
+            cout << endl;
+        }
+    } catch (const exception& ex) {
+        cerr << "Output error: " << ex.what() << endl;
+        return 1;
+    }
+
+    if (batchFiles.skipped > 0) {
+        cerr << "Warning: skipped " << batchFiles.skipped
+             << " incomplete selected batch"
+             << (batchFiles.skipped == 1 ? "" : "es")
+             << " while finalizing sample = " << sampleMeta.sample << endl;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3238,6 +3410,8 @@ int main(int argc, char** argv) {
          << ", files = " << inputFiles.size();
     if (batchRequest.singleBatch) {
         cout << ", batch = " << (batchRequest.batchIndex + 1) << "/" << nBatches;
+    } else if (batchRequest.mergeSuccessfulBatches) {
+        cout << ", merge successful batches";
     }
     if (sampleMeta.inputPaths.size() == 1) {
         cout << ", source = " << sampleMeta.inputPaths.front()
@@ -3248,6 +3422,21 @@ int main(int argc, char** argv) {
              << ", local = " << (sampleMeta.inputPaths.size() - sampleMeta.remoteSourceCount) << ")";
     }
     cout << endl;
+
+    const fs::path batchTempDir = makeBatchTempOutputDir(appConfig, sampleMeta);
+    if (batchRequest.mergeSuccessfulBatches) {
+        cout << "Batch mode: " << nBatches
+             << " batch" << (nBatches == 1 ? "" : "es")
+             << ", temporary output = " << batchTempDir.string() << endl;
+        vector<size_t> batchIndices;
+        try {
+            batchIndices = resolveBatchIndicesForFinalMerge(nBatches, batchRequest);
+        } catch (const exception& ex) {
+            cerr << "Batch selection error: " << ex.what() << endl;
+            return 1;
+        }
+        return finalizeSuccessfulBatches(appConfig, sampleMeta, branchConfig, batchIndices, nBatches);
+    }
 
     vector<PileupBin> pileupWeights;
     if (sampleMeta.isMC && !appConfig.puWeightPathPattern.empty()) {
@@ -3275,7 +3464,6 @@ int main(int argc, char** argv) {
 #endif
     cout << ", threads = " << threadCount << endl;
 
-    const fs::path batchTempDir = makeBatchTempOutputDir(appConfig, sampleMeta);
     cout << "Batch mode: " << nBatches
          << " batch" << (nBatches == 1 ? "" : "es")
          << ", max files per batch = " << batchSize
@@ -3326,63 +3514,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (batchRequest.singleBatch && batchRequest.batchIndex + 1 < nBatches) {
+    const bool deferFinalMerge = batchRequest.singleBatch && finalMergeDeferredByEnv();
+    if (batchRequest.singleBatch &&
+        (batchRequest.batchIndex + 1 < nBatches || deferFinalMerge)) {
         cout << "Batch " << (batchRequest.batchIndex + 1) << "/" << nBatches
-             << " complete; final merge will run after the last batch" << endl;
+             << " complete; final merge will run after the batch loop" << endl;
         return 0;
     }
 
-    vector<string> allBatchTempPaths;
-    allBatchTempPaths.reserve(nBatches);
-    Long64_t rawEntries = 0;
+    vector<size_t> batchIndices;
     try {
-        for (size_t batchIndex = 0; batchIndex < nBatches; ++batchIndex) {
-            const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
-            if (!fs::exists(batchOutputPath)) {
-                throw runtime_error("Missing temporary batch output: " + batchOutputPath.string());
-            }
-            allBatchTempPaths.push_back(batchOutputPath.string());
-            rawEntries += readBatchRawEntries(batchOutputPath);
-        }
-        writeSampleRawEntries(appConfig.sampleConfigPath, sampleMeta.sample, rawEntries);
-        cout << "Updated raw_entries in " << appConfig.sampleConfigPath
-             << " for sample = " << sampleMeta.sample
-             << ", tree = " << appConfig.treeName
-             << ", raw_entries = " << rawEntries << endl;
+        batchIndices = resolveBatchIndicesForFinalMerge(nBatches, batchRequest);
     } catch (const exception& ex) {
-        cerr << "raw_entries update error: " << ex.what() << endl;
+        cerr << "Batch selection error: " << ex.what() << endl;
         return 1;
     }
-
-    try {
-        const fs::path outputPath(sampleMeta.outputFileName);
-        if (!outputPath.parent_path().empty()) {
-            fs::create_directories(outputPath.parent_path());
-        }
-
-        const Long64_t maxOutputBytes = outputSizeLimitBytes(appConfig.maxOutputFileSizeGB);
-        cout << "Merging " << allBatchTempPaths.size()
-             << " temporary batch file" << (allBatchTempPaths.size() == 1 ? "" : "s")
-             << " into final output" << endl;
-        const vector<string> writtenFiles = writeOutputFilesStreaming(outputPath,
-                                                                      allBatchTempPaths,
-                                                                      branchConfig.trees,
-                                                                      maxOutputBytes);
-        if (writtenFiles.size() <= 1) {
-            cout << "Wrote output file: "
-                 << (writtenFiles.empty() ? sampleMeta.outputFileName : writtenFiles.front())
-                 << endl;
-        } else {
-            cout << "Wrote output files:";
-            for (const auto& fileName : writtenFiles) {
-                cout << ' ' << fileName;
-            }
-            cout << endl;
-        }
-    } catch (const exception& ex) {
-        cerr << "Output error: " << ex.what() << endl;
-        return 1;
-    }
-
-    return 0;
+    return finalizeSuccessfulBatches(appConfig, sampleMeta, branchConfig, batchIndices, nBatches);
 }
