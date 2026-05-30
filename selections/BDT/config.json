@@ -3,7 +3,7 @@
   "sample_config": "../../src/sample.json",
   "input_root": "../../dataset",
   "input_pattern": "{input_root}/{sample_group}_mixed/{sample}.root",
-  "output_root": "./{tree_name}_v4_NMSD",
+  "output_root": "./{tree_name}_v4_UParTv2",
   "model_pattern": "{output_root}/{tree_name}_model",
   "model_type": "bdt",
   "entries_per_sample": 20000000,
