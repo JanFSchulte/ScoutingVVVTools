@@ -6,7 +6,7 @@
   "output_root": "./{tree_name}_v4_UParTv2",
   "model_pattern": "{output_root}/{tree_name}_model",
   "model_type": "bdt",
-  "entries_per_sample": 15000000,
+  "entries_per_sample": 20000000,
   "train_fraction": 0.7,
   "random_state": 42,
   "decor_lambda": 0.002,
