@@ -176,12 +176,13 @@ def predict_model_logits(model, X, num_classes, batch_size=65536):
     if isinstance(model, TorchModelHandle):
         torch, _, _ = import_torch()
         arr = X.to_numpy(dtype=np.float32, copy=False) if hasattr(X, "to_numpy") else np.asarray(X, dtype=np.float32)
-        parts = []
+        out = np.empty((arr.shape[0], int(num_classes)), dtype=np.float32)
         with torch.no_grad():
             for start in range(0, arr.shape[0], int(batch_size)):
-                batch = torch.as_tensor(arr[start:start + int(batch_size)], dtype=torch.float32, device=model.device)
-                parts.append(model.model(batch).detach().cpu().numpy())
-        return np.concatenate(parts, axis=0) if parts else np.zeros((0, int(num_classes)), dtype=float)
+                end = min(start + int(batch_size), arr.shape[0])
+                batch = torch.as_tensor(arr[start:end], dtype=torch.float32, device=model.device)
+                out[start:end] = model.model(batch).detach().cpu().numpy()
+        return out
 
     if isinstance(model, xgb.Booster):
         dmat = xgb.DMatrix(X, feature_names=list(X.columns) if hasattr(X, "columns") else None)
@@ -205,4 +206,3 @@ def predict_model_proba(model, X, num_classes, batch_size=65536):
         proba = np.clip(proba, _EPS, None)
         return proba / np.sum(proba, axis=1, keepdims=True)
     raise TypeError(f"Unsupported model object for prediction: {type(model)}")
-
