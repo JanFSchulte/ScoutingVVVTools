@@ -15,6 +15,7 @@
   "decor_n_thresholds": 31,
   "decor_score_tau": 0.2,
   "decor_bin_tau_scale": 0.25,
+  "decor_msoftdrop_training_max": 200,
   "class_groups": {
     "VVV": ["www", "wwz", "wzz", "zzz"],
     "VH":  ["zh_had", "ggzh_had", "wplush", "wminush"],

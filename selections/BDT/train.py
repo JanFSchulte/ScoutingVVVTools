@@ -71,6 +71,7 @@ DECOR_N_BINS       = int(cfg.get("decor_n_bins", 5))
 DECOR_N_THRESHOLDS = int(cfg.get("decor_n_thresholds", 31))
 DECOR_SCORE_TAU    = float(cfg.get("decor_score_tau", 0.20))
 DECOR_BIN_TAU_SCALE = float(cfg.get("decor_bin_tau_scale", 0.35))
+DECOR_MSOFTDROP_TRAINING_MAX = float(cfg.get("decor_msoftdrop_training_max", 200.0))
 SUBMIT_TREES       = cfg.get("submit_trees", ["fat2"])
 INPUT_ROOT         = os.path.normpath(os.path.join(_SCRIPT_DIR, cfg["input_root"]))
 INPUT_PATTERN      = cfg["input_pattern"]
@@ -80,6 +81,11 @@ MODEL_TYPE         = model_type_from_config(cfg)
 
 if not 0.0 < TRAIN_FRACTION < 1.0:
     raise ValueError(f"train_fraction must be in (0, 1), got {TRAIN_FRACTION}")
+if not np.isfinite(DECOR_MSOFTDROP_TRAINING_MAX) or DECOR_MSOFTDROP_TRAINING_MAX <= 0.0:
+    raise ValueError(
+        "decor_msoftdrop_training_max must be a positive finite number, "
+        f"got {DECOR_MSOFTDROP_TRAINING_MAX}"
+    )
 
 if DECOR_LOSS_MODE == "soft_cvm":
     DECOR_LOSS_MODE = "smooth_cvm"
@@ -3406,11 +3412,15 @@ def _split_mass_thresholds(thresholds):
     mass_thresholds = {}
     other_thresholds = {}
     for name, cond in thresholds.items():
-        if str(name).startswith("ScoutingFatPFJetRecluster_msoftdrop_"):
+        if _is_msoftdrop_branch(name):
             mass_thresholds[name] = cond
         else:
             other_thresholds[name] = cond
     return mass_thresholds, other_thresholds
+
+
+def _is_msoftdrop_branch(name):
+    return str(name).startswith("ScoutingFatPFJetRecluster_msoftdrop_")
 
 
 def _split_training_thresholds(thresholds, decorrelate_feature_names):
@@ -3418,15 +3428,18 @@ def _split_training_thresholds(thresholds, decorrelate_feature_names):
         str(name) for name in decorrelate_feature_names
         if not isinstance(name, (int, np.integer)) and str(name) in thresholds
     }
-    training_thresholds = {
-        name: cond for name, cond in thresholds.items()
-        if name not in decor_threshold_names
-    }
-    decor_thresholds = {
-        name: cond for name, cond in thresholds.items()
-        if name in decor_threshold_names
-    }
-    return training_thresholds, decor_thresholds
+    training_thresholds = {}
+    decor_thresholds = {}
+    decor_training_overrides = {}
+    for name, cond in thresholds.items():
+        if name not in decor_threshold_names:
+            training_thresholds[name] = cond
+            continue
+        decor_thresholds[name] = cond
+        if _is_msoftdrop_branch(name):
+            decor_training_overrides[name] = (0.0, DECOR_MSOFTDROP_TRAINING_MAX)
+            training_thresholds[name] = decor_training_overrides[name]
+    return training_thresholds, decor_thresholds, decor_training_overrides
 
 
 def _drop_decorrelated_features(X, decorrelate_feature_names):
@@ -3483,7 +3496,9 @@ def main():
         thresholds = {k: (tuple(v) if isinstance(v, list) else v)
                       for k, v in sel.get("thresholds", {}).items()}
         decorrelate = cfg.get(tree_name, {}).get("decorrelate", [])
-        training_thresholds, decor_thresholds = _split_training_thresholds(thresholds, decorrelate)
+        training_thresholds, decor_thresholds, decor_training_overrides = _split_training_thresholds(
+            thresholds, decorrelate
+        )
         model_path = MODEL_PATTERN.format(output_root=output_root, tree_name=tree_name)
 
         # Threshold and decorrelate branches that are NOT declared in branch.json
@@ -3502,10 +3517,24 @@ def main():
             f"Running train.py for tree = {tree_name}, output = {output_root}, "
             f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
         )
-        if decor_thresholds:
+        omitted_decor_thresholds = [
+            name for name in decor_thresholds.keys()
+            if name not in decor_training_overrides
+        ]
+        if omitted_decor_thresholds:
             log_message(
                 f"Training threshold override for tree = {tree_name}: excluding decorrelate "
-                f"threshold(s) from training/eval loss only: {', '.join(decor_thresholds.keys())}"
+                f"threshold(s) from training/eval loss only: {', '.join(omitted_decor_thresholds)}"
+            )
+        if decor_training_overrides:
+            formatted_overrides = [
+                f"{name}=(0, {upper:g})"
+                for name, (_lower, upper) in decor_training_overrides.items()
+            ]
+            log_message(
+                f"Training threshold override for tree = {tree_name}: using loose "
+                f"decorrelate msoftdrop threshold(s) in training/eval loss only: "
+                f"{', '.join(formatted_overrides)}"
             )
         split_plans = build_split_plans(tree_name)
         write_config_copy(output_root)
