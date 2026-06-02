@@ -131,6 +131,68 @@ for _idx, (_cls, _members) in enumerate(CLASS_GROUPS.items()):
 TRAINING_SAMPLES = [r["name"] for r in sample_cfg["sample"] if r["name"] in SAMPLE_TO_CLASS]
 
 
+def _qcd_ht_bounds(sample_name):
+    text = str(sample_name).strip().lower()
+    prefix = "qcd_ht"
+    if not text.startswith(prefix):
+        return None
+    suffix = text[len(prefix):]
+    if "to" in suffix:
+        low_text, high_text = suffix.split("to", 1)
+    else:
+        low_text, high_text = suffix, None
+    if not low_text.isdigit() or (high_text is not None and not high_text.isdigit()):
+        return None
+    low = int(low_text)
+    high = int(high_text) if high_text is not None else None
+    return low, high
+
+
+def _qcd_ht_sort_key(sample_name):
+    bounds = _qcd_ht_bounds(sample_name)
+    if bounds is None:
+        return (float("inf"), float("inf"), str(sample_name))
+    low, high = bounds
+    return (low, high if high is not None else float("inf"), str(sample_name))
+
+
+def _qcd_ht_training_weight_scales(tree_name):
+    step = float(cfg.get(tree_name, {}).get("qcd_ht_training_weight_step", 0.0))
+    if not np.isfinite(step) or step < 0.0:
+        raise ValueError(
+            f"qcd_ht_training_weight_step for tree '{tree_name}' must be a finite non-negative number, "
+            f"got {step}"
+        )
+    if step <= 0.0:
+        return {}
+
+    qcd_ht_samples = []
+    seen = set()
+    for members in CLASS_GROUPS.values():
+        for sample_name in members:
+            if sample_name in seen:
+                continue
+            bounds = _qcd_ht_bounds(sample_name)
+            if bounds is None:
+                continue
+            low, high = bounds
+            qcd_ht_samples.append((low, high if high is not None else float("inf"), sample_name))
+            seen.add(sample_name)
+
+    if not qcd_ht_samples:
+        log_warning(
+            f"tree '{tree_name}' has qcd_ht_training_weight_step={step:g} "
+            "but no qcd_ht samples in class_groups"
+        )
+        return {}
+
+    qcd_ht_samples.sort(key=lambda item: (item[0], item[1], item[2]))
+    return {
+        sample_name: 1.0 + step * rank
+        for rank, (_low, _high, sample_name) in enumerate(qcd_ht_samples)
+    }
+
+
 # -------------------- File discovery --------------------
 def _sample_group(sample_name):
     return "signal" if SAMPLE_INFO[sample_name]["is_signal"] else "bkg"
@@ -383,9 +445,11 @@ def build_split_plans(tree_name):
     return split_plans
 
 
-def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
+def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, training_weight_scales=None):
     dfs = []
     sample_target_totals = {}
+    if training_weight_scales is None:
+        training_weight_scales = _qcd_ht_training_weight_scales(tree_name)
 
     reweight_branches = list(cfg.get(tree_name, {}).get("event_reweight_branches", []))
     load_branches = list(branches)
@@ -401,6 +465,7 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
         info = SAMPLE_INFO[sample_name]
         raw_entries = int(info["raw_entries"])
         xsec = float(info["xsection"])
+        training_weight_scale = float(training_weight_scales.get(sample_name, 1.0))
         if raw_entries <= 0:
             raise RuntimeError(
                 f"Sample '{sample_name}' has raw_entries={raw_entries}; "
@@ -440,10 +505,10 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
             target_total = 0.0
         else:
             target_total = xsec * (float(total_tree_entries) / float(raw_entries))
+        training_target_total = target_total * training_weight_scale
 
         if target_total <= 0.0:
             df["weight_physics"] = 0.0
-            sample_target_totals[sample_name] = 0.0
             if xsec <= 0.0:
                 log_warning(
                     f"sample '{sample_name}' has non-positive xsection={xsec:.6g}; assigning zero weight"
@@ -456,20 +521,22 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
                     f"{raw_w_sum:.6g} in split '{split_name}' of tree '{tree_name}'"
                 )
             df["weight_physics"] = raw_w * (target_total / raw_w_sum)
-            sample_target_totals[sample_name] = target_total
         if "weight_physics" not in df.columns:
             df["weight_physics"] = 0.0
         del raw_w
 
         df["class_idx"] = SAMPLE_TO_CLASS[sample_name]
         df["sample_name"] = sample_name
-        df["weight"] = df["weight_physics"]
+        df["weight"] = df["weight_physics"] * training_weight_scale
+        sample_target_totals[sample_name] = training_target_total
         dfs.append(df)
 
         log_message(
             f"  {sample_name}: split={split_name}, tree_entries={plan['total_entries']}, "
             f"split_entries={split_total_entries}, used_entries={n_read}, raw_entries={raw_entries}, "
-            f"target_total={target_total:.6g}, class={CLASS_NAMES[SAMPLE_TO_CLASS[sample_name]]}"
+            f"target_total={target_total:.6g}, training_scale={training_weight_scale:.6g}, "
+            f"training_target_total={training_target_total:.6g}, "
+            f"class={CLASS_NAMES[SAMPLE_TO_CLASS[sample_name]]}"
         )
 
     if not dfs:
@@ -3517,6 +3584,18 @@ def main():
             f"Running train.py for tree = {tree_name}, output = {output_root}, "
             f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
         )
+        training_weight_scales = _qcd_ht_training_weight_scales(tree_name)
+        if training_weight_scales:
+            formatted_scales = ", ".join(
+                f"{sample_name}={scale:.6g}"
+                for sample_name, scale in sorted(
+                    training_weight_scales.items(),
+                    key=lambda item: _qcd_ht_sort_key(item[0]),
+                )
+            )
+            log_message(
+                f"QCD HT training weight scales for tree = {tree_name}: {formatted_scales}"
+            )
         omitted_decor_thresholds = [
             name for name in decor_thresholds.keys()
             if name not in decor_training_overrides
@@ -3544,13 +3623,15 @@ def main():
 
         log_message(f"Loading training split for tree = {tree_name}")
         X_train, y_train, w_train, sample_labels_train, _ = prepare_split_data(
-            tree_name, load_cols, "train", split_plans, shuffle=True
+            tree_name, load_cols, "train", split_plans, shuffle=True,
+            training_weight_scales=training_weight_scales,
         )
         check_weights(w_train, f"{tree_name}_train_weight_before_filter")
 
         log_message(f"Loading test split for tree = {tree_name}")
         X_test, y_test, w_test, sample_labels_test, w_test_physics = prepare_split_data(
-            tree_name, load_cols, "test", split_plans, shuffle=False
+            tree_name, load_cols, "test", split_plans, shuffle=False,
+            training_weight_scales=training_weight_scales,
         )
         check_weights(w_test, f"{tree_name}_test_weight_before_filter")
         check_weights(w_test_physics, f"{tree_name}_test_physics_weight_before_filter")

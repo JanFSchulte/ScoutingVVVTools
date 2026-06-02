@@ -44,7 +44,8 @@
     "early_stopping_rounds": 30,
     "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1"],
     "decor_efficiencies": [1.0, 0.5, 0.1, 0.05],
-    "event_reweight_branches": ["weight_pu"]
+    "event_reweight_branches": ["weight_pu"],
+    "qcd_ht_training_weight_step": 0.10
   },
   "fat3": {
     "n_estimators": 4000,
@@ -64,7 +65,8 @@
     "early_stopping_rounds": 30,
     "decorrelate": ["ScoutingFatPFJetRecluster_msoftdrop_1"],
     "decor_efficiencies": [1.0, 0.5, 0.1, 0.05],
-    "event_reweight_branches": ["weight_pu"]
+    "event_reweight_branches": ["weight_pu"],
+    "qcd_ht_training_weight_step": 0.10
   },
   "fat2_nn": {
     "epochs": 200,
