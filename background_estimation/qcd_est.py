@@ -913,20 +913,23 @@ def plot_a_region_branch_shapes(
             raise KeyError(f"A-region shape branch {branch!r} not found in loaded data")
 
         values = X_raw[branch].to_numpy(dtype=float, copy=False)
-        valid = np.isfinite(values) & (values >= -990)
+        valid = np.isfinite(values) & (values > -10.0)
         edge_values = values[valid & a_union_mask]
         if edge_values.size == 0:
-            log_warning(f"A-region shape branch '{branch}' has no valid A-union entries; skipping")
+            log_warning(
+                f"A-region shape branch '{branch}' has no valid A-union entries "
+                "above -10; skipping"
+            )
             continue
 
-        lo = float(np.min(edge_values))
+        lo = max(-10.0, float(np.min(edge_values)))
         hi = float(np.max(edge_values))
         if not np.isfinite(lo) or not np.isfinite(hi):
             log_warning(f"A-region shape branch '{branch}' has non-finite range; skipping")
             continue
         if lo >= hi:
             pad = max(1.0, abs(lo) * 0.05)
-            lo -= 0.5 * pad
+            lo = max(-10.0, lo - 0.5 * pad)
             hi += 0.5 * pad
             log_warning(
                 f"A-region shape branch '{branch}' has degenerate range; "
