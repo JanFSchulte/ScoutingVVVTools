@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -87,6 +88,34 @@ def log_message(message: str) -> None:
 
 def log_warning(message: str) -> None:
     log_message(f"[WARN] {message}")
+
+
+def _format_seconds(start_time: float) -> str:
+    return f"{time.perf_counter() - start_time:.1f}s"
+
+
+def _format_bytes(n_bytes: float) -> str:
+    n_bytes = float(n_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n_bytes) < 1024.0 or unit == "TB":
+            return f"{n_bytes:.1f} {unit}"
+        n_bytes /= 1024.0
+    return f"{n_bytes:.1f} TB"
+
+
+def _file_size_text(path: str) -> str:
+    try:
+        return _format_bytes(os.path.getsize(path))
+    except OSError:
+        return "unknown"
+
+
+def _array_size_text(arr) -> str:
+    return _format_bytes(getattr(arr, "nbytes", 0))
+
+
+def _dataframe_size_text(df: pd.DataFrame) -> str:
+    return _format_bytes(df.memory_usage(index=True, deep=False).sum())
 
 
 # -------------------- Helpers --------------------
@@ -373,53 +402,99 @@ def _compare_prediction_reference(path, feature_names, sample_labels, class_idx,
             f"Prediction reference not found: {path}. Re-run train.py before qcd_est.py."
         )
 
+    total_start = time.perf_counter()
+    log_message(
+        f"Loading prediction reference: path={path}, compressed_size={_file_size_text(path)}"
+    )
     ref = np.load(path, allow_pickle=False)
+
+    step_start = time.perf_counter()
     ref_features = ref["feature_names"].astype(str).tolist()
     cur_features = list(feature_names)
+    log_message(
+        f"Reference feature check: current={len(cur_features)}, reference={len(ref_features)}, "
+        f"elapsed={_format_seconds(step_start)}"
+    )
     if cur_features != ref_features:
         raise RuntimeError(
             "Prediction reference mismatch for qcd_est model features: "
             f"current={cur_features}, reference={ref_features}"
         )
 
+    step_start = time.perf_counter()
+    log_message("Loading reference sample labels")
     ref_samples = ref["sample_name"].astype(str)
     cur_samples = np.asarray(sample_labels, dtype=str)
+    log_message(
+        f"Comparing sample labels: n={len(cur_samples)}, "
+        f"reference_size={_array_size_text(ref_samples)}, elapsed={_format_seconds(step_start)}"
+    )
+    step_start = time.perf_counter()
     if not np.array_equal(cur_samples, ref_samples):
         raise RuntimeError("Prediction reference mismatch for qcd_est sample order/content")
+    log_message(f"Sample label comparison passed: elapsed={_format_seconds(step_start)}")
 
+    step_start = time.perf_counter()
+    log_message("Loading reference class labels")
     ref_class_idx = ref["class_idx"].astype(int)
     cur_class_idx = np.asarray(class_idx, dtype=int)
+    log_message(
+        f"Comparing class labels: n={len(cur_class_idx)}, "
+        f"reference_size={_array_size_text(ref_class_idx)}, elapsed={_format_seconds(step_start)}"
+    )
+    step_start = time.perf_counter()
     if not np.array_equal(cur_class_idx, ref_class_idx):
         raise RuntimeError("Prediction reference mismatch for qcd_est class labels")
+    log_message(f"Class label comparison passed: elapsed={_format_seconds(step_start)}")
 
+    step_start = time.perf_counter()
+    log_message("Loading reference weights")
     ref_weights = ref["weight"].astype(float) * LUMI
     cur_weights = np.asarray(weights, dtype=float)
     weight_rtol = float(ref["weight_rtol"])
     weight_atol = float(ref["weight_atol"])
+    log_message(
+        f"Comparing weights: shape={cur_weights.shape}, current_size={_array_size_text(cur_weights)}, "
+        f"reference_size={_array_size_text(ref_weights)}, rtol={weight_rtol}, atol={weight_atol}, "
+        f"load_elapsed={_format_seconds(step_start)}"
+    )
+    step_start = time.perf_counter()
     if not np.allclose(cur_weights, ref_weights, rtol=weight_rtol, atol=weight_atol):
         diff = float(np.max(np.abs(cur_weights - ref_weights)))
         raise RuntimeError(
             "Prediction reference mismatch for qcd_est weights: "
             f"max_abs_diff={diff:.6g}, rtol={weight_rtol}, atol={weight_atol}"
         )
+    log_message(f"Weight comparison passed: elapsed={_format_seconds(step_start)}")
 
+    step_start = time.perf_counter()
+    log_message("Loading reference probabilities")
     ref_proba = ref["proba"].astype(float)
     cur_proba = np.asarray(proba, dtype=float)
     proba_rtol = float(ref["proba_rtol"])
     proba_atol = float(ref["proba_atol"])
+    log_message(
+        f"Comparing probabilities: shape={cur_proba.shape}, "
+        f"current_size={_array_size_text(cur_proba)}, reference_size={_array_size_text(ref_proba)}, "
+        f"rtol={proba_rtol}, atol={proba_atol}, load_elapsed={_format_seconds(step_start)}"
+    )
     if cur_proba.shape != ref_proba.shape:
         raise RuntimeError(
             "Prediction reference mismatch for qcd_est probabilities shape: "
             f"current={cur_proba.shape}, reference={ref_proba.shape}"
         )
+    step_start = time.perf_counter()
     if not np.allclose(cur_proba, ref_proba, rtol=proba_rtol, atol=proba_atol):
         diff = float(np.max(np.abs(cur_proba - ref_proba)))
         raise RuntimeError(
             "Prediction reference mismatch for qcd_est probabilities: "
             f"max_abs_diff={diff:.6g}, rtol={proba_rtol}, atol={proba_atol}"
         )
+    log_message(f"Probability comparison passed: elapsed={_format_seconds(step_start)}")
 
-    log_message(f"Validated prediction reference: {path}")
+    log_message(
+        f"Validated prediction reference: {path}, total_elapsed={_format_seconds(total_start)}"
+    )
 
 
 # -------------------- Test data loading --------------------
@@ -1169,22 +1244,77 @@ def main() -> None:
     )
     log_message(f"Output directory: {OUTPUT_DIR}")
 
+    step_start = time.perf_counter()
     df_all = load_test_data(load_branches)
+    log_message(
+        f"Finished loading MC test data: events={len(df_all)}, columns={len(df_all.columns)}, "
+        f"dataframe_size={_dataframe_size_text(df_all)}, elapsed={_format_seconds(step_start)}"
+    )
+    step_start = time.perf_counter()
     X_raw = df_all[load_branches].copy()
     y = df_all["class_idx"].values.astype(int)
     w = df_all["weight"].values.astype(float)
     sample_labels = df_all["sample_name"].astype(str).values
     group_labels = df_all["group_name"].astype(str).values
+    log_message(
+        f"Prepared raw analysis arrays: events={len(X_raw)}, branches={len(load_branches)}, "
+        f"X_raw_size={_dataframe_size_text(X_raw)}, weights_size={_array_size_text(w)}, "
+        f"elapsed={_format_seconds(step_start)}"
+    )
     del df_all
     gc.collect()
 
     clf = _load_model()
     have_full_reference = os.path.exists(TEST_REFERENCE_QCD_EST_FULL)
+    log_message(
+        f"Prediction reference availability: full_reference={have_full_reference}, "
+        f"full_path={TEST_REFERENCE_QCD_EST_FULL}, "
+        f"full_size={_file_size_text(TEST_REFERENCE_QCD_EST_FULL) if have_full_reference else 'missing'}"
+    )
     if have_full_reference:
-        log_message("Validating full test-set prediction reference")
-        X_model_full = standardize_X(X_raw[model_branches].copy(), clip_ranges, log_transform)
+        log_message(
+            f"Validating full test-set prediction reference: events={len(X_raw)}, "
+            f"model_branches={len(model_branches)}"
+        )
+        step_start = time.perf_counter()
+        X_model_full = X_raw[model_branches].copy()
+        log_message(
+            f"Copied full test-set model features: shape={X_model_full.shape}, "
+            f"size={_dataframe_size_text(X_model_full)}, elapsed={_format_seconds(step_start)}"
+        )
+
+        step_start = time.perf_counter()
+        X_model_full = standardize_X(X_model_full, clip_ranges, log_transform)
+        log_message(
+            f"Standardised full test-set model features: shape={X_model_full.shape}, "
+            f"elapsed={_format_seconds(step_start)}"
+        )
+
+        step_start = time.perf_counter()
         X_model_full = _drop_decorrelated_features(X_model_full, decorrelate)
+        if decorrelate:
+            log_message(
+                f"Removed decorrelated full test-set features: {decorrelate}, "
+                f"shape={X_model_full.shape}, elapsed={_format_seconds(step_start)}"
+            )
+        else:
+            log_message(
+                f"No decorrelated full test-set features to remove: shape={X_model_full.shape}, "
+                f"elapsed={_format_seconds(step_start)}"
+            )
+
+        step_start = time.perf_counter()
+        log_message(
+            f"Running full test-set model prediction: X_shape={X_model_full.shape}, "
+            f"model_type={type(clf).__name__}"
+        )
         proba_full = _predict_model_proba(clf, X_model_full)
+        log_message(
+            f"Finished full test-set model prediction: proba_shape={proba_full.shape}, "
+            f"proba_size={_array_size_text(proba_full)}, elapsed={_format_seconds(step_start)}"
+        )
+        step_start = time.perf_counter()
+        log_message("Comparing full test-set prediction reference")
         _compare_prediction_reference(
             TEST_REFERENCE_QCD_EST_FULL,
             X_model_full.columns
@@ -1195,10 +1325,15 @@ def main() -> None:
             w,
             proba_full,
         )
+        log_message(f"Finished full test-set reference comparison: elapsed={_format_seconds(step_start)}")
+        step_start = time.perf_counter()
         del X_model_full, proba_full
         gc.collect()
+        log_message(f"Released full test-set validation arrays: elapsed={_format_seconds(step_start)}")
 
     log_message("Applying non-ABCD thresholds")
+    events_before_filter = len(X_raw)
+    step_start = time.perf_counter()
     X_raw, y, w, sample_labels = filter_X(
         X_raw,
         y,
@@ -1209,31 +1344,61 @@ def main() -> None:
         sample_labels=sample_labels,
     )
     group_labels = np.asarray([SAMPLE_TO_GROUP[name] for name in sample_labels], dtype=object)
-    log_message(f"After non-ABCD filtering: {len(X_raw)} events")
+    log_message(
+        f"After non-ABCD filtering: events={len(X_raw)} "
+        f"(removed={events_before_filter - len(X_raw)} of {events_before_filter}), "
+        f"elapsed={_format_seconds(step_start)}"
+    )
 
     log_message("Evaluating ABCD pass/fail masks")
+    step_start = time.perf_counter()
     abcd_pass, abcd_fail = _abcd_pass_fail_masks(X_raw, abcd_thresholds)
     abcd_mixed = ~(abcd_pass | abcd_fail)
     log_message(
         f"ABCD branch categories: pass={int(np.count_nonzero(abcd_pass))}, "
-        f"fail={int(np.count_nonzero(abcd_fail))}, excluded_mixed={int(np.count_nonzero(abcd_mixed))}"
+        f"fail={int(np.count_nonzero(abcd_fail))}, "
+        f"excluded_mixed={int(np.count_nonzero(abcd_mixed))}, "
+        f"elapsed={_format_seconds(step_start)}"
     )
 
     log_message("Standardising model features")
-    X_model = standardize_X(X_raw[model_branches].copy(), clip_ranges, log_transform)
+    step_start = time.perf_counter()
+    X_model = X_raw[model_branches].copy()
+    log_message(
+        f"Copied filtered model features: shape={X_model.shape}, "
+        f"size={_dataframe_size_text(X_model)}, elapsed={_format_seconds(step_start)}"
+    )
+    step_start = time.perf_counter()
+    X_model = standardize_X(X_model, clip_ranges, log_transform)
+    log_message(
+        f"Standardised filtered model features: shape={X_model.shape}, "
+        f"elapsed={_format_seconds(step_start)}"
+    )
     if decorrelate:
+        step_start = time.perf_counter()
         X_model = _drop_decorrelated_features(X_model, decorrelate)
-        log_message(f"Removed decorrelated features: {decorrelate}")
+        log_message(
+            f"Removed decorrelated filtered features: {decorrelate}, "
+            f"shape={X_model.shape}, elapsed={_format_seconds(step_start)}"
+        )
 
     log_message("Running model prediction")
+    step_start = time.perf_counter()
     proba = _predict_model_proba(clf, X_model)
-    log_message(f"Predicted probabilities shape: {proba.shape}")
+    log_message(
+        f"Predicted probabilities: shape={proba.shape}, size={_array_size_text(proba)}, "
+        f"elapsed={_format_seconds(step_start)}"
+    )
     if not have_full_reference:
         log_warning(
             "Full qcd_est reference missing; using legacy filtered reference. "
             "Re-run train.py to produce test_reference_qcd_est_full.npz for configurable ABCD branches."
         )
-        log_message("Validating filtered test-set prediction reference")
+        log_message(
+            f"Validating filtered test-set prediction reference: path={TEST_REFERENCE_QCD_EST}, "
+            f"size={_file_size_text(TEST_REFERENCE_QCD_EST)}"
+        )
+        step_start = time.perf_counter()
         _compare_prediction_reference(
             TEST_REFERENCE_QCD_EST,
             X_model.columns
@@ -1244,6 +1409,7 @@ def main() -> None:
             w,
             proba,
         )
+        log_message(f"Finished filtered test-set reference comparison: elapsed={_format_seconds(step_start)}")
 
     log_message("Building ABCD regions")
     region_score_masks = []
