@@ -1296,6 +1296,9 @@ def main() -> None:
     pred_qcd_union = raw_pred_qcd_union * QCD_PREDICT_SCALE_MULTIPLIER
     pred_qcd_union_var = raw_pred_qcd_union_var * (QCD_PREDICT_SCALE_MULTIPLIER ** 2)
     pred_qcd_union_sigma = math.sqrt(max(pred_qcd_union_var, 0.0))
+    raw_qcd_scale = raw_pred_qcd_union / qcd_a_total
+    raw_qcd_scale_var = raw_pred_qcd_union_var / (qcd_a_total ** 2)
+    raw_qcd_scale_sigma = math.sqrt(max(raw_qcd_scale_var, 0.0))
     qcd_scale = pred_qcd_union / qcd_a_total
     qcd_scale_var = pred_qcd_union_var / (qcd_a_total ** 2)
     qcd_scale_sigma = math.sqrt(max(qcd_scale_var, 0.0))
@@ -1303,9 +1306,10 @@ def main() -> None:
     log_message(
         f"ABCD QCD totals: A_union={qcd_a_total:.6g}, B={qcd_b_total:.6g}, "
         f"C={qcd_c_total:.6g}, D={qcd_d_total:.6g}, raw_pred_union={raw_pred_qcd_union:.6g}, "
+        f"raw_scale={raw_qcd_scale:.6g} ± {raw_qcd_scale_sigma:.6g}, "
         f"manual_scale_multiplier={QCD_PREDICT_SCALE_MULTIPLIER:.6g}, "
         f"pred_union={pred_qcd_union:.6g} ± {pred_qcd_union_sigma:.6g}, "
-        f"scale={qcd_scale:.6g} ± {qcd_scale_sigma:.6g}"
+        f"final_scale={qcd_scale:.6g} ± {qcd_scale_sigma:.6g}"
     )
 
     log_message(f"Filling signal-region yields: n={len(region_labels)}")
@@ -1345,6 +1349,7 @@ def main() -> None:
             + ((region_val / (qcd_a_total ** 2)) ** 2) * rest_var
         )
 
+    raw_pred_qcd_vals = raw_pred_qcd_union * qcd_fraction_vals
     pred_qcd_vals = pred_qcd_union * qcd_fraction_vals
     pred_qcd_stat_vars = (pred_qcd_union ** 2) * qcd_fraction_vars
     pred_qcd_scale_vars = (true_qcd_vals ** 2) * qcd_scale_var
@@ -1353,6 +1358,19 @@ def main() -> None:
         np.sqrt(np.maximum(pred_qcd_scale_vars, 0.0)),
     )
     pred_qcd_vars = np.diag(pred_qcd_cov).astype(float)
+
+    log_message(
+        "QCD SR prediction debug: "
+        f"manual_scale_multiplier={QCD_PREDICT_SCALE_MULTIPLIER:.6g}, "
+        f"raw_scale={raw_qcd_scale:.6g}, final_scale={qcd_scale:.6g}"
+    )
+    for idx, label in enumerate(region_labels):
+        log_message(
+            f"  {label}: qcd_true={true_qcd_vals[idx]:.6g}, "
+            f"a_fraction={qcd_fraction_vals[idx]:.6g}, "
+            f"raw_predict={raw_pred_qcd_vals[idx]:.6g}, "
+            f"scaled_predict={pred_qcd_vals[idx]:.6g}"
+        )
 
     non_qcd_groups = [group for group in CLASS_NAMES if group not in QCD_CLASS_SET]
     pred_group_yields = {group: group_yields[group].copy() for group in non_qcd_groups}
