@@ -19,6 +19,7 @@ import mplhep as hep
 import numpy as np
 import pandas as pd
 import uproot
+import xgboost as xgb
 
 
 # -------------------- Style --------------------
@@ -165,6 +166,10 @@ CLASS_GROUPS = cfg["class_groups"]
 CLASS_NAMES = list(CLASS_GROUPS.keys())
 NUM_CLASSES = len(CLASS_NAMES)
 DEFAULT_AXIS_NAMES = CLASS_NAMES[: max(1, NUM_CLASSES - 1)]
+INFERENCE_THREADS = max(1, min(32, os.cpu_count() or 1))
+XGB_PREDICT_BATCH_TARGET_BYTES = 512 * 1024 * 1024
+XGB_PREDICT_MIN_BATCH_ROWS = 100_000
+XGB_PREDICT_PROGRESS_SECONDS = 30.0
 
 
 def _resolve_tree_branch_names(
@@ -323,22 +328,14 @@ def _mask_from_cond(col: pd.Series, cond) -> pd.Series:
     raise TypeError(f"Unsupported condition type: {type(cond)}")
 
 
-def filter_X(
+def _threshold_mask(
     X: pd.DataFrame,
-    y,
-    w,
-    branch: list,
     thresholds: dict | None = None,
     apply_to_sentinel: bool = True,
-    sample_labels=None,
-):
-    """Apply per-branch threshold cuts, matching train.py and signal_region.py."""
-    if not thresholds:
-        if sample_labels is None:
-            return X.copy(), y.copy(), w.copy()
-        return X.copy(), y.copy(), w.copy(), np.asarray(sample_labels).copy()
-
+) -> pd.Series:
     mask = pd.Series(True, index=X.index)
+    if not thresholds:
+        return mask
     for name, cond in thresholds.items():
         if name not in X.columns:
             raise KeyError(f"Column {name!r} not found in X")
@@ -351,6 +348,29 @@ def filter_X(
         else:
             if cond is not None:
                 mask &= (_mask_from_cond(col, cond) | sentinel)
+    return mask
+
+
+def filter_X(
+    X: pd.DataFrame,
+    y,
+    w,
+    branch: list,
+    thresholds: dict | None = None,
+    apply_to_sentinel: bool = True,
+    sample_labels=None,
+    mask: Optional[pd.Series] = None,
+):
+    """Apply per-branch threshold cuts, matching train.py and signal_region.py."""
+    if mask is None and not thresholds:
+        if sample_labels is None:
+            return X.copy(), y.copy(), w.copy()
+        return X.copy(), y.copy(), w.copy(), np.asarray(sample_labels).copy()
+
+    if mask is None:
+        mask = _threshold_mask(X, thresholds, apply_to_sentinel=apply_to_sentinel)
+    elif not isinstance(mask, pd.Series):
+        mask = pd.Series(mask, index=X.index)
 
     X_out = X.loc[mask].copy()
     y_out = y[mask.values].copy()
@@ -392,7 +412,134 @@ def _drop_decorrelated_features(X: pd.DataFrame, decorrelate: list[str]) -> pd.D
     return X
 
 
-def _predict_model_proba(model, X):
+def _softmax_rows(logits) -> np.ndarray:
+    logits = np.asarray(logits, dtype=float)
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exp_v = np.exp(shifted)
+    return exp_v / (np.sum(exp_v, axis=1, keepdims=True) + 1e-12)
+
+
+def _reshape_multiclass_margin(predt, n_rows: int) -> np.ndarray:
+    predt = np.asarray(predt, dtype=float)
+    if predt.ndim == 2:
+        if predt.shape[1] == NUM_CLASSES:
+            return predt
+        if predt.shape[0] == NUM_CLASSES:
+            return predt.T
+    return predt.reshape(int(n_rows), int(NUM_CLASSES))
+
+
+def _xgb_batch_rows(n_rows: int, n_cols: int) -> int:
+    if n_rows <= 0:
+        return 1
+    bytes_per_row = max(1, int(n_cols)) * np.dtype(np.float32).itemsize
+    rows = max(
+        XGB_PREDICT_MIN_BATCH_ROWS,
+        XGB_PREDICT_BATCH_TARGET_BYTES // max(1, bytes_per_row),
+    )
+    return max(1, min(int(n_rows), int(rows)))
+
+
+def _xgb_feature_names(X) -> Optional[List[str]]:
+    if hasattr(X, "columns"):
+        return list(X.columns)
+    return None
+
+
+def _validate_xgb_feature_names(model: xgb.Booster, feature_names: Optional[List[str]]) -> None:
+    model_features = getattr(model, "feature_names", None)
+    if model_features and feature_names and list(model_features) != list(feature_names):
+        raise RuntimeError(
+            "XGBoost model feature mismatch: "
+            f"current={feature_names}, model={list(model_features)}"
+        )
+
+
+def _predict_booster_proba_dmatrix_batched(model: xgb.Booster, X, context: str) -> np.ndarray:
+    n_rows = int(X.shape[0])
+    n_cols = int(X.shape[1])
+    feature_names = _xgb_feature_names(X)
+    out = np.empty((n_rows, NUM_CLASSES), dtype=float)
+    batch_rows = _xgb_batch_rows(n_rows, n_cols)
+    n_batches = int(math.ceil(n_rows / batch_rows)) if n_rows else 0
+    start_time = time.perf_counter()
+    next_progress = start_time + XGB_PREDICT_PROGRESS_SECONDS
+    log_message(
+        f"Using XGBoost batched DMatrix prediction for {context}: "
+        f"rows={n_rows}, cols={n_cols}, batch_rows={batch_rows}, "
+        f"batches={n_batches}, threads={INFERENCE_THREADS}"
+    )
+    for batch_idx, start in enumerate(range(0, n_rows, batch_rows), 1):
+        end = min(start + batch_rows, n_rows)
+        batch = X.iloc[start:end] if hasattr(X, "iloc") else X[start:end]
+        dmat = xgb.DMatrix(batch, feature_names=feature_names)
+        margins = _reshape_multiclass_margin(
+            model.predict(dmat, output_margin=True),
+            end - start,
+        )
+        out[start:end] = _softmax_rows(margins)
+        now = time.perf_counter()
+        if end == n_rows or now >= next_progress:
+            log_message(
+                f"  {context} prediction batch {batch_idx}/{n_batches}: "
+                f"rows={end}/{n_rows}, elapsed={now - start_time:.1f}s"
+            )
+            next_progress = now + XGB_PREDICT_PROGRESS_SECONDS
+    return out
+
+
+def _predict_booster_proba_batched(model: xgb.Booster, X, context: str) -> np.ndarray:
+    n_rows = int(X.shape[0])
+    n_cols = int(X.shape[1])
+    if n_rows == 0:
+        return np.empty((0, NUM_CLASSES), dtype=float)
+    feature_names = _xgb_feature_names(X)
+    _validate_xgb_feature_names(model, feature_names)
+
+    data = X.to_numpy(dtype=np.float32, copy=False) if hasattr(X, "to_numpy") else np.asarray(X, dtype=np.float32)
+    out = np.empty((n_rows, NUM_CLASSES), dtype=float)
+    batch_rows = _xgb_batch_rows(n_rows, n_cols)
+    n_batches = int(math.ceil(n_rows / batch_rows))
+    start_time = time.perf_counter()
+    next_progress = start_time + XGB_PREDICT_PROGRESS_SECONDS
+    log_message(
+        f"Using XGBoost batched inplace prediction for {context}: "
+        f"rows={n_rows}, cols={n_cols}, batch_rows={batch_rows}, "
+        f"batches={n_batches}, threads={INFERENCE_THREADS}"
+    )
+
+    for batch_idx, start in enumerate(range(0, n_rows, batch_rows), 1):
+        end = min(start + batch_rows, n_rows)
+        batch = data[start:end]
+        if not batch.flags["C_CONTIGUOUS"]:
+            batch = np.ascontiguousarray(batch)
+        try:
+            margins = model.inplace_predict(
+                batch,
+                predict_type="margin",
+                validate_features=False,
+            )
+        except (AttributeError, TypeError, ValueError, xgb.core.XGBoostError) as exc:
+            log_warning(
+                "XGBoost inplace prediction unavailable; falling back to batched DMatrix "
+                f"prediction for {context}: {exc}"
+            )
+            return _predict_booster_proba_dmatrix_batched(model, X, context)
+        margins = _reshape_multiclass_margin(margins, end - start)
+        out[start:end] = _softmax_rows(margins)
+        now = time.perf_counter()
+        if end == n_rows or now >= next_progress:
+            log_message(
+                f"  {context} prediction batch {batch_idx}/{n_batches}: "
+                f"rows={end}/{n_rows}, elapsed={now - start_time:.1f}s"
+            )
+            next_progress = now + XGB_PREDICT_PROGRESS_SECONDS
+    return out
+
+
+def _predict_model_proba(model, X, context: str = "model"):
+    if isinstance(model, xgb.Booster):
+        return _predict_booster_proba_batched(model, X, context)
     return _shared_predict_model_proba(model, X, NUM_CLASSES)
 
 
@@ -605,9 +752,23 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
 
 
 # -------------------- Model loading --------------------
+def _configure_model_for_inference(model):
+    if isinstance(model, xgb.Booster):
+        model.set_param({"nthread": INFERENCE_THREADS})
+        log_message(f"XGBoost inference threads = {INFERENCE_THREADS}")
+    elif hasattr(model, "set_params"):
+        try:
+            model.set_params(n_jobs=INFERENCE_THREADS)
+            log_message(f"Model inference jobs = {INFERENCE_THREADS}")
+        except (TypeError, ValueError):
+            pass
+    return model
+
+
 def _load_model():
     model_base = MODEL_PATTERN.format(output_root=BDT_ROOT, tree_name=TREE_NAME)
-    return _shared_load_model(model_base, cfg, NUM_CLASSES, log_message=log_message)
+    model = _shared_load_model(model_base, cfg, NUM_CLASSES, log_message=log_message)
+    return _configure_model_for_inference(model)
 
 
 # -------------------- Region helpers --------------------
@@ -1271,6 +1432,8 @@ def main() -> None:
         f"full_path={TEST_REFERENCE_QCD_EST_FULL}, "
         f"full_size={_file_size_text(TEST_REFERENCE_QCD_EST_FULL) if have_full_reference else 'missing'}"
     )
+    proba_full = None
+    proba = None
     if have_full_reference:
         log_message(
             f"Validating full test-set prediction reference: events={len(X_raw)}, "
@@ -1308,7 +1471,7 @@ def main() -> None:
             f"Running full test-set model prediction: X_shape={X_model_full.shape}, "
             f"model_type={type(clf).__name__}"
         )
-        proba_full = _predict_model_proba(clf, X_model_full)
+        proba_full = _predict_model_proba(clf, X_model_full, context="full test-set")
         log_message(
             f"Finished full test-set model prediction: proba_shape={proba_full.shape}, "
             f"proba_size={_array_size_text(proba_full)}, elapsed={_format_seconds(step_start)}"
@@ -1327,13 +1490,31 @@ def main() -> None:
         )
         log_message(f"Finished full test-set reference comparison: elapsed={_format_seconds(step_start)}")
         step_start = time.perf_counter()
-        del X_model_full, proba_full
+        del X_model_full
         gc.collect()
-        log_message(f"Released full test-set validation arrays: elapsed={_format_seconds(step_start)}")
+        log_message(
+            "Released full test-set model features; keeping probabilities for filtered reuse: "
+            f"elapsed={_format_seconds(step_start)}"
+        )
 
     log_message("Applying non-ABCD thresholds")
     events_before_filter = len(X_raw)
     step_start = time.perf_counter()
+    filter_mask = _threshold_mask(X_raw, bdt_thresholds, apply_to_sentinel=True)
+    if proba_full is not None:
+        mask_values = filter_mask.values
+        if int(np.count_nonzero(mask_values)) == len(mask_values):
+            proba = proba_full
+            proba_full = None
+        else:
+            proba = proba_full[mask_values].copy()
+            del proba_full
+        gc.collect()
+        log_message(
+            f"Reused full test-set probabilities for filtered events: "
+            f"shape={proba.shape}, size={_array_size_text(proba)}, "
+            f"elapsed={_format_seconds(step_start)}"
+        )
     X_raw, y, w, sample_labels = filter_X(
         X_raw,
         y,
@@ -1342,6 +1523,7 @@ def main() -> None:
         bdt_thresholds,
         apply_to_sentinel=True,
         sample_labels=sample_labels,
+        mask=filter_mask,
     )
     group_labels = np.asarray([SAMPLE_TO_GROUP[name] for name in sample_labels], dtype=object)
     log_message(
@@ -1361,35 +1543,35 @@ def main() -> None:
         f"elapsed={_format_seconds(step_start)}"
     )
 
-    log_message("Standardising model features")
-    step_start = time.perf_counter()
-    X_model = X_raw[model_branches].copy()
-    log_message(
-        f"Copied filtered model features: shape={X_model.shape}, "
-        f"size={_dataframe_size_text(X_model)}, elapsed={_format_seconds(step_start)}"
-    )
-    step_start = time.perf_counter()
-    X_model = standardize_X(X_model, clip_ranges, log_transform)
-    log_message(
-        f"Standardised filtered model features: shape={X_model.shape}, "
-        f"elapsed={_format_seconds(step_start)}"
-    )
-    if decorrelate:
+    if proba is None:
+        log_message("Standardising model features")
         step_start = time.perf_counter()
-        X_model = _drop_decorrelated_features(X_model, decorrelate)
+        X_model = X_raw[model_branches].copy()
         log_message(
-            f"Removed decorrelated filtered features: {decorrelate}, "
-            f"shape={X_model.shape}, elapsed={_format_seconds(step_start)}"
+            f"Copied filtered model features: shape={X_model.shape}, "
+            f"size={_dataframe_size_text(X_model)}, elapsed={_format_seconds(step_start)}"
         )
+        step_start = time.perf_counter()
+        X_model = standardize_X(X_model, clip_ranges, log_transform)
+        log_message(
+            f"Standardised filtered model features: shape={X_model.shape}, "
+            f"elapsed={_format_seconds(step_start)}"
+        )
+        if decorrelate:
+            step_start = time.perf_counter()
+            X_model = _drop_decorrelated_features(X_model, decorrelate)
+            log_message(
+                f"Removed decorrelated filtered features: {decorrelate}, "
+                f"shape={X_model.shape}, elapsed={_format_seconds(step_start)}"
+            )
 
-    log_message("Running model prediction")
-    step_start = time.perf_counter()
-    proba = _predict_model_proba(clf, X_model)
-    log_message(
-        f"Predicted probabilities: shape={proba.shape}, size={_array_size_text(proba)}, "
-        f"elapsed={_format_seconds(step_start)}"
-    )
-    if not have_full_reference:
+        log_message("Running model prediction")
+        step_start = time.perf_counter()
+        proba = _predict_model_proba(clf, X_model, context="filtered test-set")
+        log_message(
+            f"Predicted probabilities: shape={proba.shape}, size={_array_size_text(proba)}, "
+            f"elapsed={_format_seconds(step_start)}"
+        )
         log_warning(
             "Full qcd_est reference missing; using legacy filtered reference. "
             "Re-run train.py to produce test_reference_qcd_est_full.npz for configurable ABCD branches."
