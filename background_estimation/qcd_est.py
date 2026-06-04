@@ -183,6 +183,24 @@ def _resolve_tree_branch_names(
     return out
 
 
+def _resolve_tree_float(
+    config: dict,
+    tree_name: str,
+    key: str,
+    default: float = 1.0,
+) -> float:
+    payload = config.get(key, {})
+    if not isinstance(payload, dict):
+        raise TypeError(f"background_estimation config '{key}' must be a dict")
+    value = payload.get(tree_name, default)
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise TypeError(f"{key}['{tree_name}'] must be numeric")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"{key}['{tree_name}'] must be a finite non-negative number")
+    return value
+
+
 ABCD_BRANCH_NAMES = _resolve_tree_branch_names(
     qcd_cfg,
     TREE_NAME,
@@ -194,6 +212,11 @@ A_REGION_SHAPE_BRANCHES = _resolve_tree_branch_names(
     TREE_NAME,
     "a_region_shape_branches",
     required=False,
+)
+QCD_PREDICT_SCALE_MULTIPLIER = _resolve_tree_float(
+    qcd_cfg,
+    TREE_NAME,
+    "qcd_predict_scale_multipliers",
 )
 
 QCD_CLASS_NAMES = [class_name for class_name in CLASS_NAMES if "qcd" in class_name.lower()]
@@ -1264,12 +1287,14 @@ def main() -> None:
     if qcd_a_total <= 0.0:
         raise RuntimeError("QCD A-union total is zero; cannot derive global QCD scale")
 
-    pred_qcd_union = qcd_b_total * qcd_c_total / qcd_d_total
-    pred_qcd_union_var = (
+    raw_pred_qcd_union = qcd_b_total * qcd_c_total / qcd_d_total
+    raw_pred_qcd_union_var = (
         (qcd_c_total / qcd_d_total) ** 2 * qcd_b_var
         + (qcd_b_total / qcd_d_total) ** 2 * qcd_c_var
         + (qcd_b_total * qcd_c_total / (qcd_d_total ** 2)) ** 2 * qcd_d_var
     )
+    pred_qcd_union = raw_pred_qcd_union * QCD_PREDICT_SCALE_MULTIPLIER
+    pred_qcd_union_var = raw_pred_qcd_union_var * (QCD_PREDICT_SCALE_MULTIPLIER ** 2)
     pred_qcd_union_sigma = math.sqrt(max(pred_qcd_union_var, 0.0))
     qcd_scale = pred_qcd_union / qcd_a_total
     qcd_scale_var = pred_qcd_union_var / (qcd_a_total ** 2)
@@ -1277,8 +1302,10 @@ def main() -> None:
 
     log_message(
         f"ABCD QCD totals: A_union={qcd_a_total:.6g}, B={qcd_b_total:.6g}, "
-        f"C={qcd_c_total:.6g}, D={qcd_d_total:.6g}, pred_union={pred_qcd_union:.6g} ± "
-        f"{pred_qcd_union_sigma:.6g}, scale={qcd_scale:.6g} ± {qcd_scale_sigma:.6g}"
+        f"C={qcd_c_total:.6g}, D={qcd_d_total:.6g}, raw_pred_union={raw_pred_qcd_union:.6g}, "
+        f"manual_scale_multiplier={QCD_PREDICT_SCALE_MULTIPLIER:.6g}, "
+        f"pred_union={pred_qcd_union:.6g} ± {pred_qcd_union_sigma:.6g}, "
+        f"scale={qcd_scale:.6g} ± {qcd_scale_sigma:.6g}"
     )
 
     log_message(f"Filling signal-region yields: n={len(region_labels)}")
