@@ -3,11 +3,14 @@
 
 """Data vs MC histogram comparison plotter.
 
-Reads convert_branch.C output ROOT files directly (per-sample trees), applies
-the trained-model selection.json clip/threshold cuts (no log transform), and draws a
-stacked MC + data panel with a Data/MC ratio sub-panel.
+Reads convert_branch.C output ROOT files directly for ordinary branches,
+including branches that are not BDT inputs, applies the trained-model
+selection.json clip/threshold cuts (no log transform), and draws a stacked MC +
+data panel with a Data/MC ratio sub-panel. Derived model score branches use the
+saved MC test split and validate against the trained-model prediction reference.
 """
 
+import gc
 import os
 import sys
 import json
@@ -182,9 +185,30 @@ def _tree_entries_total(files, tree_name):
     return total
 
 
-def _load_tree(files, tree_name, branches):
+def _concat_parts(parts):
+    if not parts:
+        return None
+    if len(parts) == 1:
+        df = parts[0].reset_index(drop=True)
+        parts.clear()
+        gc.collect()
+        return df
+    df = pd.concat(parts, ignore_index=True)
+    parts.clear()
+    gc.collect()
+    return df
+
+
+def _load_tree(files, tree_name, branches, max_entries=None):
     parts = []
+    remaining = None
+    if max_entries is not None:
+        remaining = max(0, int(max_entries))
+        if remaining == 0:
+            return None
     for fpath in files:
+        if remaining is not None and remaining <= 0:
+            break
         with uproot.open(fpath) as uf:
             if tree_name not in uf:
                 continue
@@ -196,10 +220,21 @@ def _load_tree(files, tree_name, branches):
                     f"Missing branches in {fpath}:{tree_name}: "
                     f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else "")
                 )
-            parts.append(tree.arrays(branches, library="pd"))
-    if not parts:
-        return None
-    return pd.concat(parts, ignore_index=True)
+            entry_stop = int(tree.num_entries)
+            if remaining is not None:
+                entry_stop = min(entry_stop, remaining)
+            if entry_stop <= 0:
+                continue
+            df_part = tree.arrays(
+                branches,
+                library="pd",
+                entry_start=0,
+                entry_stop=entry_stop,
+            )
+            parts.append(df_part)
+            if remaining is not None:
+                remaining -= len(df_part)
+    return _concat_parts(parts)
 
 
 # -------------------- Threshold and clip filtering --------------------
@@ -272,6 +307,17 @@ def _apply_clip(df, clip_ranges):
         if hi is not None:
             arr[valid & (arr > hi)] = hi
         df[col] = arr
+    return df
+
+
+def _drop_unneeded_columns(df, keep_columns):
+    if df is None or len(df) == 0:
+        return df
+    keep = set(keep_columns)
+    drop_cols = [col for col in df.columns if col not in keep]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        gc.collect()
     return df
 
 
@@ -450,9 +496,7 @@ def _load_test_segments(tree_name, branches, sample_meta):
                     entry_stop=int(seg["entry_stop"]),
                 )
             )
-    if not parts:
-        return None
-    return pd.concat(parts, ignore_index=True)
+    return _concat_parts(parts)
 
 
 def _assign_test_split_mc_weight(df, sample_name, total_entries, reweight_branches=None):
@@ -587,6 +631,11 @@ def _process_tree(tree_name):
     class_names      = list(class_groups.keys())
     model_branches   = [item["name"] for item in bdt_br[tree_name]]
     score_branches   = [_score_branch_name(class_name) for class_name in class_names]
+    entries_per_sample = int(bdt_cfg.get("entries_per_sample", 1_000_000))
+    if entries_per_sample <= 0:
+        raise RuntimeError(
+            f"bdt_root config entries_per_sample must be positive, got {entries_per_sample}"
+        )
 
     # Resolve input_root relative to the BDT script directory used by train.py.
     bdt_root_dir   = _bdt_root_for_tree(tree_name)
@@ -619,6 +668,7 @@ def _process_tree(tree_name):
         f"threshold_branches={len(thresholds)}, clip_branches={len(clip_ranges)}, "
         f"reweight_branches={len(reweight_branches)}, score_branches={len(score_branches)}"
     )
+    log_message(f"Ordinary MC branch entry cap per sample: {entries_per_sample}")
 
     out_dir = _resolve(OUTPUT_ROOT_PATT.format(tree_name=tree_name), _SCRIPT_DIR)
     os.makedirs(out_dir, exist_ok=True)
@@ -639,17 +689,18 @@ def _process_tree(tree_name):
             n_total = _tree_entries_total(files, tree_name)
             if n_total <= 0:
                 raise RuntimeError(f"Empty tree '{tree_name}' for MC sample '{sname}'")
-            df = _load_tree(files, tree_name, mc_need_load)
+            df = _load_tree(files, tree_name, mc_need_load, max_entries=entries_per_sample)
             if df is None or len(df) == 0:
                 raise RuntimeError(f"No events loaded for MC sample '{sname}' in tree '{tree_name}'")
             df = _assign_mc_weight(df, sname, n_total, len(df), reweight_branches)
             dfs.append(df)
             log_message(
                 f"  {sname}: class={cls_name}, tree_entries={n_total}, "
-                f"loaded={len(df)}, weight_sum={float(df['weight'].sum()):.6g}"
+                f"loaded={len(df)}, entry_cap={entries_per_sample}, "
+                f"weight_sum={float(df['weight'].sum()):.6g}"
             )
         if dfs:
-            class_dfs[cls_name] = pd.concat(dfs, ignore_index=True)
+            class_dfs[cls_name] = _concat_parts(dfs)
             log_message(f"  Loaded class '{cls_name}': events={len(class_dfs[cls_name])}")
         else:
             raise RuntimeError(f"MC class '{cls_name}' has no usable events")
@@ -668,7 +719,7 @@ def _process_tree(tree_name):
         df["weight"] = 1.0
         data_dfs.append(df)
         log_message(f"  data {sname}: loaded={len(df)}")
-    data_df = pd.concat(data_dfs, ignore_index=True) if data_dfs else None
+    data_df = _concat_parts(data_dfs) if data_dfs else None
     if data_df is None:
         log_message("Loaded data events: 0")
     else:
@@ -735,7 +786,7 @@ def _process_tree(tree_name):
 
         for cls_name, parts in score_parts_by_class.items():
             if parts:
-                score_class_dfs[cls_name] = pd.concat(parts, ignore_index=True)
+                score_class_dfs[cls_name] = _concat_parts(parts)
 
         if not ref_proba_parts:
             raise RuntimeError(f"No MC score events after filtering for tree '{tree_name}'")
@@ -748,6 +799,8 @@ def _process_tree(tree_name):
             ref_weights,
             score_proba_ref,
         )
+        del ref_sample_labels, ref_class_idx, ref_weights, ref_proba_parts, score_proba_ref
+        gc.collect()
 
         if DATA_SAMPLES:
             score_data_load = sorted(set(model_branches) | set(thresholds.keys()))
@@ -772,7 +825,7 @@ def _process_tree(tree_name):
                 score_data_parts.append(_add_score_columns(df, proba, class_names))
                 log_message(f"  data score {sname}: events={len(df)}")
             if score_data_parts:
-                score_data_df = pd.concat(score_data_parts, ignore_index=True)
+                score_data_df = _concat_parts(score_data_parts)
                 log_message(f"Loaded data score events: {len(score_data_df)}")
             else:
                 log_message("Loaded data score events: 0")
@@ -783,6 +836,7 @@ def _process_tree(tree_name):
             return df
         df = _apply_thresholds(df, thresholds)
         df = _apply_clip(df, clip_ranges)
+        df = _drop_unneeded_columns(df, set(root_plot_branches) | {"weight"})
         return df
 
     log_message("Applying thresholds and clip ranges")
