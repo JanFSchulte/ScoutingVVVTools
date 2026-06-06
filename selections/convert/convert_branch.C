@@ -3091,11 +3091,15 @@ Long64_t processInputFile(const string& inputFileName,
         throw runtime_error("Tree " + appConfig.treeName + " not found in " + inputFileName);
     }
 
+    const Long64_t nEntries = tree->GetEntries();
+    if (nEntries == 0) {
+        return 0;
+    }
+
     configureActiveBranches(tree, branchConfig, sampleMeta.isMC);
     ensureCollectionBufferCapacities(tree, branchConfig, sampleMeta.isMC);
     unordered_map<string, const ScalarInputConfig*> rawScalarByName = bindInputBranches(tree, branchConfig, sampleMeta.isMC);
 
-    const Long64_t nEntries = tree->GetEntries();
     for (Long64_t entry = 0; entry < nEntries; ++entry) {
         tree->GetEntry(entry);
 
