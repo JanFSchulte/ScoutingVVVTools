@@ -5,7 +5,7 @@
       "path": [
         "/ScoutingPFRun3/jschulte-ScoutingNano_Data_v4-00000000000000000000000000000000/USER"
       ],
-      "sample_ID": 0,
+      "sample_ID": 99,
       "is_MC": false,
       "is_signal": false,
       "xsection": -1,
@@ -20,7 +20,7 @@
         "/ScoutingPFRun3/jschulte-ScoutingNano_Data_part3_v4-00000000000000000000000000000000/USER",
         "/ScoutingPFRun3/jschulte-ScoutingNano_Data_part4_v4-00000000000000000000000000000000/USER"
       ],
-      "sample_ID": 1,
+      "sample_ID": 99,
       "is_MC": false,
       "is_signal": false,
       "xsection": -1,
