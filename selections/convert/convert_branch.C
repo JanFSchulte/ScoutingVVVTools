@@ -3216,7 +3216,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
             } catch (const exception& ex) {
                 failed.store(true);
 #pragma omp critical(convert_error)
-                errors.push_back(ex.what());
+                errors.push_back("Input ROOT file " + batchInputFiles[index] + ": " + ex.what());
             }
         }
     }
