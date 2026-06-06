@@ -5,7 +5,7 @@
   "output_dir": "./output/fat2_UParTv2_v3",
   "root_file_name": "qcd_abcd_yields.root",
   "qcd_predict_scale_multipliers": {
-    "fat2": 3.5,
+    "fat2": 7.0,
     "fat3": 6.5
   },
   "abcd_branches": {
