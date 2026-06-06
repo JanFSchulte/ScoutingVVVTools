@@ -170,7 +170,10 @@ def _sample_group(info):
 def _input_files(sample_name, input_root, input_pattern):
     info = SAMPLE_INFO[sample_name]
     sg   = _sample_group(info)
-    base = input_pattern.format(input_root=input_root, sample_group=sg, sample=sample_name)
+    pattern = input_pattern
+    if not info.get("is_MC", True):
+        pattern = pattern.replace("{sample_group}_mixed", "{sample_group}")
+    base = pattern.format(input_root=input_root, sample_group=sg, sample=sample_name)
     stem = base[:-5] if base.endswith(".root") else base
     return sorted(glob.glob(base) + glob.glob(stem + "_*.root"))
 
