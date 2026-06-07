@@ -3397,7 +3397,7 @@ int main(int argc, char** argv) {
     }
 
     const int threadCount = determineThreadCount(appConfig.maxThreads, inputFiles.size());
-    const size_t batchSize = max<size_t>(1, static_cast<size_t>(threadCount) * 6);
+    const size_t batchSize = max<size_t>(1, static_cast<size_t>(threadCount) * 32);
     const size_t nBatches = (inputFiles.size() + batchSize - 1) / batchSize;
     if (batchRequest.printBatchCount) {
         cout << nBatches << endl;

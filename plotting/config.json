@@ -4,7 +4,7 @@
   "convert_branch_config": "../selections/convert/branch.json",
   "bdt_root": "../selections/BDT/{tree_name}_UParTv2_v3",
   "output_root": "./pre-selection/{tree_name}_UParTv2_v3",
-  "data_samples": ["2024B"],
+  "data_samples": ["2024B", "2024I"],
   "default_bins": 50,
   "event_reweight_branches": {
     "fat2": ["weight_pu"],
