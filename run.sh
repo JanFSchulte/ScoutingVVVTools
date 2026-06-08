@@ -411,6 +411,33 @@ fi
 
 echo "[$(timestamp)] selected_samples=${samples[*]}"
 
+if [ "${MODE}" = "0" ]; then
+  RESUME_SUCCESSFUL_BATCHES="$(
+    python3 - "${CONFIG_PATH}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+resume = payload.get("resume_successful_batches", True)
+if not isinstance(resume, bool):
+    raise SystemExit("resume_successful_batches must be a boolean")
+print("1" if resume else "0")
+PY
+  )"
+  if [ "${RESUME_SUCCESSFUL_BATCHES}" = "1" ]; then
+    RESUME_SUCCESSFUL_BATCHES_LABEL=true
+  else
+    RESUME_SUCCESSFUL_BATCHES_LABEL=false
+  fi
+  echo "[$(timestamp)] resume_successful_batches=${RESUME_SUCCESSFUL_BATCHES_LABEL}"
+  if [ "${RESUME_SUCCESSFUL_BATCHES}" = "1" ] && [ "${#samples[@]}" -ne 1 ]; then
+    echo "resume_successful_batches requires exactly one selected sample, got ${#samples[@]}: ${samples[*]}" >&2
+    exit 1
+  fi
+fi
+
 declare -a RUNNING_PIDS=()
 declare -a RUNNING_SAMPLES=()
 FAILED_JOBS=0

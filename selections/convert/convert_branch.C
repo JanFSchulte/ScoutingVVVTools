@@ -55,6 +55,8 @@ const char* kAppConfigEnvVar = "CONVERT_CONFIG_PATH";
 const char* kSuccessfulBatchesEnvVar = "CONVERT_SUCCESSFUL_BATCHES";
 const char* kDeferFinalMergeEnvVar = "CONVERT_DEFER_FINAL_MERGE";
 const char* kDefaultSampleConfigPath = "../../src/sample.json";
+const int kRemoteInputOpenRetries = 5;
+const unsigned int kRemoteInputRetrySleepSeconds = 5;
 
 enum class DataType {
     Float,
@@ -381,12 +383,15 @@ struct SampleRuleConfig {
 
 struct AppConfig {
     string treeName = "Events";
+    string configPath;
+    string configDir;
     string outputRoot;
     string outputPattern;
     string runSample;
     string sampleConfigPath = kDefaultSampleConfigPath;
     int maxThreads = 12;
     double maxOutputFileSizeGB = 5.;
+    bool resumeSuccessfulBatches = true;
     vector<SampleRuleConfig> sampleRules;
     string puWeightPathPattern;
 };
@@ -742,6 +747,11 @@ bool endsWith(const string& text, const string& suffix) {
            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+bool startsWith(const string& text, const string& prefix) {
+    return text.size() >= prefix.size() &&
+           text.compare(0, prefix.size(), prefix) == 0;
+}
+
 size_t skipWhitespace(const string& text, size_t pos) {
     while (pos < text.size() && isspace(static_cast<unsigned char>(text[pos]))) {
         ++pos;
@@ -869,9 +879,18 @@ JsonValue loadJson(const char* path, const char* envVar = nullptr) {
     return simple_json::parseFile(resolved);
 }
 
+JsonValue loadJsonPath(const string& path) {
+    return simple_json::parseFile(path);
+}
+
 string resolveReferencedPath(const string& baseConfigPath, const string& targetPath) {
     if (targetPath.empty()) {
         return targetPath;
+    }
+
+    fs::path basePath(baseConfigPath);
+    if (!basePath.is_absolute()) {
+        basePath = fs::absolute(basePath);
     }
 
     const fs::path path(targetPath);
@@ -879,7 +898,22 @@ string resolveReferencedPath(const string& baseConfigPath, const string& targetP
         return path.lexically_normal().string();
     }
 
-    return (fs::path(baseConfigPath).parent_path() / path).lexically_normal().string();
+    return (basePath.parent_path() / path).lexically_normal().string();
+}
+
+string resolveConfiguredPathPattern(const string& baseConfigPath, const string& pathPattern) {
+    if (pathPattern.empty() || pathPattern.find("{output_root}") != string::npos) {
+        return pathPattern;
+    }
+    return resolveReferencedPath(baseConfigPath, pathPattern);
+}
+
+string normalizeOutputPath(const AppConfig& appConfig, const string& outputPath) {
+    const fs::path path(outputPath);
+    if (path.is_absolute()) {
+        return path.lexically_normal().string();
+    }
+    return (fs::path(appConfig.configDir) / path).lexically_normal().string();
 }
 
 ExprPtr compileExpression(const string& text) {
@@ -921,14 +955,17 @@ AppConfig loadAppConfig() {
     const JsonValue payload = simple_json::parseFile(appConfigPath);
 
     AppConfig config;
+    config.configPath = fs::absolute(fs::path(appConfigPath)).lexically_normal().string();
+    config.configDir = fs::path(config.configPath).parent_path().string();
     config.treeName = payload.getStringOr("tree_name", "Events");
     config.runSample = payload.getStringOr("run_sample", "");
-    config.outputRoot = payload.at("output_root").asString();
+    config.outputRoot = resolveReferencedPath(config.configPath, payload.at("output_root").asString());
     config.outputPattern = payload.at("output_pattern").asString();
     config.sampleConfigPath = resolveReferencedPath(
-        appConfigPath, payload.getStringOr("sample_config", kDefaultSampleConfigPath));
+        config.configPath, payload.getStringOr("sample_config", kDefaultSampleConfigPath));
     config.maxThreads = payload.getIntOr("max_threads", 12);
     config.maxOutputFileSizeGB = static_cast<double>(payload.getNumberOr("max_output_file_size_gb", 5.));
+    config.resumeSuccessfulBatches = payload.getBoolOr("resume_successful_batches", true);
 
     const JsonValue samplePayload = simple_json::parseFile(config.sampleConfigPath);
     if (samplePayload.contains("sample")) {
@@ -945,7 +982,8 @@ AppConfig loadAppConfig() {
         }
     }
 
-    config.puWeightPathPattern = payload.getStringOr("pu_weight_path", "");
+    config.puWeightPathPattern = resolveConfiguredPathPattern(
+        config.configPath, payload.getStringOr("pu_weight_path", ""));
     return config;
 }
 
@@ -1085,8 +1123,8 @@ void finalizeInputCollection(InputCollectionConfig& collection) {
     }
 }
 
-BranchConfig loadBranchConfig() {
-    const JsonValue payload = loadJson(kBranchConfigPath);
+BranchConfig loadBranchConfig(const AppConfig& appConfig) {
+    const JsonValue payload = loadJsonPath(resolveReferencedPath(appConfig.configPath, kBranchConfigPath));
 
     BranchConfig config;
     for (const auto& node : payload.at("input").at("scalars").asArray()) {
@@ -1142,8 +1180,8 @@ BranchConfig loadBranchConfig() {
     return config;
 }
 
-SelectionConfig loadSelectionConfig() {
-    const JsonValue payload = loadJson(kSelectionConfigPath);
+SelectionConfig loadSelectionConfig(const AppConfig& appConfig) {
+    const JsonValue payload = loadJsonPath(resolveReferencedPath(appConfig.configPath, kSelectionConfigPath));
 
     SelectionConfig config;
     config.eventPreselectionText = payload.getStringOr("event_preselection", "1");
@@ -2260,6 +2298,46 @@ Long64_t readBatchRawEntries(const fs::path& batchOutputPath) {
     return rawEntries;
 }
 
+bool validateBatchTempOutput(const fs::path& batchOutputPath,
+                             const vector<TreeConfig>& treeConfigs,
+                             Long64_t& rawEntries,
+                             string& reason) {
+    const fs::path rawEntriesPath = makeBatchRawEntriesPath(batchOutputPath);
+    if (!fs::exists(batchOutputPath)) {
+        reason = "missing ROOT output";
+        return false;
+    }
+    if (!fs::exists(rawEntriesPath)) {
+        reason = "missing raw_entries";
+        return false;
+    }
+
+    try {
+        rawEntries = readBatchRawEntries(batchOutputPath);
+    } catch (const exception& ex) {
+        reason = ex.what();
+        return false;
+    }
+
+    unique_ptr<TFile> file(TFile::Open(batchOutputPath.string().c_str(), "READ"));
+    if (!file || file->IsZombie()) {
+        reason = "cannot open ROOT output";
+        return false;
+    }
+
+    for (const auto& treeConfig : treeConfigs) {
+        TTree* tree = dynamic_cast<TTree*>(file->Get(treeConfig.name.c_str()));
+        if (tree == nullptr) {
+            reason = "missing tree " + treeConfig.name;
+            return false;
+        }
+        (void)tree->GetEntries();
+    }
+
+    reason.clear();
+    return true;
+}
+
 vector<string> listRemoteRootFiles(const string& datasetPath) {
     string query = "file dataset=" + datasetPath;
     if (isUserDataset(datasetPath)) {
@@ -2367,7 +2445,8 @@ SampleMeta resolveSampleMeta(const string& sample, const AppConfig& appConfig) {
         if (meta.inputPaths.empty()) {
             throw runtime_error("No input path configured for sample: " + sample);
         }
-        meta.outputFileName = applyTemplate(appConfig.outputPattern, templateValues);
+        meta.outputFileName = normalizeOutputPath(
+            appConfig, applyTemplate(appConfig.outputPattern, templateValues));
         return meta;
     }
 
@@ -2497,7 +2576,7 @@ string resolvePileupWeightPath(const AppConfig& appConfig, const SampleMeta& sam
     templateValues["sample"] = sampleMeta.sample;
     templateValues["sample_group"] = sampleMeta.sampleGroup();
     templateValues["output_root"] = appConfig.outputRoot;
-    return applyTemplate(appConfig.puWeightPathPattern, templateValues);
+    return normalizeOutputPath(appConfig, applyTemplate(appConfig.puWeightPathPattern, templateValues));
 }
 
 size_t countOutputGroupBranches(const vector<OutputScalarConfig>& configs, bool isMC) {
@@ -3074,6 +3153,27 @@ vector<string> writeOutputFilesStreaming(const fs::path& baseOutputPath,
     return writtenFiles;
 }
 
+unique_ptr<TFile> openInputFileWithRetry(const string& inputFileName) {
+    const bool remoteInput = startsWith(inputFileName, "root://");
+    const int maxRetries = remoteInput ? kRemoteInputOpenRetries : 0;
+
+    for (int retry = 0; retry <= maxRetries; ++retry) {
+        unique_ptr<TFile> inputFile(TFile::Open(inputFileName.c_str(), "READ"));
+        if (inputFile && !inputFile->IsZombie()) {
+            return inputFile;
+        }
+
+        if (retry < maxRetries) {
+            cerr << "Warning: failed to open remote input file " << inputFileName
+                 << "; retry " << (retry + 1) << "/" << maxRetries
+                 << " after " << kRemoteInputRetrySleepSeconds << " seconds" << endl;
+            sleep(kRemoteInputRetrySleepSeconds);
+        }
+    }
+
+    throw runtime_error("Error opening input file " + inputFileName);
+}
+
 Long64_t processInputFile(const string& inputFileName,
                           const AppConfig& appConfig,
                           const SelectionConfig& selectionConfig,
@@ -3081,10 +3181,7 @@ Long64_t processInputFile(const string& inputFileName,
                           const vector<PileupBin>& pileupWeights,
                           BranchConfig& branchConfig,
                           vector<OutputTreeState>& outputTrees) {
-    unique_ptr<TFile> inputFile(TFile::Open(inputFileName.c_str(), "READ"));
-    if (!inputFile || inputFile->IsZombie()) {
-        throw runtime_error("Error opening input file " + inputFileName);
-    }
+    unique_ptr<TFile> inputFile = openInputFileWithRetry(inputFileName);
 
     TTree* tree = static_cast<TTree*>(inputFile->Get(appConfig.treeName.c_str()));
     if (!tree) {
@@ -3252,34 +3349,26 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
 
 BatchTempCollection collectSuccessfulBatchTempFiles(const AppConfig& appConfig,
                                                     const SampleMeta& sampleMeta,
+                                                    const BranchConfig& branchConfig,
                                                     const vector<size_t>& batchIndices,
                                                     size_t nBatches) {
     BatchTempCollection collection;
     collection.paths.reserve(batchIndices.size());
     for (const size_t batchIndex : batchIndices) {
         const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
-        const fs::path rawEntriesPath = makeBatchRawEntriesPath(batchOutputPath);
-        if (!fs::exists(batchOutputPath) || !fs::exists(rawEntriesPath)) {
+        Long64_t batchRawEntries = 0;
+        string invalidReason;
+        if (!validateBatchTempOutput(batchOutputPath,
+                                     branchConfig.trees,
+                                     batchRawEntries,
+                                     invalidReason)) {
             ++collection.skipped;
             cerr << "Warning: skipping incomplete batch " << (batchIndex + 1)
                  << "/" << nBatches << " for sample = " << sampleMeta.sample
-                 << " (missing"
-                 << (fs::exists(batchOutputPath) ? "" : " ROOT output")
-                 << ((!fs::exists(batchOutputPath) && !fs::exists(rawEntriesPath)) ? " and" : "")
-                 << (fs::exists(rawEntriesPath) ? "" : " raw_entries")
-                 << ")" << endl;
+                 << ": " << invalidReason << endl;
             continue;
         }
-
-        try {
-            collection.rawEntries += readBatchRawEntries(batchOutputPath);
-        } catch (const exception& ex) {
-            ++collection.skipped;
-            cerr << "Warning: skipping batch " << (batchIndex + 1)
-                 << "/" << nBatches << " for sample = " << sampleMeta.sample
-                 << ": " << ex.what() << endl;
-            continue;
-        }
+        collection.rawEntries += batchRawEntries;
         collection.paths.push_back(batchOutputPath.string());
     }
 
@@ -3297,7 +3386,7 @@ int finalizeSuccessfulBatches(const AppConfig& appConfig,
                               size_t nBatches) {
     BatchTempCollection batchFiles;
     try {
-        batchFiles = collectSuccessfulBatchTempFiles(appConfig, sampleMeta, batchIndices, nBatches);
+        batchFiles = collectSuccessfulBatchTempFiles(appConfig, sampleMeta, branchConfig, batchIndices, nBatches);
         writeSampleRawEntries(appConfig.sampleConfigPath, sampleMeta.sample, batchFiles.rawEntries);
         cout << "Updated raw_entries in " << appConfig.sampleConfigPath
              << " for sample = " << sampleMeta.sample
@@ -3357,8 +3446,8 @@ int main(int argc, char** argv) {
     SelectionConfig selectionConfig;
     try {
         appConfig = loadAppConfig();
-        branchConfig = loadBranchConfig();
-        selectionConfig = loadSelectionConfig();
+        branchConfig = loadBranchConfig(appConfig);
+        selectionConfig = loadSelectionConfig(appConfig);
     } catch (const exception& ex) {
         cerr << "Configuration error: " << ex.what() << endl;
         return 1;
@@ -3485,6 +3574,30 @@ int main(int argc, char** argv) {
         vector<string> batchInputFiles(batchBegin, batchEnd);
         const int batchThreadCount = determineThreadCount(appConfig.maxThreads, batchInputFiles.size());
         const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
+        bool batchAlreadyComplete = false;
+        if (appConfig.resumeSuccessfulBatches && batchRequest.singleBatch) {
+            Long64_t existingRawEntries = 0;
+            string invalidReason;
+            if (validateBatchTempOutput(batchOutputPath,
+                                        branchConfig.trees,
+                                        existingRawEntries,
+                                        invalidReason)) {
+                cout << "Skipping completed batch " << (batchIndex + 1) << "/" << nBatches
+                     << ": found valid existing temporary batch file "
+                     << batchOutputPath.string()
+                     << " with raw_entries = " << existingRawEntries << endl;
+                batchAlreadyComplete = true;
+            }
+            if (!batchAlreadyComplete &&
+                (fs::exists(batchOutputPath) || fs::exists(makeBatchRawEntriesPath(batchOutputPath)))) {
+                cerr << "Warning: resume check will rerun batch " << (batchIndex + 1)
+                     << "/" << nBatches << " for sample = " << sampleMeta.sample
+                     << ": existing temporary output is incomplete (" << invalidReason << ")" << endl;
+            }
+        }
+        if (batchAlreadyComplete) {
+            continue;
+        }
         atomic<Long64_t> batchRawEntries{0};
 
         cout << "Processing batch " << (batchIndex + 1) << "/" << nBatches
