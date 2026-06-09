@@ -37,7 +37,8 @@ static const string TREE_NAME = "fat2";
 static const string OUTPUT_DIR = "systematics/branch_histograms";
 static const string OUTPUT_ROOT_FILE = "histograms.root";
 static const string XROOTD_REDIRECTOR = "root://cms-xrd-global.cern.ch/";
-static const string REMOTE_DATASET_FILE_SUBSTRING = "000";
+static const long long REMOTE_DATASET_FILE_NUMBER_MIN = 13820;
+static const long long REMOTE_DATASET_FILE_NUMBER_MAX = 14400;
 static const int DEFAULT_BINS = 100;
 static const double LOG_AXIS_MIN = 0.1;
 
@@ -355,10 +356,29 @@ vector<string> splitLines(const string& text) {
 }
 
 bool remoteDatasetFilePassesFilter(const string& rootFilePath) {
-    if (REMOTE_DATASET_FILE_SUBSTRING.empty()) {
-        return true;
+    const string name = baseName(rootFilePath);
+    if (!endsWith(name, ".root")) {
+        return false;
     }
-    return rootFilePath.find(REMOTE_DATASET_FILE_SUBSTRING) != string::npos;
+
+    const size_t numberEnd = name.size() - 5;
+    size_t numberBegin = numberEnd;
+    while (numberBegin > 0 && isdigit(static_cast<unsigned char>(name[numberBegin - 1]))) {
+        --numberBegin;
+    }
+    if (numberBegin == numberEnd) {
+        return false;
+    }
+
+    long long fileNumber = 0;
+    try {
+        fileNumber = stoll(name.substr(numberBegin, numberEnd - numberBegin));
+    } catch (const exception&) {
+        return false;
+    }
+
+    return fileNumber >= REMOTE_DATASET_FILE_NUMBER_MIN &&
+           fileNumber <= REMOTE_DATASET_FILE_NUMBER_MAX;
 }
 
 vector<string> listRemoteDatasetRootFiles(const string& datasetPath) {
@@ -799,17 +819,18 @@ int plot_branch_histograms() {
         if (BRANCHES.empty()) {
             throw runtime_error("BRANCHES is empty");
         }
+        if (REMOTE_DATASET_FILE_NUMBER_MIN > REMOTE_DATASET_FILE_NUMBER_MAX) {
+            throw runtime_error("REMOTE_DATASET_FILE_NUMBER_MIN is larger than REMOTE_DATASET_FILE_NUMBER_MAX");
+        }
 
         gROOT->SetBatch(kTRUE);
         gStyle->SetOptStat(0);
 
         const vector<string> rootFiles = resolveInputRootFiles();
         cout << "Resolved ROOT files = " << rootFiles.size() << endl;
-        if (REMOTE_DATASET_FILE_SUBSTRING.empty()) {
-            cout << "Remote dataset filename filter = <empty>" << endl;
-        } else {
-            cout << "Remote dataset filename filter = " << REMOTE_DATASET_FILE_SUBSTRING << endl;
-        }
+        cout << "Remote dataset file-number filter = "
+             << REMOTE_DATASET_FILE_NUMBER_MIN << "-"
+             << REMOTE_DATASET_FILE_NUMBER_MAX << endl;
 
         for (const string& inputFile : rootFiles) {
             processRootFile(inputFile);
