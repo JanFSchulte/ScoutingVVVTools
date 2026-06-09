@@ -122,6 +122,8 @@ The analysis runs in this order:
 
 `systematics/find_duplicate_entries.C` is a standalone ROOT diagnostic macro that scans either one ROOT file or a directory searched recursively for `.root` files, chains the matching trees with `TChain`, and reports duplicated event keys (`run`, `luminosityBlock`, `event`) plus their multiplicities and first/last entry indices.
 
+`systematics/plot_branch_histograms.C` is a standalone ROOT plotting macro with its input ROOT files, TTree name, branch list, histogram ranges, binning, and log-x choices configured directly in the source. It chains the configured files with `TChain`, auto-detects scalar versus C-array numeric branch leaves from ROOT metadata, and for variable-length NanoAOD-style C arrays fills the histogram with only element index 0 using the branch's associated count leaf.
+
 ## Convert_branch.C output layout (consumed downstream)
 
 `convert_branch.C` writes per-sample ROOT files laid out as
@@ -243,6 +245,13 @@ PLOT_CONFIG_PATH=/path/to/config.json python3 plotting/data_mc.py
 # Edit filePath / requestedTree inside systematics/find_duplicate_entries.C,
 # then run it as a ROOT macro.
 root -l -q systematics/find_duplicate_entries.C
+```
+
+### Branch histogram plotting
+```bash
+# Edit INPUT_FILES / TREE_NAME / BRANCHES inside systematics/plot_branch_histograms.C,
+# then run it as a ROOT macro.
+root -l -b -q systematics/plot_branch_histograms.C
 ```
 
 `plotting/data_mc.py` reads [plotting/config.json](plotting/config.json) and [plotting/branch.json](plotting/branch.json), then for every tree in `submit_trees`:
