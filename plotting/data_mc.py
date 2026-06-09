@@ -973,7 +973,7 @@ def _process_tree(tree_name):
                 ax.set_ylim(0.0, max(1.0, ymax * 1.3))
 
         ax.set_ylabel("Events", fontsize=24)
-        hep.cms.label("Preliminary", data=True, com=13.6, year="2024", lumi=LUMI_TOTAL, ax=ax)
+        hep.cms.label("Preliminary", data=True, com=13.6, year="2024", lumi=int(LUMI_TOTAL), ax=ax)
 
         handles, labels = ax.get_legend_handles_labels()
         if "Data" in labels:
