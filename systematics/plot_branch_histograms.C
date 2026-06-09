@@ -1,12 +1,16 @@
-// Summary: Draw configured scalar or C-array ROOT branches from a TChain.
+// Summary: Draw configured scalar or C-array ROOT branches from ROOT files.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include "TBranch.h"
@@ -21,6 +25,7 @@
 #include "TTree.h"
 
 using namespace std;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -35,6 +40,8 @@ static const vector<string> INPUT_FILES = {
 static const string TREE_NAME = "fat2";
 static const string OUTPUT_DIR = "systematics/branch_histograms";
 static const string OUTPUT_ROOT_FILE = "histograms.root";
+static const string XROOTD_REDIRECTOR = "root://cms-xrd-global.cern.ch/";
+static const string REMOTE_DATASET_FILE_SUBSTRING = "000";
 static const int DEFAULT_BINS = 100;
 static const double LOG_AXIS_MIN = 0.1;
 
@@ -260,6 +267,192 @@ struct PlotRuntime {
     unique_ptr<TH1D> hist;
 };
 
+bool endsWith(const string& text, const string& suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool startsWith(const string& text, const string& prefix) {
+    return text.size() >= prefix.size() &&
+           text.compare(0, prefix.size(), prefix) == 0;
+}
+
+string stripQueryString(const string& path) {
+    const size_t pos = path.find('?');
+    return pos == string::npos ? path : path.substr(0, pos);
+}
+
+string baseName(const string& path) {
+    const string cleanPath = stripQueryString(path);
+    const size_t slash = cleanPath.find_last_of('/');
+    if (slash == string::npos) {
+        return cleanPath;
+    }
+    return cleanPath.substr(slash + 1);
+}
+
+string fileStem(const string& path) {
+    string name = baseName(path);
+    if (endsWith(name, ".root")) {
+        name.resize(name.size() - 5);
+    }
+    return name.empty() ? "input" : name;
+}
+
+bool isRemoteRootFile(const string& path) {
+    return startsWith(path, "root://") && endsWith(stripQueryString(path), ".root");
+}
+
+bool isCmsStoreRootFile(const string& path) {
+    return startsWith(path, "/store/") && endsWith(stripQueryString(path), ".root");
+}
+
+bool isCmsDatasetPath(const string& path) {
+    if (path.empty() || path[0] != '/' || endsWith(path, ".root")) {
+        return false;
+    }
+
+    size_t parts = 0;
+    string token;
+    stringstream ss(path);
+    while (getline(ss, token, '/')) {
+        if (!token.empty()) {
+            ++parts;
+        }
+    }
+    return parts == 3;
+}
+
+bool isUserDataset(const string& path) {
+    return endsWith(path, "/USER");
+}
+
+string runCommand(const string& command) {
+    unique_ptr<FILE, int(*)(FILE*)> pipe(popen(command.c_str(), "r"), pclose);
+    if (!pipe) {
+        throw runtime_error("Failed to run command: " + command);
+    }
+
+    string output;
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
+        output += buffer;
+    }
+
+    const int status = pclose(pipe.release());
+    if (status != 0) {
+        throw runtime_error("Command failed (" + to_string(status) + "): " + command + "\n" + output);
+    }
+    return output;
+}
+
+vector<string> splitLines(const string& text) {
+    vector<string> lines;
+    string line;
+    stringstream ss(text);
+    while (getline(ss, line)) {
+        if (!line.empty()) {
+            lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+bool remoteDatasetFilePassesFilter(const string& rootFilePath) {
+    if (REMOTE_DATASET_FILE_SUBSTRING.empty()) {
+        return true;
+    }
+    return rootFilePath.find(REMOTE_DATASET_FILE_SUBSTRING) != string::npos;
+}
+
+vector<string> listRemoteDatasetRootFiles(const string& datasetPath) {
+    string query = "file dataset=" + datasetPath;
+    if (isUserDataset(datasetPath)) {
+        query += " instance=prod/phys03";
+    }
+
+    const string command = "dasgoclient -query=\"" + query + "\" 2>&1";
+    const vector<string> lines = splitLines(runCommand(command));
+
+    vector<string> files;
+    files.reserve(lines.size());
+    for (const string& line : lines) {
+        if (!endsWith(line, ".root")) {
+            continue;
+        }
+        if (!remoteDatasetFilePassesFilter(line)) {
+            continue;
+        }
+        files.push_back(XROOTD_REDIRECTOR + line);
+    }
+
+    sort(files.begin(), files.end());
+    files.erase(unique(files.begin(), files.end()), files.end());
+    return files;
+}
+
+vector<string> listLocalRootFiles(const string& inputPath) {
+    const fs::path path(inputPath);
+    if (!fs::exists(path)) {
+        throw runtime_error("Local input path does not exist: " + inputPath);
+    }
+
+    vector<string> files;
+    if (fs::is_regular_file(path)) {
+        if (!endsWith(path.string(), ".root")) {
+            throw runtime_error("Local input file is not a ROOT file: " + inputPath);
+        }
+        files.push_back(fs::absolute(path).lexically_normal().string());
+        return files;
+    }
+
+    if (!fs::is_directory(path)) {
+        throw runtime_error("Unsupported local input path: " + inputPath);
+    }
+
+    for (const auto& entry : fs::recursive_directory_iterator(path)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const string filePath = entry.path().string();
+        if (endsWith(filePath, ".root")) {
+            files.push_back(fs::absolute(entry.path()).lexically_normal().string());
+        }
+    }
+
+    sort(files.begin(), files.end());
+    files.erase(unique(files.begin(), files.end()), files.end());
+    return files;
+}
+
+vector<string> resolveInputRootFiles() {
+    vector<string> files;
+
+    for (const string& inputPath : INPUT_FILES) {
+        vector<string> sourceFiles;
+        if (isRemoteRootFile(inputPath)) {
+            sourceFiles.push_back(inputPath);
+        } else if (isCmsStoreRootFile(inputPath)) {
+            sourceFiles.push_back(XROOTD_REDIRECTOR + inputPath);
+        } else if (fs::exists(fs::path(inputPath))) {
+            sourceFiles = listLocalRootFiles(inputPath);
+        } else if (isCmsDatasetPath(inputPath)) {
+            sourceFiles = listRemoteDatasetRootFiles(inputPath);
+        } else {
+            sourceFiles = listLocalRootFiles(inputPath);
+        }
+
+        files.insert(files.end(), sourceFiles.begin(), sourceFiles.end());
+    }
+
+    sort(files.begin(), files.end());
+    files.erase(unique(files.begin(), files.end()), files.end());
+    if (files.empty()) {
+        throw runtime_error("No ROOT files found from INPUT_FILES");
+    }
+    return files;
+}
+
 string stripSpaces(string text) {
     text.erase(remove_if(text.begin(), text.end(),
                          [](unsigned char c) { return isspace(c); }),
@@ -363,6 +556,10 @@ string safeName(string text) {
         }
     }
     return text;
+}
+
+string sourceTag(const string& inputFile) {
+    return safeName(fileStem(inputFile));
 }
 
 double effectiveXMin(const BranchPlotConfig& config) {
@@ -478,9 +675,9 @@ void configureBranches(TTree& tree, map<string, BoundBranch>& boundBranches) {
     }
 }
 
-void fillPlots(TTree& tree, vector<PlotRuntime>& plots) {
+void fillPlots(TTree& tree, vector<PlotRuntime>& plots, const string& inputFile) {
     const Long64_t nEntries = tree.GetEntries();
-    cout << "Total entries = " << nEntries << endl;
+    cout << "Total entries in " << inputFile << " = " << nEntries << endl;
 
     for (Long64_t entry = 0; entry < nEntries; ++entry) {
         tree.GetEntry(entry);
@@ -516,10 +713,11 @@ void fillPlots(TTree& tree, vector<PlotRuntime>& plots) {
     }
 }
 
-void savePlots(const vector<PlotRuntime>& plots) {
+void savePlots(const vector<PlotRuntime>& plots, const string& inputFile) {
     gSystem->mkdir(OUTPUT_DIR.c_str(), kTRUE);
 
-    const string rootPath = makeUniquePath(OUTPUT_DIR + "/" + OUTPUT_ROOT_FILE);
+    const string tag = sourceTag(inputFile);
+    const string rootPath = makeUniquePath(OUTPUT_DIR + "/" + tag + "_" + OUTPUT_ROOT_FILE);
     TFile output(rootPath.c_str(), "CREATE");
     if (output.IsZombie()) {
         throw runtime_error("Failed to create output ROOT file: " + rootPath);
@@ -531,7 +729,8 @@ void savePlots(const vector<PlotRuntime>& plots) {
     output.Close();
 
     for (const PlotRuntime& plot : plots) {
-        TCanvas canvas(("c_" + safeName(plot.config.name)).c_str(), "", 800, 700);
+        const string branchTag = safeName(plot.config.name);
+        TCanvas canvas(("c_" + tag + "_" + branchTag).c_str(), "", 800, 700);
         canvas.SetMargin(0.12, 0.04, 0.12, 0.08);
         canvas.SetLogy(true);
         if (plot.config.logx) {
@@ -546,7 +745,7 @@ void savePlots(const vector<PlotRuntime>& plots) {
         }
         plot.hist->Draw("hist");
 
-        const string pdfPath = makeUniquePath(OUTPUT_DIR + "/" + safeName(plot.config.name) + ".pdf");
+        const string pdfPath = makeUniquePath(OUTPUT_DIR + "/" + tag + "_" + branchTag + ".pdf");
         canvas.SaveAs(pdfPath.c_str());
         cout << "Wrote " << pdfPath << endl;
     }
@@ -572,6 +771,28 @@ void printBranchSummary(const vector<PlotRuntime>& plots) {
     }
 }
 
+void processRootFile(const string& inputFile) {
+    cout << "[FILE] " << inputFile << endl;
+
+    TChain chain(TREE_NAME.c_str());
+    if (chain.Add(inputFile.c_str()) <= 0) {
+        throw runtime_error("Failed to add ROOT file to TChain: " + inputFile);
+    }
+
+    if (chain.GetEntries() > 0) {
+        chain.LoadTree(0);
+    }
+
+    map<string, BoundBranch> boundBranches;
+    vector<PlotRuntime> plots = buildPlots(chain, boundBranches);
+    configureBranches(chain, boundBranches);
+    printBranchSummary(plots);
+    fillPlots(chain, plots, inputFile);
+    savePlots(plots, inputFile);
+
+    chain.ResetBranchAddresses();
+}
+
 }  // namespace
 
 int plot_branch_histograms() {
@@ -586,24 +807,17 @@ int plot_branch_histograms() {
         gROOT->SetBatch(kTRUE);
         gStyle->SetOptStat(0);
 
-        TChain chain(TREE_NAME.c_str());
-        for (const string& inputFile : INPUT_FILES) {
-            cout << "Adding file: " << inputFile << endl;
-            chain.Add(inputFile.c_str());
+        const vector<string> rootFiles = resolveInputRootFiles();
+        cout << "Resolved ROOT files = " << rootFiles.size() << endl;
+        if (REMOTE_DATASET_FILE_SUBSTRING.empty()) {
+            cout << "Remote dataset filename filter = <empty>" << endl;
+        } else {
+            cout << "Remote dataset filename filter = " << REMOTE_DATASET_FILE_SUBSTRING << endl;
         }
 
-        if (chain.GetEntries() > 0) {
-            chain.LoadTree(0);
+        for (const string& inputFile : rootFiles) {
+            processRootFile(inputFile);
         }
-
-        map<string, BoundBranch> boundBranches;
-        vector<PlotRuntime> plots = buildPlots(chain, boundBranches);
-        configureBranches(chain, boundBranches);
-        printBranchSummary(plots);
-        fillPlots(chain, plots);
-        savePlots(plots);
-
-        chain.ResetBranchAddresses();
     } catch (const exception& ex) {
         cerr << "plot_branch_histograms error: " << ex.what() << endl;
         return 1;

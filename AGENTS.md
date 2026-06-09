@@ -122,7 +122,7 @@ The analysis runs in this order:
 
 `systematics/find_duplicate_entries.C` is a standalone ROOT diagnostic macro that scans either one ROOT file or a directory searched recursively for `.root` files, chains the matching trees with `TChain`, and reports duplicated event keys (`run`, `luminosityBlock`, `event`) plus their multiplicities and first/last entry indices.
 
-`systematics/plot_branch_histograms.C` is a standalone ROOT plotting macro with its input ROOT files, TTree name, branch list, histogram ranges, binning, and log-x choices configured directly in the source. It chains the configured files with `TChain`, auto-detects scalar versus C-array numeric branch leaves from ROOT metadata, and for variable-length NanoAOD-style C arrays fills the histogram with only element index 0 using the branch's associated count leaf.
+`systematics/plot_branch_histograms.C` is a standalone ROOT plotting macro with its input sources, TTree name, branch list, histogram ranges, binning, and log-x choices configured directly in the source. Each `INPUT_FILES` entry may be a local ROOT file, a local directory searched recursively for `.root` files, a `root://` ROOT file, a CMS `/store/...root` file that is prefixed with the global XRootD redirector, or a CMS DAS dataset path of the form `/A/B/C`; DAS dataset entries are expanded with `dasgoclient` using the CMS global XRootD redirector and filtered by `REMOTE_DATASET_FILE_SUBSTRING` against each returned ROOT file path. The macro processes every resolved ROOT file independently with a single-file `TChain`, auto-detects scalar versus C-array numeric branch leaves from ROOT metadata, fills variable-length NanoAOD-style C arrays with only element index 0 using the branch's associated count leaf, and writes per-input-file ROOT/PDF outputs.
 
 ## Convert_branch.C output layout (consumed downstream)
 
@@ -249,7 +249,8 @@ root -l -q systematics/find_duplicate_entries.C
 
 ### Branch histogram plotting
 ```bash
-# Edit INPUT_FILES / TREE_NAME / BRANCHES inside systematics/plot_branch_histograms.C,
+# Edit INPUT_FILES / TREE_NAME / BRANCHES / REMOTE_DATASET_FILE_SUBSTRING
+# inside systematics/plot_branch_histograms.C,
 # then run it as a ROOT macro.
 root -l -b -q systematics/plot_branch_histograms.C
 ```
