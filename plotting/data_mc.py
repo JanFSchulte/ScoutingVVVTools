@@ -634,7 +634,7 @@ def _process_tree(tree_name):
     class_names      = list(class_groups.keys())
     model_branches   = [item["name"] for item in bdt_br[tree_name]]
     score_branches   = [_score_branch_name(class_name) for class_name in class_names]
-    entries_per_sample = int(bdt_cfg.get("entries_per_sample", 1_000_000))
+    entries_per_sample = int(bdt_cfg.get("entries_per_sample", 1_000_000) * 0.5)
     if entries_per_sample <= 0:
         raise RuntimeError(
             f"bdt_root config entries_per_sample must be positive, got {entries_per_sample}"
