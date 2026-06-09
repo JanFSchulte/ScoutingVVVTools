@@ -25,10 +25,14 @@ using namespace std;
 namespace {
 
 static const vector<string> INPUT_FILES = {
-    "dataset/data/example.root"
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_1.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_2.root",
+    //"/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_3.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_4.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_5.root"
 };
 
-static const string TREE_NAME = "Events";
+static const string TREE_NAME = "fat2";
 static const string OUTPUT_DIR = "systematics/branch_histograms";
 static const string OUTPUT_ROOT_FILE = "histograms.root";
 static const int DEFAULT_BINS = 100;
@@ -43,9 +47,8 @@ struct BranchPlotConfig {
 };
 
 static const vector<BranchPlotConfig> BRANCHES = {
-    // Edit these examples for the ROOT files being checked.
-    {"nScoutingFatPFJetRecluster", -0.5, 10.5, false},
-    {"ScoutingFatPFJetRecluster_pt", LOG_AXIS_MIN, 2000., true}
+    {"ScoutingFatPFJetRecluster_pt_1", 200, 2000., true},
+    {"ScoutingFatPFJetRecluster_pt_2", 200, 2000., true}
 };
 
 enum class NumericType {
