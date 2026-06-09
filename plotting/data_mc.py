@@ -624,6 +624,149 @@ def _ratio_data_over_mc(data_vals, data_vars, mc_vals, mc_vars):
     return r, sigma
 
 
+def _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2):
+    mc_sum = float(np.sum(mc_total_v))
+    data_sum = float(np.sum(data_v))
+    mc_scale = 1.0 / mc_sum if mc_sum > 0.0 else 0.0
+    data_scale = 1.0 / data_sum if data_sum > 0.0 else 0.0
+
+    mc_per_cls_norm = {
+        cls: (h * mc_scale, h2 * (mc_scale ** 2))
+        for cls, (h, h2) in mc_per_cls.items()
+    }
+    return (
+        mc_per_cls_norm,
+        mc_total_v * mc_scale,
+        mc_total_w2 * (mc_scale ** 2),
+        data_v * data_scale,
+        data_w2 * (data_scale ** 2),
+    )
+
+
+def _draw_data_mc_plot(
+    *,
+    class_names,
+    color_map,
+    edges,
+    bin_centers,
+    bin_widths,
+    mc_per_cls,
+    mc_total_v,
+    mc_total_w2,
+    data_v,
+    data_w2,
+    branch,
+    x_range,
+    logx,
+    logy,
+    y_range,
+    y_label,
+    out_path,
+    logy_floor=0.1,
+):
+    bins = len(bin_centers)
+    fig, (ax, axr) = plt.subplots(
+        2, 1, figsize=(10, 10),
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0},
+        sharex=True,
+    )
+
+    mc_yields = {cls: float(mc_per_cls[cls][0].sum()) for cls in class_names}
+    order = np.argsort([mc_yields[c] for c in class_names])
+    bottom = np.zeros(bins)
+    for idx in order:
+        cls = class_names[idx]
+        h, _ = mc_per_cls[cls]
+        ax.bar(
+            edges[:-1], h, width=bin_widths, bottom=bottom,
+            align="edge", color=color_map[cls], edgecolor="none",
+            linewidth=0, antialiased=False, alpha=0.9, label=cls,
+        )
+        bottom += h
+    ax.margins(x=0)
+
+    mc_sigma = np.sqrt(np.maximum(mc_total_w2, 0.0))
+    lower = np.clip(mc_total_v - mc_sigma, 1e-12, None)
+    upper = np.clip(mc_total_v + mc_sigma, 1e-12, None)
+    ax.fill_between(
+        bin_centers, lower, upper, step="mid",
+        facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
+    )
+
+    data_sigma = np.sqrt(np.maximum(data_w2, 0.0))
+    y_plot = np.where(data_v > 0, data_v, np.nan)
+    ax.errorbar(
+        bin_centers, y_plot, yerr=data_sigma,
+        fmt="o", ms=7.6, color="black", mfc="black", mec="black",
+        elinewidth=1.5, capsize=0, label="Data",
+    )
+
+    if logx:
+        ax.set_xscale("log")
+        axr.set_xscale("log")
+    if logy:
+        ax.set_yscale("log")
+    ax.set_xlim(*x_range)
+    axr.set_xlim(*x_range)
+
+    if y_range is not None:
+        ax.set_ylim(*y_range)
+    else:
+        vis = (mc_total_v > 0) | (data_v > 0)
+        if np.any(vis):
+            ymax = max(float(np.max(mc_total_v[vis])), float(np.max(data_v[vis])))
+        else:
+            ymax = 1.0
+        if logy:
+            if logy_floor is None:
+                positive = np.concatenate([mc_total_v[mc_total_v > 0], data_v[data_v > 0]])
+                ymin = max(float(np.min(positive)) / 5.0, 1e-12) if positive.size else 1e-6
+            else:
+                ymin = float(logy_floor)
+            ax.set_ylim(ymin, max(ymin * 10.0, ymax * 5.0))
+        else:
+            ax.set_ylim(0.0, max(1.0, ymax * 1.3))
+
+    ax.set_ylabel(y_label, fontsize=24)
+    hep.cms.label("Preliminary", data=True, com=13.6, year="2024", lumi=int(LUMI_TOTAL), ax=ax)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if "Data" in labels:
+        i = labels.index("Data")
+        handles.append(handles.pop(i))
+        labels.append(labels.pop(i))
+    ax.legend(handles, labels, loc="best", fontsize=17, frameon=False, ncol=2)
+
+    ratio, r_err = _ratio_data_over_mc(data_v, data_w2, mc_total_v, mc_total_w2)
+    axr.errorbar(
+        bin_centers, ratio, yerr=r_err,
+        fmt="o", ms=7.6, color="black", mfc="black", mec="black",
+        elinewidth=1.5, capsize=0,
+    )
+    axr.axhline(1.0, color="black", linestyle="--", linewidth=1.5)
+
+    finite = np.isfinite(ratio)
+    if np.any(finite):
+        safe_err = np.nan_to_num(r_err[finite], nan=0.0)
+        rmax = float(np.nanmax(ratio[finite] + safe_err))
+        rmin = float(np.nanmin(ratio[finite] - safe_err))
+        if not np.isfinite(rmax) or rmax <= 0:
+            rmax = 1.0
+        if rmax < 5.0:
+            axr.set_ylim(max(0.0, 0.8 * rmin), 1.2 * rmax)
+        else:
+            axr.set_ylim(0.0, 5.0)
+    else:
+        axr.set_ylim(0.0, 2.0)
+
+    axr.set_ylabel(r"$\frac{Data}{MC}$", fontsize=26)
+    axr.yaxis.set_label_coords(-0.05, 0.6)
+    axr.set_xlabel(branch, fontsize=24)
+
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 # -------------------- Per-tree processing --------------------
 def _process_tree(tree_name):
     log_message(f"Running data_mc.py: tree={tree_name}")
@@ -889,7 +1032,6 @@ def _process_tree(tree_name):
         mc_total_v  = np.zeros(bins)
         mc_total_w2 = np.zeros(bins)
         mc_per_cls  = {}
-        mc_yields   = {}
         for cls in class_names:
             if cls in plot_class_dfs and branch in plot_class_dfs[cls].columns:
                 h, h2 = _weighted_hist(
@@ -902,7 +1044,6 @@ def _process_tree(tree_name):
             mc_per_cls[cls] = (h, h2)
             mc_total_v  += h
             mc_total_w2 += h2
-            mc_yields[cls] = float(h.sum())
 
         if plot_data_df is not None and branch in plot_data_df.columns:
             data_v, data_w2 = _weighted_hist(
@@ -912,107 +1053,58 @@ def _process_tree(tree_name):
             data_v  = np.zeros(bins)
             data_w2 = np.zeros(bins)
 
-        fig, (ax, axr) = plt.subplots(
-            2, 1, figsize=(10, 10),
-            gridspec_kw={"height_ratios": [3, 1], "hspace": 0},
-            sharex=True,
-        )
-
-        # Draw the stacked MC histograms from low to high total yield.
-        order = np.argsort([mc_yields[c] for c in class_names])
-        bottom = np.zeros(bins)
-        for idx in order:
-            cls = class_names[idx]
-            h, _ = mc_per_cls[cls]
-            ax.bar(
-                edges[:-1], h, width=bin_widths, bottom=bottom,
-                align="edge", color=color_map[cls], edgecolor="none",
-                linewidth=0, antialiased=False, alpha=0.9, label=cls,
-            )
-            bottom += h
-        ax.margins(x=0)
-
-        # Draw the total MC uncertainty band.
-        mc_sigma = np.sqrt(np.maximum(mc_total_w2, 0.0))
-        lower = np.clip(mc_total_v - mc_sigma, 1e-12, None)
-        upper = np.clip(mc_total_v + mc_sigma, 1e-12, None)
-        ax.fill_between(
-            bin_centers, lower, upper, step="mid",
-            facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
-        )
-
-        # Draw the data points.
-        data_sigma = np.sqrt(np.maximum(data_w2, 0.0))
-        y_plot = np.where(data_v > 0, data_v, np.nan)
-        ax.errorbar(
-            bin_centers, y_plot, yerr=data_sigma,
-            fmt="o", ms=7.6, color="black", mfc="black", mec="black",
-            elinewidth=1.5, capsize=0, label="Data",
-        )
-
-        # Configure the axes.
-        if logx:
-            ax.set_xscale("log")
-            axr.set_xscale("log")
-        if logy:
-            ax.set_yscale("log")
-        ax.set_xlim(*x_range)
-        axr.set_xlim(*x_range)
-
-        if y_range is not None:
-            ax.set_ylim(*y_range)
-        else:
-            vis = (mc_total_v > 0) | (data_v > 0)
-            if np.any(vis):
-                ymax = max(float(np.max(mc_total_v[vis])), float(np.max(data_v[vis])))
-            else:
-                ymax = 1.0
-            if logy:
-                ax.set_ylim(0.1, max(1.0, ymax * 5.0))
-            else:
-                ax.set_ylim(0.0, max(1.0, ymax * 1.3))
-
-        ax.set_ylabel("Events", fontsize=24)
-        hep.cms.label("Preliminary", data=True, com=13.6, year="2024", lumi=int(LUMI_TOTAL), ax=ax)
-
-        handles, labels = ax.get_legend_handles_labels()
-        if "Data" in labels:
-            i = labels.index("Data")
-            handles.append(handles.pop(i))
-            labels.append(labels.pop(i))
-        ax.legend(handles, labels, loc="best", fontsize=17, frameon=False, ncol=2)
-
-        # Draw the Data/MC ratio panel.
-        ratio, r_err = _ratio_data_over_mc(data_v, data_w2, mc_total_v, mc_total_w2)
-        axr.errorbar(
-            bin_centers, ratio, yerr=r_err,
-            fmt="o", ms=7.6, color="black", mfc="black", mec="black",
-            elinewidth=1.5, capsize=0,
-        )
-        axr.axhline(1.0, color="black", linestyle="--", linewidth=1.5)
-
-        finite = np.isfinite(ratio)
-        if np.any(finite):
-            safe_err = np.nan_to_num(r_err[finite], nan=0.0)
-            rmax = float(np.nanmax(ratio[finite] + safe_err))
-            rmin = float(np.nanmin(ratio[finite] - safe_err))
-            if not np.isfinite(rmax) or rmax <= 0:
-                rmax = 1.0
-            if rmax < 5.0:
-                axr.set_ylim(max(0.0, 0.8 * rmin), 1.2 * rmax)
-            else:
-                axr.set_ylim(0.0, 5.0)
-        else:
-            axr.set_ylim(0.0, 2.0)
-
-        axr.set_ylabel(r"$\frac{Data}{MC}$", fontsize=26)
-        axr.yaxis.set_label_coords(-0.05, 0.6)
-        axr.set_xlabel(branch, fontsize=24)
-
         out_path = os.path.join(out_dir, f"{tree_name}_{branch}.pdf")
-        fig.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        _draw_data_mc_plot(
+            class_names=class_names,
+            color_map=color_map,
+            edges=edges,
+            bin_centers=bin_centers,
+            bin_widths=bin_widths,
+            mc_per_cls=mc_per_cls,
+            mc_total_v=mc_total_v,
+            mc_total_w2=mc_total_w2,
+            data_v=data_v,
+            data_w2=data_w2,
+            branch=branch,
+            x_range=x_range,
+            logx=logx,
+            logy=logy,
+            y_range=y_range,
+            y_label="Events",
+            out_path=out_path,
+            logy_floor=0.1,
+        )
         log_message(f"Wrote plot file: {out_path}")
+
+        (
+            mc_per_cls_norm,
+            mc_total_v_norm,
+            mc_total_w2_norm,
+            data_v_norm,
+            data_w2_norm,
+        ) = _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2)
+        out_path_normal = os.path.join(out_dir, f"{tree_name}_{branch}_normal.pdf")
+        _draw_data_mc_plot(
+            class_names=class_names,
+            color_map=color_map,
+            edges=edges,
+            bin_centers=bin_centers,
+            bin_widths=bin_widths,
+            mc_per_cls=mc_per_cls_norm,
+            mc_total_v=mc_total_v_norm,
+            mc_total_w2=mc_total_w2_norm,
+            data_v=data_v_norm,
+            data_w2=data_w2_norm,
+            branch=branch,
+            x_range=x_range,
+            logx=logx,
+            logy=logy,
+            y_range=y_range,
+            y_label="A.U.",
+            out_path=out_path_normal,
+            logy_floor=None,
+        )
+        log_message(f"Wrote plot file: {out_path_normal}")
     log_message(f"Finished data_mc.py for tree={tree_name}")
 
 
