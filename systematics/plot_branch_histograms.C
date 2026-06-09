@@ -30,15 +30,30 @@ namespace fs = std::filesystem;
 namespace {
 
 static const vector<string> INPUT_FILES = {
-    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data_tmp"
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_1.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_2.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_3.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_4.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_5.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_6.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_7.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_8.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_9.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_10.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_11.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_12.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_13.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_14.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I_15.root",
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/2024/skim/2024I.root"
 };
 
-static const string TREE_NAME = "fat2";
-static const string OUTPUT_DIR = "systematics/branch_histograms";
+static const string TREE_NAME = "Events";
+static const string OUTPUT_DIR = "systematics/";
 static const string OUTPUT_ROOT_FILE = "histograms.root";
 static const string XROOTD_REDIRECTOR = "root://cms-xrd-global.cern.ch/";
-static const long long REMOTE_DATASET_FILE_NUMBER_MIN = 13820;
-static const long long REMOTE_DATASET_FILE_NUMBER_MAX = 14400;
+static const long long REMOTE_DATASET_FILE_NUMBER_MIN = 4820;
+static const long long REMOTE_DATASET_FILE_NUMBER_MAX = 5400;
 static const int DEFAULT_BINS = 100;
 static const double LOG_AXIS_MIN = 0.1;
 
@@ -51,8 +66,7 @@ struct BranchPlotConfig {
 };
 
 static const vector<BranchPlotConfig> BRANCHES = {
-    {"ScoutingFatPFJetRecluster_pt_1", 200, 2000., true},
-    {"ScoutingFatPFJetRecluster_pt_2", 200, 2000., true}
+    {"ScoutingFatPFJetRecluster_pt", 100, 2000., true}
 };
 
 enum class NumericType {
