@@ -30,11 +30,7 @@ namespace fs = std::filesystem;
 namespace {
 
 static const vector<string> INPUT_FILES = {
-    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_1.root",
-    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_2.root",
-    //"/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_3.root",
-    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_4.root",
-    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data/2024I_5.root"
+    "/afs/ihep.ac.cn/users/y/yiyangzhao/Research/CMS_THU_Space/VVV/ScoutingVVVTools_new/dataset/data_tmp"
 };
 
 static const string TREE_NAME = "fat2";
