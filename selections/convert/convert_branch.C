@@ -23,6 +23,7 @@
 #include <vector>
 #include <unistd.h>
 
+#include <TBranch.h>
 #include <TChain.h>
 #include <TFile.h>
 #include <TH1.h>
@@ -388,6 +389,7 @@ struct AppConfig {
     string outputRoot;
     string outputPattern;
     string runSample;
+    string lumiMaskPath;
     string sampleConfigPath = kDefaultSampleConfigPath;
     int maxThreads = 12;
     double maxOutputFileSizeGB = 5.;
@@ -433,6 +435,41 @@ struct SampleMeta {
             return "data";
         }
         return isSignal ? "signal" : "bkg";
+    }
+};
+
+struct LumiRange {
+    UInt_t first = 0;
+    UInt_t last = 0;
+};
+
+struct LumiMaskRun {
+    UInt_t run = 0;
+    vector<LumiRange> ranges;
+};
+
+struct LumiMask {
+    vector<LumiMaskRun> runs;
+
+    bool contains(UInt_t run, UInt_t lumi) const {
+        const auto runIt = lower_bound(runs.begin(), runs.end(), run,
+                                       [](const LumiMaskRun& item, UInt_t value) {
+                                           return item.run < value;
+                                       });
+        if (runIt == runs.end() || runIt->run != run) {
+            return false;
+        }
+
+        const auto& ranges = runIt->ranges;
+        const auto rangeIt = upper_bound(ranges.begin(), ranges.end(), lumi,
+                                         [](UInt_t value, const LumiRange& range) {
+                                             return value < range.first;
+                                         });
+        if (rangeIt == ranges.begin()) {
+            return false;
+        }
+        const LumiRange& candidate = *(rangeIt - 1);
+        return lumi <= candidate.last;
     }
 };
 
@@ -916,6 +953,69 @@ string normalizeOutputPath(const AppConfig& appConfig, const string& outputPath)
     return (fs::path(appConfig.configDir) / path).lexically_normal().string();
 }
 
+UInt_t parseUInt32Text(const string& text, const string& context) {
+    size_t pos = 0;
+    unsigned long long value = 0;
+    try {
+        value = stoull(text, &pos, 10);
+    } catch (const exception&) {
+        throw runtime_error("Invalid unsigned integer for " + context + ": " + text);
+    }
+    if (pos != text.size() || value > numeric_limits<UInt_t>::max()) {
+        throw runtime_error("Invalid unsigned integer for " + context + ": " + text);
+    }
+    return static_cast<UInt_t>(value);
+}
+
+UInt_t parseUInt32Json(const JsonValue& value, const string& context) {
+    const long double number = value.asNumber();
+    if (number < 0 || number > numeric_limits<UInt_t>::max() || floor(number) != number) {
+        throw runtime_error("Invalid unsigned integer for " + context);
+    }
+    return static_cast<UInt_t>(number);
+}
+
+LumiMask loadLumiMask(const string& path) {
+    const JsonValue payload = loadJsonPath(path);
+    const auto& object = payload.asObject();
+
+    LumiMask mask;
+    mask.runs.reserve(object.size());
+    for (const auto& item : object) {
+        LumiMaskRun runConfig;
+        runConfig.run = parseUInt32Text(item.first, "lumi mask run");
+
+        const auto& ranges = item.second.asArray();
+        runConfig.ranges.reserve(ranges.size());
+        for (const auto& rangeNode : ranges) {
+            const auto& range = rangeNode.asArray();
+            if (range.size() != 2) {
+                throw runtime_error("Each lumi mask range must contain exactly two values for run " +
+                                    item.first);
+            }
+
+            LumiRange lumiRange;
+            lumiRange.first = parseUInt32Json(range[0], "lumi mask range start");
+            lumiRange.last = parseUInt32Json(range[1], "lumi mask range end");
+            if (lumiRange.last < lumiRange.first) {
+                throw runtime_error("Lumi mask range end is smaller than start for run " + item.first);
+            }
+            runConfig.ranges.push_back(lumiRange);
+        }
+        sort(runConfig.ranges.begin(), runConfig.ranges.end(),
+             [](const LumiRange& lhs, const LumiRange& rhs) {
+                 return lhs.first < rhs.first;
+             });
+        mask.runs.push_back(std::move(runConfig));
+    }
+
+    sort(mask.runs.begin(), mask.runs.end(),
+         [](const LumiMaskRun& lhs, const LumiMaskRun& rhs) {
+             return lhs.run < rhs.run;
+         });
+    return mask;
+}
+
 ExprPtr compileExpression(const string& text) {
     return ExpressionParser(text).parse();
 }
@@ -961,6 +1061,7 @@ AppConfig loadAppConfig() {
     config.runSample = payload.getStringOr("run_sample", "");
     config.outputRoot = resolveReferencedPath(config.configPath, payload.at("output_root").asString());
     config.outputPattern = payload.at("output_pattern").asString();
+    config.lumiMaskPath = resolveReferencedPath(config.configPath, payload.getStringOr("lumi_mask", ""));
     config.sampleConfigPath = resolveReferencedPath(
         config.configPath, payload.getStringOr("sample_config", kDefaultSampleConfigPath));
     config.maxThreads = payload.getIntOr("max_threads", 12);
@@ -3179,6 +3280,7 @@ Long64_t processInputFile(const string& inputFileName,
                           const SelectionConfig& selectionConfig,
                           const SampleMeta& sampleMeta,
                           const vector<PileupBin>& pileupWeights,
+                          const LumiMask* lumiMask,
                           BranchConfig& branchConfig,
                           vector<OutputTreeState>& outputTrees) {
     unique_ptr<TFile> inputFile = openInputFileWithRetry(inputFileName);
@@ -3197,7 +3299,41 @@ Long64_t processInputFile(const string& inputFileName,
     ensureCollectionBufferCapacities(tree, branchConfig, sampleMeta.isMC);
     unordered_map<string, const ScalarInputConfig*> rawScalarByName = bindInputBranches(tree, branchConfig, sampleMeta.isMC);
 
+    const bool applyLumiMask = (!sampleMeta.isMC && lumiMask != nullptr);
+    const ScalarInputConfig* runScalar = nullptr;
+    const ScalarInputConfig* lumiScalar = nullptr;
+    TBranch* runBranch = nullptr;
+    TBranch* lumiBranch = nullptr;
+    if (applyLumiMask) {
+        const auto runIt = rawScalarByName.find("run");
+        const auto lumiIt = rawScalarByName.find("luminosityBlock");
+        if (runIt == rawScalarByName.end() || lumiIt == rawScalarByName.end()) {
+            throw runtime_error("Data lumi mask requires input scalars 'run' and 'luminosityBlock'");
+        }
+        runScalar = runIt->second;
+        lumiScalar = lumiIt->second;
+        runBranch = tree->GetBranch(runScalar->branch.c_str());
+        lumiBranch = tree->GetBranch(lumiScalar->branch.c_str());
+        if (runBranch == nullptr || lumiBranch == nullptr) {
+            throw runtime_error("Data lumi mask requires input branches '" +
+                                runScalar->branch + "' and '" + lumiScalar->branch + "'");
+        }
+    }
+
+    Long64_t rawEntries = applyLumiMask ? 0 : nEntries;
     for (Long64_t entry = 0; entry < nEntries; ++entry) {
+        if (applyLumiMask) {
+            if (runBranch->GetEntry(entry) < 0 || lumiBranch->GetEntry(entry) < 0) {
+                throw runtime_error("Failed to read run/luminosityBlock for lumi mask");
+            }
+            const UInt_t runValue = static_cast<UInt_t>(runScalar->numericValue());
+            const UInt_t lumiValue = static_cast<UInt_t>(lumiScalar->numericValue());
+            if (!lumiMask->contains(runValue, lumiValue)) {
+                continue;
+            }
+            ++rawEntries;
+        }
+
         tree->GetEntry(entry);
 
         unordered_map<string, long double> baseVars = buildRawScalarValues(branchConfig, sampleMeta, &pileupWeights);
@@ -3241,7 +3377,7 @@ Long64_t processInputFile(const string& inputFileName,
             fillOutputTree(treeState, runtimeCollections, inputCollections, baseVars, rawScalarByName, sampleMeta.isMC);
         }
     }
-    return nEntries;
+    return rawEntries;
 }
 
 vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles,
@@ -3252,6 +3388,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                                            const SelectionConfig& selectionConfig,
                                            const SampleMeta& sampleMeta,
                                            const vector<PileupBin>& pileupWeights,
+                                           const LumiMask* lumiMask,
                                            const BranchConfig& branchConfig,
                                            atomic<size_t>& processedFiles,
                                            size_t totalFiles,
@@ -3308,6 +3445,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                                                               selectionConfig,
                                                               sampleMeta,
                                                               pileupWeights,
+                                                              lumiMask,
                                                               threadConfigs[tid],
                                                               threadResults[tid].outputTrees);
                 batchRawEntries.fetch_add(fileEntries);
@@ -3543,6 +3681,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    unique_ptr<LumiMask> lumiMask;
+    if (!sampleMeta.isMC && !appConfig.lumiMaskPath.empty()) {
+        try {
+            lumiMask = make_unique<LumiMask>(loadLumiMask(appConfig.lumiMaskPath));
+            cout << "Loaded lumi mask from: " << appConfig.lumiMaskPath
+                 << " (" << lumiMask->runs.size() << " runs)" << endl;
+        } catch (const exception& ex) {
+            cerr << "Lumi mask error: " << ex.what() << endl;
+            return 1;
+        }
+    }
+
 #ifdef _OPENMP
     if (threadCount > 1) {
         ROOT::EnableThreadSafety();
@@ -3615,6 +3765,7 @@ int main(int argc, char** argv) {
                                                                                  selectionConfig,
                                                                                  sampleMeta,
                                                                                  pileupWeights,
+                                                                                 lumiMask.get(),
                                                                                  branchConfig,
                                                                                  processedFiles,
                                                                                  inputFiles.size(),
