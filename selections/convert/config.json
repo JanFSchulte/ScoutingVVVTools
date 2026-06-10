@@ -3,7 +3,7 @@
   "run_sample": "www",
   "submit_samples": [],
   "max_threads": 18,
-  "max_output_file_size_gb": 5,
+  "max_output_file_size_gb": 0,
   "pu_weight_path": "../weight/pileup/pileup_{sample}.csv",
   "output_root": "../../dataset",
   "output_pattern": "{output_root}/{sample_group}/{sample}.root",

@@ -71,6 +71,7 @@ DECOR_N_BINS       = int(cfg.get("decor_n_bins", 5))
 DECOR_N_THRESHOLDS = int(cfg.get("decor_n_thresholds", 31))
 DECOR_SCORE_TAU    = float(cfg.get("decor_score_tau", 0.20))
 DECOR_BIN_TAU_SCALE = float(cfg.get("decor_bin_tau_scale", 0.35))
+DECOR_MSOFTDROP_TRAINING_MAX = float(cfg.get("decor_msoftdrop_training_max", 200.0))
 SUBMIT_TREES       = cfg.get("submit_trees", ["fat2"])
 INPUT_ROOT         = os.path.normpath(os.path.join(_SCRIPT_DIR, cfg["input_root"]))
 INPUT_PATTERN      = cfg["input_pattern"]
@@ -80,6 +81,11 @@ MODEL_TYPE         = model_type_from_config(cfg)
 
 if not 0.0 < TRAIN_FRACTION < 1.0:
     raise ValueError(f"train_fraction must be in (0, 1), got {TRAIN_FRACTION}")
+if not np.isfinite(DECOR_MSOFTDROP_TRAINING_MAX) or DECOR_MSOFTDROP_TRAINING_MAX <= 0.0:
+    raise ValueError(
+        "decor_msoftdrop_training_max must be a positive finite number, "
+        f"got {DECOR_MSOFTDROP_TRAINING_MAX}"
+    )
 
 if DECOR_LOSS_MODE == "soft_cvm":
     DECOR_LOSS_MODE = "smooth_cvm"
@@ -123,6 +129,68 @@ for _idx, (_cls, _members) in enumerate(CLASS_GROUPS.items()):
 
 # Resolve the training sample list.
 TRAINING_SAMPLES = [r["name"] for r in sample_cfg["sample"] if r["name"] in SAMPLE_TO_CLASS]
+
+
+def _qcd_ht_bounds(sample_name):
+    text = str(sample_name).strip().lower()
+    prefix = "qcd_ht"
+    if not text.startswith(prefix):
+        return None
+    suffix = text[len(prefix):]
+    if "to" in suffix:
+        low_text, high_text = suffix.split("to", 1)
+    else:
+        low_text, high_text = suffix, None
+    if not low_text.isdigit() or (high_text is not None and not high_text.isdigit()):
+        return None
+    low = int(low_text)
+    high = int(high_text) if high_text is not None else None
+    return low, high
+
+
+def _qcd_ht_sort_key(sample_name):
+    bounds = _qcd_ht_bounds(sample_name)
+    if bounds is None:
+        return (float("inf"), float("inf"), str(sample_name))
+    low, high = bounds
+    return (low, high if high is not None else float("inf"), str(sample_name))
+
+
+def _qcd_ht_training_weight_scales(tree_name):
+    step = float(cfg.get(tree_name, {}).get("qcd_ht_training_weight_step", 0.0))
+    if not np.isfinite(step) or step < 0.0:
+        raise ValueError(
+            f"qcd_ht_training_weight_step for tree '{tree_name}' must be a finite non-negative number, "
+            f"got {step}"
+        )
+    if step <= 0.0:
+        return {}
+
+    qcd_ht_samples = []
+    seen = set()
+    for members in CLASS_GROUPS.values():
+        for sample_name in members:
+            if sample_name in seen:
+                continue
+            bounds = _qcd_ht_bounds(sample_name)
+            if bounds is None:
+                continue
+            low, high = bounds
+            qcd_ht_samples.append((low, high if high is not None else float("inf"), sample_name))
+            seen.add(sample_name)
+
+    if not qcd_ht_samples:
+        log_warning(
+            f"tree '{tree_name}' has qcd_ht_training_weight_step={step:g} "
+            "but no qcd_ht samples in class_groups"
+        )
+        return {}
+
+    qcd_ht_samples.sort(key=lambda item: (item[0], item[1], item[2]))
+    return {
+        sample_name: 1.0 + step * rank
+        for rank, (_low, _high, sample_name) in enumerate(qcd_ht_samples)
+    }
 
 
 # -------------------- File discovery --------------------
@@ -357,6 +425,9 @@ def _load_segments(tree_name, branches, segments):
     if not parts:
         return None, 0
 
+    if len(parts) == 1:
+        return parts[0], n_read
+
     df = pd.concat(parts, ignore_index=True)
     del parts
     gc.collect()
@@ -374,9 +445,11 @@ def build_split_plans(tree_name):
     return split_plans
 
 
-def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
+def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, training_weight_scales=None):
     dfs = []
     sample_target_totals = {}
+    if training_weight_scales is None:
+        training_weight_scales = _qcd_ht_training_weight_scales(tree_name)
 
     reweight_branches = list(cfg.get(tree_name, {}).get("event_reweight_branches", []))
     load_branches = list(branches)
@@ -392,6 +465,7 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
         info = SAMPLE_INFO[sample_name]
         raw_entries = int(info["raw_entries"])
         xsec = float(info["xsection"])
+        training_weight_scale = float(training_weight_scales.get(sample_name, 1.0))
         if raw_entries <= 0:
             raise RuntimeError(
                 f"Sample '{sample_name}' has raw_entries={raw_entries}; "
@@ -431,10 +505,10 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
             target_total = 0.0
         else:
             target_total = xsec * (float(total_tree_entries) / float(raw_entries))
+        training_target_total = target_total * training_weight_scale
 
         if target_total <= 0.0:
             df["weight_physics"] = 0.0
-            sample_target_totals[sample_name] = 0.0
             if xsec <= 0.0:
                 log_warning(
                     f"sample '{sample_name}' has non-positive xsection={xsec:.6g}; assigning zero weight"
@@ -447,19 +521,22 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
                     f"{raw_w_sum:.6g} in split '{split_name}' of tree '{tree_name}'"
                 )
             df["weight_physics"] = raw_w * (target_total / raw_w_sum)
-            sample_target_totals[sample_name] = target_total
         if "weight_physics" not in df.columns:
             df["weight_physics"] = 0.0
+        del raw_w
 
         df["class_idx"] = SAMPLE_TO_CLASS[sample_name]
         df["sample_name"] = sample_name
-        df["weight"] = df["weight_physics"]
+        df["weight"] = df["weight_physics"] * training_weight_scale
+        sample_target_totals[sample_name] = training_target_total
         dfs.append(df)
 
         log_message(
             f"  {sample_name}: split={split_name}, tree_entries={plan['total_entries']}, "
             f"split_entries={split_total_entries}, used_entries={n_read}, raw_entries={raw_entries}, "
-            f"target_total={target_total:.6g}, class={CLASS_NAMES[SAMPLE_TO_CLASS[sample_name]]}"
+            f"target_total={target_total:.6g}, training_scale={training_weight_scale:.6g}, "
+            f"training_target_total={training_target_total:.6g}, "
+            f"class={CLASS_NAMES[SAMPLE_TO_CLASS[sample_name]]}"
         )
 
     if not dfs:
@@ -485,10 +562,10 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle):
         df_all = df_all.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
 
     X = df_all[branches].copy()
-    y = df_all["class_idx"].values.astype(int)
-    w = df_all["weight"].values
-    w_physics = df_all["weight_physics"].values
-    sample_labels = df_all["sample_name"].astype(str).values
+    y = df_all["class_idx"].to_numpy(dtype=int, copy=True)
+    w = df_all["weight"].to_numpy(dtype=float, copy=True)
+    w_physics = df_all["weight_physics"].to_numpy(dtype=float, copy=True)
+    sample_labels = df_all["sample_name"].astype(str).to_numpy(copy=True)
 
     del df_all
     gc.collect()
@@ -550,7 +627,7 @@ def write_selection_copy(output_root):
 # -------------------- Event filtering --------------------
 def filter_X(X: pd.DataFrame, y, w, branch: list,
              thresholds: dict = None, apply_to_sentinel: bool = True,
-             sample_labels=None):
+             sample_labels=None, return_index: bool = False):
     """Apply per-branch threshold cuts.
 
     Only branches that appear as keys in ``thresholds`` are inspected: for each
@@ -562,9 +639,14 @@ def filter_X(X: pd.DataFrame, y, w, branch: list,
     backward compatibility and is not used to drive filtering.
     """
     if not thresholds:
+        kept_index = X.index.to_numpy(copy=True)
         if sample_labels is None:
-            return X.copy(), y.copy(), w.copy()
-        return X.copy(), y.copy(), w.copy(), np.asarray(sample_labels).copy()
+            result = (X.copy(), y.copy(), w.copy())
+        else:
+            result = (X.copy(), y.copy(), w.copy(), np.asarray(sample_labels).copy())
+        if return_index:
+            return (*result, kept_index)
+        return result
 
     mask = pd.Series(True, index=X.index)
 
@@ -616,9 +698,14 @@ def filter_X(X: pd.DataFrame, y, w, branch: list,
     X_out = X.loc[mask].copy()
     y_out = y[mask.values].copy()
     w_out = w[mask.values].copy()
+    kept_index = X_out.index.to_numpy(copy=True)
     if sample_labels is None:
-        return X_out, y_out, w_out
-    return X_out, y_out, w_out, np.asarray(sample_labels)[mask.values].copy()
+        result = (X_out, y_out, w_out)
+    else:
+        result = (X_out, y_out, w_out, np.asarray(sample_labels)[mask.values].copy())
+    if return_index:
+        return (*result, kept_index)
+    return result
 
 
 # -------------------- Feature standardization --------------------
@@ -626,26 +713,42 @@ def standardize_X(X: pd.DataFrame, clip_ranges: dict, log_transform: list) -> pd
     """Clip values and apply log transform in-place; sentinel values (< -990) are untouched."""
     log_set = set(log_transform)
     for col in X.columns:
-        arr  = X[col].values.copy()
+        arr = X[col].to_numpy(copy=False)
+        needs_assign = False
+        if not arr.flags.writeable:
+            arr = arr.copy()
+            needs_assign = True
+        changed = False
         mask = arr < -990   # Sentinel placeholder values.
         valid = ~mask
         if not valid.any():
+            if needs_assign:
+                X[col] = arr
             continue
 
         lo, hi = clip_ranges.get(col, (None, None))
         if lo is not None:
-            arr[valid & (arr < lo)] = lo
+            low = valid & (arr < lo)
+            if low.any():
+                arr[low] = lo
+                changed = True
         if hi is not None:
-            arr[valid & (arr > hi)] = hi
+            high = valid & (arr > hi)
+            if high.any():
+                arr[high] = hi
+                changed = True
 
         if col in log_set:
             pos = valid & (arr > 0)
             if pos.any():
                 if not np.issubdtype(arr.dtype, np.floating):
                     arr = arr.astype(float)
+                    needs_assign = True
                 arr[pos] = np.log(arr[pos])
+                changed = True
 
-        X[col] = arr
+        if needs_assign or changed:
+            X[col] = arr
     return X
 
 
@@ -653,18 +756,47 @@ def _clip_only_X(X: pd.DataFrame, clip_ranges: dict) -> pd.DataFrame:
     """Apply clip_ranges only (no log_transform); sentinel values (< -990) untouched."""
     X = X.copy()
     for col in X.columns:
-        arr = X[col].values.copy()
+        arr = X[col].to_numpy(copy=False)
+        needs_assign = False
+        if not arr.flags.writeable:
+            arr = arr.copy()
+            needs_assign = True
+        changed = False
         mask = arr < -990
         valid = ~mask
         if not valid.any():
+            if needs_assign:
+                X[col] = arr
             continue
         lo, hi = clip_ranges.get(col, (None, None))
         if lo is not None:
-            arr[valid & (arr < lo)] = lo
+            low = valid & (arr < lo)
+            if low.any():
+                arr[low] = lo
+                changed = True
         if hi is not None:
-            arr[valid & (arr > hi)] = hi
-        X[col] = arr
+            high = valid & (arr > hi)
+            if high.any():
+                arr[high] = hi
+                changed = True
+        if needs_assign or changed:
+            X[col] = arr
     return X
+
+
+def _clipped_column_values(X: pd.DataFrame, col: str, clip_ranges: dict) -> np.ndarray:
+    """Return one clipped column as float values without copying the full DataFrame."""
+    arr = X[col].to_numpy(copy=True)
+    mask = arr < -990
+    valid = ~mask
+    if not valid.any():
+        return arr.astype(float, copy=False)
+    lo, hi = clip_ranges.get(col, (None, None))
+    if lo is not None:
+        arr[valid & (arr < lo)] = lo
+    if hi is not None:
+        arr[valid & (arr > hi)] = hi
+    return arr.astype(float, copy=False)
 
 
 # -------------------- Input branch distribution plots --------------------
@@ -695,9 +827,6 @@ def plot_branch_distributions(output_root, branches, clip_ranges,
     out_dir = os.path.join(output_root, "branches")
     os.makedirs(out_dir, exist_ok=True)
 
-    X_train_c = _clip_only_X(X_train[list(branches)], clip_ranges)
-    X_test_c = _clip_only_X(X_test[list(branches)], clip_ranges)
-
     y_all = np.concatenate([np.asarray(y_train, dtype=int),
                             np.asarray(y_test, dtype=int)])
     w_all = np.concatenate([np.asarray(w_train, dtype=float),
@@ -714,8 +843,8 @@ def plot_branch_distributions(output_root, branches, clip_ranges,
 
     for col in branches:
         v_all = np.concatenate([
-            X_train_c[col].to_numpy(dtype=float, copy=False),
-            X_test_c[col].to_numpy(dtype=float, copy=False),
+            _clipped_column_values(X_train, col, clip_ranges),
+            _clipped_column_values(X_test, col, clip_ranges),
         ])
         valid = v_all > -990
         if not np.any(valid):
@@ -1702,6 +1831,8 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     else:
         train_decor_state = {"mode": "none"}
         test_decor_state = {"mode": "none"}
+    del Z_train, Z_test
+    gc.collect()
 
     # ---------- Stage 1: native cls-only ----------
     stage1_params = dict(base_params)
@@ -1908,19 +2039,18 @@ def _torch_state_copy(model):
 
 def _torch_predict_logits_numpy(torch, model, device, X_np, batch_size):
     model.eval()
-    parts = []
+    out = np.empty((X_np.shape[0], NUM_CLASSES), dtype=np.float32)
     batch_size = max(1, int(batch_size))
     with torch.no_grad():
         for start in range(0, X_np.shape[0], batch_size):
+            end = min(start + batch_size, X_np.shape[0])
             xb = torch.as_tensor(
-                X_np[start:start + batch_size],
+                X_np[start:end],
                 dtype=torch.float32,
                 device=device,
             )
-            parts.append(model(xb).detach().cpu().numpy())
-    if not parts:
-        return np.zeros((0, NUM_CLASSES), dtype=float)
-    return np.concatenate(parts, axis=0)
+            out[start:end] = model(xb).detach().cpu().numpy()
+    return out
 
 
 def _nn_build_decor_edges(torch, Z_train, device):
@@ -3026,6 +3156,25 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         X_ref, y_ref, w_ref = _subset_for_permutation_importance(Xlike, labels, weights)
         if len(y_ref) == 0:
             return np.zeros(Xlike.shape[1], dtype=float)
+        if isinstance(model, TorchModelHandle):
+            X_perm = (
+                X_ref.to_numpy(dtype=np.float32, copy=True)
+                if hasattr(X_ref, "to_numpy")
+                else np.asarray(X_ref, dtype=np.float32).copy()
+            )
+            baseline = _classification_loss_from_probs(_predict_proba(model, X_perm), y_ref, w_ref)
+            importances = []
+            rng = np.random.default_rng(int(RANDOM_STATE) + 17)
+            for col_idx in range(X_perm.shape[1]):
+                values = X_perm[:, col_idx].copy()
+                shuffled = values.copy()
+                rng.shuffle(shuffled)
+                X_perm[:, col_idx] = shuffled
+                loss = _classification_loss_from_probs(_predict_proba(model, X_perm), y_ref, w_ref)
+                importances.append(max(0.0, float(loss - baseline)))
+                X_perm[:, col_idx] = values
+            return np.asarray(importances, dtype=float)
+
         baseline = _classification_loss_from_probs(_predict_proba(model, X_ref), y_ref, w_ref)
         importances = []
         rng = np.random.default_rng(int(RANDOM_STATE) + 17)
@@ -3049,9 +3198,14 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             return
         probs_train = _predict_proba(model, X_train_eval_used)
         probs_test = _predict_proba(model, X_test_eval_used)
-        probs_test_decor = _predict_proba(model, X_test_decor_used)
-        margins_train_decor = _predict_margins(model, X_train_decor_used)
-        margins_test_decor = _predict_margins(model, X_test_decor_used)
+        probs_test_decor = (
+            _predict_proba(model, X_test_decor_used)
+            if decorrelate_feature_names else None
+        )
+        margins_train_decor = margins_test_decor = None
+        if decor_idx_full:
+            margins_train_decor = _predict_margins(model, X_train_decor_used)
+            margins_test_decor = _predict_margins(model, X_test_decor_used)
         booster = _booster_from_model(model)
 
         # ROC plots
@@ -3286,7 +3440,11 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         _plot_loss_metric("total", "total_loss", "loss_total")
     _plot_loss_metric("decorrelation", "decorrelation_loss", "loss_decorrelation")
 
-    X_tr_df = pd.DataFrame(_as_array(X_train_eval_used), columns=feat_names_used)
+    X_tr_df = (
+        X_train_eval_used
+        if isinstance(X_train_eval_used, pd.DataFrame)
+        else pd.DataFrame(_as_array(X_train_eval_used), columns=feat_names_used)
+    )
     corr = X_tr_df.corr(numeric_only=True).dropna(axis=0, how="all").dropna(axis=1, how="all")
     if not corr.empty:
         _plot_matrix_heatmap(
@@ -3321,11 +3479,15 @@ def _split_mass_thresholds(thresholds):
     mass_thresholds = {}
     other_thresholds = {}
     for name, cond in thresholds.items():
-        if str(name).startswith("ScoutingFatPFJetRecluster_msoftdrop_"):
+        if _is_msoftdrop_branch(name):
             mass_thresholds[name] = cond
         else:
             other_thresholds[name] = cond
     return mass_thresholds, other_thresholds
+
+
+def _is_msoftdrop_branch(name):
+    return str(name).startswith("ScoutingFatPFJetRecluster_msoftdrop_")
 
 
 def _split_training_thresholds(thresholds, decorrelate_feature_names):
@@ -3333,25 +3495,27 @@ def _split_training_thresholds(thresholds, decorrelate_feature_names):
         str(name) for name in decorrelate_feature_names
         if not isinstance(name, (int, np.integer)) and str(name) in thresholds
     }
-    training_thresholds = {
-        name: cond for name, cond in thresholds.items()
-        if name not in decor_threshold_names
-    }
-    decor_thresholds = {
-        name: cond for name, cond in thresholds.items()
-        if name in decor_threshold_names
-    }
-    return training_thresholds, decor_thresholds
+    training_thresholds = {}
+    decor_thresholds = {}
+    decor_training_overrides = {}
+    for name, cond in thresholds.items():
+        if name not in decor_threshold_names:
+            training_thresholds[name] = cond
+            continue
+        decor_thresholds[name] = cond
+        if _is_msoftdrop_branch(name):
+            decor_training_overrides[name] = (0.0, DECOR_MSOFTDROP_TRAINING_MAX)
+            training_thresholds[name] = decor_training_overrides[name]
+    return training_thresholds, decor_thresholds, decor_training_overrides
 
 
 def _drop_decorrelated_features(X, decorrelate_feature_names):
     if not decorrelate_feature_names:
-        return X.copy()
-    X_out = X.copy()
-    drop_cols = [name for name in decorrelate_feature_names if name in X_out.columns]
+        return X
+    drop_cols = [name for name in decorrelate_feature_names if name in X.columns]
     if drop_cols:
-        X_out = X_out.drop(columns=drop_cols)
-    return X_out
+        return X.drop(columns=drop_cols)
+    return X
 
 
 def _write_prediction_reference(
@@ -3399,7 +3563,9 @@ def main():
         thresholds = {k: (tuple(v) if isinstance(v, list) else v)
                       for k, v in sel.get("thresholds", {}).items()}
         decorrelate = cfg.get(tree_name, {}).get("decorrelate", [])
-        training_thresholds, decor_thresholds = _split_training_thresholds(thresholds, decorrelate)
+        training_thresholds, decor_thresholds, decor_training_overrides = _split_training_thresholds(
+            thresholds, decorrelate
+        )
         model_path = MODEL_PATTERN.format(output_root=output_root, tree_name=tree_name)
 
         # Threshold and decorrelate branches that are NOT declared in branch.json
@@ -3418,10 +3584,36 @@ def main():
             f"Running train.py for tree = {tree_name}, output = {output_root}, "
             f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
         )
-        if decor_thresholds:
+        training_weight_scales = _qcd_ht_training_weight_scales(tree_name)
+        if training_weight_scales:
+            formatted_scales = ", ".join(
+                f"{sample_name}={scale:.6g}"
+                for sample_name, scale in sorted(
+                    training_weight_scales.items(),
+                    key=lambda item: _qcd_ht_sort_key(item[0]),
+                )
+            )
+            log_message(
+                f"QCD HT training weight scales for tree = {tree_name}: {formatted_scales}"
+            )
+        omitted_decor_thresholds = [
+            name for name in decor_thresholds.keys()
+            if name not in decor_training_overrides
+        ]
+        if omitted_decor_thresholds:
             log_message(
                 f"Training threshold override for tree = {tree_name}: excluding decorrelate "
-                f"threshold(s) from training/eval loss only: {', '.join(decor_thresholds.keys())}"
+                f"threshold(s) from training/eval loss only: {', '.join(omitted_decor_thresholds)}"
+            )
+        if decor_training_overrides:
+            formatted_overrides = [
+                f"{name}=(0, {upper:g})"
+                for name, (_lower, upper) in decor_training_overrides.items()
+            ]
+            log_message(
+                f"Training threshold override for tree = {tree_name}: using loose "
+                f"decorrelate msoftdrop threshold(s) in training/eval loss only: "
+                f"{', '.join(formatted_overrides)}"
             )
         split_plans = build_split_plans(tree_name)
         write_config_copy(output_root)
@@ -3431,21 +3623,23 @@ def main():
 
         log_message(f"Loading training split for tree = {tree_name}")
         X_train, y_train, w_train, sample_labels_train, _ = prepare_split_data(
-            tree_name, load_cols, "train", split_plans, shuffle=True
+            tree_name, load_cols, "train", split_plans, shuffle=True,
+            training_weight_scales=training_weight_scales,
         )
         check_weights(w_train, f"{tree_name}_train_weight_before_filter")
 
         log_message(f"Loading test split for tree = {tree_name}")
         X_test, y_test, w_test, sample_labels_test, w_test_physics = prepare_split_data(
-            tree_name, load_cols, "test", split_plans, shuffle=False
+            tree_name, load_cols, "test", split_plans, shuffle=False,
+            training_weight_scales=training_weight_scales,
         )
         check_weights(w_test, f"{tree_name}_test_weight_before_filter")
         check_weights(w_test_physics, f"{tree_name}_test_physics_weight_before_filter")
-        X_test_unfiltered = X_test.copy()
-        y_test_unfiltered = y_test.copy()
-        w_test_unfiltered = w_test.copy()
-        w_test_physics_unfiltered = w_test_physics.copy()
-        sample_labels_test_unfiltered = np.asarray(sample_labels_test).copy()
+        X_test_unfiltered = X_test
+        y_test_unfiltered = y_test
+        w_test_physics_unfiltered = w_test_physics
+        sample_labels_test_unfiltered = np.asarray(sample_labels_test)
+        del w_test_physics
 
         log_message(f"Applying training thresholds for training split of tree = {tree_name}")
         X_train, y_train, w_train, sample_labels_train = filter_X(
@@ -3486,26 +3680,15 @@ def main():
             X_test, y_test, w_test, load_cols, training_thresholds, apply_to_sentinel=True,
             sample_labels=sample_labels_test
         )
-        X_test_eval, y_test_eval, w_test_eval, sample_labels_test_eval = filter_X(
+        X_test_eval, y_test_eval, w_test_eval, sample_labels_test_eval, test_eval_index = filter_X(
             X_test, y_test, w_test, load_cols, decor_thresholds, apply_to_sentinel=True,
-            sample_labels=sample_labels_test
+            sample_labels=sample_labels_test,
+            return_index=True,
         )
-        X_test_ref, y_test_ref, w_test_ref, sample_labels_test_ref = filter_X(
-            X_test_unfiltered.copy(),
-            y_test_unfiltered.copy(),
-            w_test_physics_unfiltered.copy(),
-            load_cols,
-            thresholds,
-            apply_to_sentinel=True,
-            sample_labels=sample_labels_test_unfiltered.copy(),
-        )
-        if not X_test_ref.index.equals(X_test_eval.index):
-            raise RuntimeError("Filtered evaluation/reference test splits are misaligned")
-        if (
-            not np.array_equal(y_test_ref, y_test_eval)
-            or not np.array_equal(sample_labels_test_ref, sample_labels_test_eval)
-        ):
-            raise RuntimeError("Filtered evaluation/reference test labels are misaligned")
+        test_eval_pos = np.asarray(test_eval_index, dtype=np.int64)
+        y_test_ref = y_test_eval.copy()
+        w_test_ref = w_test_physics_unfiltered[test_eval_pos].copy()
+        sample_labels_test_ref = np.asarray(sample_labels_test_eval).copy()
         _validate_filtered_split(
             tree_name,
             "test (training thresholds)",
@@ -3533,7 +3716,7 @@ def main():
 
         decor_plot_cols = [c for c in decorrelate if c in X_test.columns]
         X_test_decor_plot = (
-            _clip_only_X(X_test[decor_plot_cols].copy(), clip_ranges)
+            _clip_only_X(X_test[decor_plot_cols], clip_ranges)
             if decor_plot_cols else None
         )
 
@@ -3542,7 +3725,6 @@ def main():
             X_test = X_test.drop(columns=drop_after_filter, errors="ignore")
             X_train_eval = X_train_eval.drop(columns=drop_after_filter, errors="ignore")
             X_test_eval = X_test_eval.drop(columns=drop_after_filter, errors="ignore")
-            X_test_ref = X_test_ref.drop(columns=drop_after_filter, errors="ignore")
 
         log_message(f"Plotting input branch distributions for tree = {tree_name}")
         plot_branch_distributions(
@@ -3558,6 +3740,9 @@ def main():
         log_message(f"Standardising full-threshold evaluation splits for tree = {tree_name}")
         X_train_eval_std = standardize_X(X_train_eval.copy(), clip_ranges, log_tf)
         X_test_eval_std = standardize_X(X_test_eval.copy(), clip_ranges, log_tf)
+        del X_train, X_test, X_train_eval, X_test_eval
+        del sample_labels_train, sample_labels_test, sample_labels_train_eval, sample_labels_test_eval
+        gc.collect()
 
         log_message(f"Training model for tree = {tree_name}")
         if MODEL_TYPE == "nn":
@@ -3591,6 +3776,7 @@ def main():
             proba_qcd_full_test,
         )
         del X_test_qcd_full_model, proba_qcd_full_test
+        gc.collect()
 
         X_test_signal_model = _drop_decorrelated_features(X_test_eval_std, decorrelate)
         proba_signal_test = _predict_proba(final_model, X_test_signal_model)
@@ -3605,32 +3791,22 @@ def main():
             w_test_ref,
             proba_signal_test,
         )
+        del X_test_signal_model, proba_signal_test
 
         mass_thresholds, bdt_thresholds = _split_mass_thresholds(thresholds)
         log_message(
             f"Preparing qcd_est reference for tree = {tree_name}: "
             f"non_mass_thresholds={len(bdt_thresholds)}, mass_thresholds={len(mass_thresholds)}"
         )
-        X_test_qcd_raw, y_test_qcd, w_test_qcd, sample_labels_test_qcd = filter_X(
+        X_test_qcd_raw, y_test_qcd_ref, w_test_qcd_ref, sample_labels_test_qcd_ref = filter_X(
             X_test_unfiltered,
             y_test_unfiltered,
-            w_test_unfiltered,
+            w_test_physics_unfiltered,
             load_cols,
             bdt_thresholds,
             apply_to_sentinel=True,
             sample_labels=sample_labels_test_unfiltered,
         )
-        X_test_qcd_ref, y_test_qcd_ref, w_test_qcd_ref, sample_labels_test_qcd_ref = filter_X(
-            X_test_unfiltered.copy(),
-            y_test_unfiltered.copy(),
-            w_test_physics_unfiltered.copy(),
-            load_cols,
-            bdt_thresholds,
-            apply_to_sentinel=True,
-            sample_labels=sample_labels_test_unfiltered.copy(),
-        )
-        if not X_test_qcd_ref.index.equals(X_test_qcd_raw.index):
-            raise RuntimeError("Filtered qcd_est model/reference test splits are misaligned")
         X_test_qcd_model = standardize_X(X_test_qcd_raw[branches].copy(), clip_ranges, log_tf)
         X_test_qcd_model = _drop_decorrelated_features(X_test_qcd_model, decorrelate)
         proba_qcd_test = _predict_proba(final_model, X_test_qcd_model)
@@ -3645,6 +3821,11 @@ def main():
             w_test_qcd_ref,
             proba_qcd_test,
         )
+        del X_test_qcd_raw, X_test_qcd_model, proba_qcd_test
+        del y_test_ref, w_test_ref, sample_labels_test_ref
+        del y_test_qcd_ref, w_test_qcd_ref, sample_labels_test_qcd_ref
+        del X_test_unfiltered, y_test_unfiltered, w_test_physics_unfiltered, sample_labels_test_unfiltered
+        gc.collect()
 
         log_message(f"Plotting results for tree = {tree_name}")
         plot_results(

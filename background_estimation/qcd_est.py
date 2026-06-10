@@ -138,41 +138,63 @@ NUM_CLASSES = len(CLASS_NAMES)
 DEFAULT_AXIS_NAMES = CLASS_NAMES[: max(1, NUM_CLASSES - 1)]
 
 
-def _resolve_abcd_branch_names(config: dict, tree_name: str) -> List[str]:
-    if "abcd_branches" not in config:
-        raise RuntimeError(
-            "background_estimation config missing required 'abcd_branches' mapping"
-        )
-    payload = config["abcd_branches"]
+def _resolve_tree_branch_names(
+    config: dict,
+    tree_name: str,
+    key: str,
+    required: bool = False,
+) -> List[str]:
+    if key not in config:
+        if required:
+            raise RuntimeError(
+                f"background_estimation config missing required '{key}' mapping"
+            )
+        return []
+    payload = config[key]
     if not isinstance(payload, dict):
-        raise TypeError("background_estimation config 'abcd_branches' must be a dict")
+        raise TypeError(f"background_estimation config '{key}' must be a dict")
     if tree_name not in payload:
-        raise RuntimeError(
-            f"background_estimation config 'abcd_branches' missing tree '{tree_name}'"
-        )
+        if required:
+            raise RuntimeError(
+                f"background_estimation config '{key}' missing tree '{tree_name}'"
+            )
+        return []
     value = payload[tree_name]
     if isinstance(value, str):
         names = [value]
     elif isinstance(value, list):
         names = value
     else:
-        raise TypeError(f"abcd_branches['{tree_name}'] must be a string or list")
+        raise TypeError(f"{key}['{tree_name}'] must be a string or list")
 
     out = []
     seen = set()
     for item in names:
         if not isinstance(item, str) or not item:
-            raise TypeError(f"abcd_branches['{tree_name}'] entries must be non-empty strings")
+            raise TypeError(f"{key}['{tree_name}'] entries must be non-empty strings")
         if item in seen:
             continue
         seen.add(item)
         out.append(item)
-    if not out:
-        raise RuntimeError(f"abcd_branches['{tree_name}'] must not be empty")
+    if required and not out:
+        raise RuntimeError(
+            f"{key}['{tree_name}'] must not be empty"
+        )
     return out
 
 
-ABCD_BRANCH_NAMES = _resolve_abcd_branch_names(qcd_cfg, TREE_NAME)
+ABCD_BRANCH_NAMES = _resolve_tree_branch_names(
+    qcd_cfg,
+    TREE_NAME,
+    "abcd_branches",
+    required=True,
+)
+A_REGION_SHAPE_BRANCHES = _resolve_tree_branch_names(
+    qcd_cfg,
+    TREE_NAME,
+    "a_region_shape_branches",
+    required=False,
+)
 
 QCD_CLASS_NAMES = [class_name for class_name in CLASS_NAMES if "qcd" in class_name.lower()]
 if not QCD_CLASS_NAMES:
@@ -862,6 +884,109 @@ def plot_signal_region_prediction(
     log_message(f"Wrote plot file: {out_path}")
 
 
+def plot_a_region_branch_shapes(
+    X_raw: pd.DataFrame,
+    group_labels: np.ndarray,
+    weights: np.ndarray,
+    branch_names: List[str],
+    region_masks: List[np.ndarray],
+    region_labels: List[str],
+    a_union_mask: np.ndarray,
+    out_dir: str,
+    n_bins: int = 50,
+) -> None:
+    if not branch_names:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    color_map = _group_color_map()
+    plot_regions = list(zip(region_labels, region_masks)) + [("A union", a_union_mask)]
+    group_labels = np.asarray(group_labels, dtype=object)
+    weights = np.asarray(weights, dtype=float)
+
+    log_message(
+        f"Plotting A-region branch shapes: branches={len(branch_names)}, "
+        f"regions_per_branch={len(plot_regions)}"
+    )
+    for branch in branch_names:
+        if branch not in X_raw.columns:
+            raise KeyError(f"A-region shape branch {branch!r} not found in loaded data")
+
+        values = X_raw[branch].to_numpy(dtype=float, copy=False)
+        valid = np.isfinite(values) & (values > -10.0)
+        edge_values = values[valid & a_union_mask]
+        if edge_values.size == 0:
+            log_warning(
+                f"A-region shape branch '{branch}' has no valid A-union entries "
+                "above -10; skipping"
+            )
+            continue
+
+        lo = max(-10.0, float(np.min(edge_values)))
+        hi = float(np.max(edge_values))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            log_warning(f"A-region shape branch '{branch}' has non-finite range; skipping")
+            continue
+        if lo >= hi:
+            pad = max(1.0, abs(lo) * 0.05)
+            lo = max(-10.0, lo - 0.5 * pad)
+            hi += 0.5 * pad
+            log_warning(
+                f"A-region shape branch '{branch}' has degenerate range; "
+                f"using [{lo:.6g}, {hi:.6g}]"
+            )
+
+        edges = np.linspace(lo, hi, int(n_bins) + 1)
+        branch_file = _slugify(branch) or "branch"
+
+        for region_label, region_mask in plot_regions:
+            fig, ax = plt.subplots(figsize=(8.5, 6.5))
+            plotted_any = False
+            for group_name in CLASS_NAMES:
+                mask = valid & region_mask & (group_labels == group_name)
+                if not np.any(mask):
+                    continue
+                group_weights = weights[mask]
+                if float(np.sum(group_weights)) <= 0.0:
+                    continue
+                ax.hist(
+                    values[mask],
+                    bins=edges,
+                    weights=group_weights,
+                    density=True,
+                    histtype="step",
+                    linewidth=2,
+                    color=color_map[group_name],
+                    label=group_name,
+                )
+                plotted_any = True
+
+            if not plotted_any:
+                plt.close(fig)
+                log_warning(
+                    f"A-region shape branch '{branch}' has no positive-weight "
+                    f"entries in {region_label}; skipping"
+                )
+                continue
+
+            ax.set_xlim(lo, hi)
+            ax.set_xlabel(branch, fontsize=18)
+            ax.set_ylabel("A.U.", fontsize=22)
+            ax.set_title(region_label, fontsize=18)
+            hep.cms.label("Preliminary", data=False, com=13.6, year="2024", ax=ax)
+            ax.legend(loc="best", fontsize=12, frameon=False, ncol=2)
+            fig.tight_layout()
+
+            region_file = _slugify(region_label) or "region"
+            out_path = os.path.join(
+                out_dir,
+                f"a_region_shape_{branch_file}_{region_file}.pdf",
+            )
+            fig.savefig(out_path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            log_message(f"Wrote plot file: {out_path}")
+
+
 def write_root_output(
     root_path: str,
     edges: np.ndarray,
@@ -994,10 +1119,16 @@ def main() -> None:
 
     log_message("Loading signal region file")
     # Load every branch needed downstream: model features (model_branches), all
-    # threshold branches (for filter_X and the ABCD pass/fail masks), and every
+    # threshold branches (for filter_X and the ABCD pass/fail masks), every
     # decorrelate branch (in case decorrelation references a branch not in
-    # branch.json). Model inference still uses only model_branches.
-    load_branches = sorted(set(model_branches) | set(thresholds.keys()) | set(decorrelate))
+    # branch.json), and the optional A-region shape branches. Model inference
+    # still uses only model_branches.
+    load_branches = sorted(
+        set(model_branches)
+        | set(thresholds.keys())
+        | set(decorrelate)
+        | set(A_REGION_SHAPE_BRANCHES)
+    )
     signal_regions, axis_names = _load_signal_regions()
     region_labels = [f"SR{int(idx)}" for idx in signal_regions["bin_index"].tolist()]
     edges = np.arange(len(region_labels) + 1, dtype=float)
@@ -1005,7 +1136,8 @@ def main() -> None:
         f"Resolved inputs: model_branches={len(model_branches)}, "
         f"load_branches={len(load_branches)}, signal_regions={len(region_labels)}, "
         f"score_axes={axis_names}, non_abcd_thresholds={len(bdt_thresholds)}, "
-        f"abcd_thresholds={list(abcd_thresholds)}"
+        f"abcd_thresholds={list(abcd_thresholds)}, "
+        f"a_region_shape_branches={A_REGION_SHAPE_BRANCHES}"
     )
     log_message(
         "QCD classes for ABCD merge: "
@@ -1351,6 +1483,16 @@ def main() -> None:
         os.path.join(OUTPUT_DIR, "qcd_abcd_signal_regions_qcd.pdf"),
         [QCD_PREDICT_GROUP_NAME],
         "QCD Events",
+    )
+    plot_a_region_branch_shapes(
+        X_raw,
+        group_labels,
+        weights,
+        A_REGION_SHAPE_BRANCHES,
+        region_a_masks,
+        region_labels,
+        a_union_mask,
+        os.path.join(OUTPUT_DIR, "a_region_shapes"),
     )
 
     log_message("Finished qcd_est.py")

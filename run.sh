@@ -287,7 +287,6 @@ PY
   return 0
 }
 
->>>>>>> e27d6b34da34796aef7c40ebe7fe3596ae8106ef
 cd "${WORK_DIR}"
 : > "${LOG_PATH}"
 exec >> "${LOG_PATH}" 2>&1
@@ -356,6 +355,7 @@ fi
 
 ROOT_CFLAGS="$(root-config --cflags)"
 ROOT_LIBS="$(root-config --libs)"
+ROOT_LIBDIR="$(root-config --libdir)"
 COMPILE_CMD="c++ -O3 -DNDEBUG -std=c++17 ${ROOT_CFLAGS} ${OMP_CFLAGS} ./${SOURCE_FILE} -o ${BIN_PATH} ${ROOT_LIBS} ${OMP_LDFLAGS}"
 echo "[$(timestamp)] compile: ${COMPILE_CMD}"
 eval "${COMPILE_CMD}"
@@ -472,19 +472,6 @@ reap_finished_jobs() {
   fi
 }
 
-reap_finished_jobs() {
-  if $USE_SLURM; then
-    reap_finished_jobs_slurm
-  else
-    reap_finished_jobs_local
-  fi
-}
-
-reap_finished_jobs_local() {
-  # rename of your existing reap_finished_jobs body — no changes needed
-  ...
-}
-
 reap_finished_jobs_slurm() {
   local new_pids=() new_samples=()
   local idx job_id sample state finished_any=0
@@ -573,7 +560,7 @@ launch_job() {
 
     local job_id
     job_id=$(sbatch "${sbatch_args[@]}" \
-      --wrap="export X509_USER_PROXY=${X509_DST}; env ${CONFIG_ENV_VAR}=${CONFIG_PATH} ${BIN_PATH} ${sample}" \
+      --wrap="export X509_USER_PROXY=${X509_DST}; export LD_LIBRARY_PATH=${ROOT_LIBDIR}:\${LD_LIBRARY_PATH:-}; env ${CONFIG_ENV_VAR}=${CONFIG_PATH} ${BIN_PATH} ${sample}" \
       | awk '{print $NF}')
 
     # Reuse the same pid-tracking arrays — store job_id in place of pid
@@ -581,7 +568,47 @@ launch_job() {
     RUNNING_SAMPLES+=("${sample}")
     echo "[$(timestamp)] submitted sample=${sample} slurm_job_id=${job_id}"
   else
-    nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &
+    if [ "${MODE}" = "0" ]; then
+      (
+        set -e
+        batch_count="$(env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" --batch-count)"
+        if [[ ! "${batch_count}" =~ ^[0-9]+$ ]] || [ "${batch_count}" -le 0 ]; then
+          echo "Invalid convert batch count for sample=${sample}: ${batch_count}" >&2
+          exit 1
+        fi
+        batch_failures=0
+        successful_batches=""
+        for ((batch_index = 0; batch_index < batch_count; batch_index++)); do
+          echo "[$(timestamp)] running sample=${sample} batch=$((batch_index + 1))/${batch_count}"
+          set +e
+          env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
+            "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
+            "CONVERT_DEFER_FINAL_MERGE=1" \
+            "${BIN_PATH}" "${sample}" "${batch_index}"
+          batch_status=$?
+          set -e
+          if [ "${batch_status}" -ne 0 ]; then
+            batch_failures=$((batch_failures + 1))
+            echo "[$(timestamp)] warning: sample=${sample} batch=$((batch_index + 1))/${batch_count} failed status=${batch_status}; continuing"
+            continue
+          fi
+          if [ -z "${successful_batches}" ]; then
+            successful_batches="${batch_index}"
+          else
+            successful_batches="${successful_batches},${batch_index}"
+          fi
+        done
+        if [ "${batch_failures}" -gt 0 ]; then
+          echo "[$(timestamp)] warning: sample=${sample} completed with ${batch_failures}/${batch_count} failed batch(es); final output uses successful batches only"
+        fi
+        echo "[$(timestamp)] running sample=${sample} final merge from successful batches"
+        env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
+          "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
+          "${BIN_PATH}" "${sample}" --merge-successful-batches
+      ) &
+    else
+      nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &
+    fi
     local pid=$!
     RUNNING_PIDS+=("${pid}")
     RUNNING_SAMPLES+=("${sample}")
@@ -589,15 +616,15 @@ launch_job() {
   fi
 }
 
-  if $USE_SLURM; then
-    # Submit all jobs at once — SLURM handles scheduling
-    for sample in "${samples[@]}"; do
-      launch_job "${sample}"
-    done
-    echo "[$(timestamp)] all jobs submitted to SLURM"
-  else
-    for sample in "${samples[@]}"; do
-      while [ "${#RUNNING_PIDS[@]}" -ge "${MAX_CONCURRENT_JOBS}" ]; do
+if $USE_SLURM; then
+  # Submit all jobs at once — SLURM handles scheduling
+  for sample in "${samples[@]}"; do
+    launch_job "${sample}"
+  done
+  echo "[$(timestamp)] all jobs submitted to SLURM"
+else
+  for sample in "${samples[@]}"; do
+    while [ "${#RUNNING_PIDS[@]}" -ge "${MAX_CONCURRENT_JOBS}" ]; do
       if ! reap_finished_jobs; then
         sleep 2
       fi
