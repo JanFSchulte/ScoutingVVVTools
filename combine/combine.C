@@ -121,6 +121,22 @@ std::string shellQuote(const std::string& s) {
     return out;
 }
 
+// -------------------- Theory uncertainty structs --------------------
+struct TheoryFrac {
+    double nom_sum   = 0.0;
+    double pdf_up    = 1.0, pdf_down    = 1.0;
+    double scale_up  = 1.0, scale_down  = 1.0;
+    double ps_isr_up = 1.0, ps_isr_down = 1.0;
+    double ps_fsr_up = 1.0, ps_fsr_down = 1.0;
+};
+
+// Per-systematic pair of (up_ratio, down_ratio) for a given process in one channel.
+struct TheoryLnN {
+    double up   = 1.0;
+    double down = 1.0;
+    bool active = false;
+};
+
 // -------------------- Config --------------------
 struct ChannelSpec {
     std::string name;
@@ -138,6 +154,9 @@ struct AppConfig {
     bool rescale_shape_modes_to_positive = true;
     bool keep_work = true;
     std::string work_dir;  // resolved under output_dir
+    // Optional path to theory_syst_yields.json (output of mode 8).
+    // {sample_name -> {channel_name -> TheoryFrac}}
+    std::map<std::string, std::map<std::string, TheoryFrac>> theory_fracs;
 };
 
 AppConfig loadAppConfig() {
@@ -174,8 +193,39 @@ AppConfig loadAppConfig() {
     cfg.rescale_shape_modes_to_positive =
         payload.getBoolOr("rescale_shape_modes_to_positive", true);
     cfg.keep_work = payload.getBoolOr("keep_work", true);
-
     cfg.work_dir = (fs::path(cfg.output_dir) / "work").string();
+
+    // Optional theory syst yields (produced by mode 8 / theory_syst.py).
+    if (payload.contains("theory_syst_json")) {
+        const std::string theory_path = resolveReferencedPath(
+            abs, payload.at("theory_syst_json").asString());
+        if (fs::exists(theory_path)) {
+            const JsonValue tj = simple_json::parseFile(theory_path);
+            for (const auto& sample_kv : tj.asObject()) {
+                const std::string& sname = sample_kv.first;
+                for (const auto& tree_kv : sample_kv.second.asObject()) {
+                    const std::string& tname = tree_kv.first;
+                    const JsonValue& v = tree_kv.second;
+                    TheoryFrac tf;
+                    tf.nom_sum    = static_cast<double>(v.getNumberOr("nom_sum",    0.L));
+                    tf.pdf_up     = static_cast<double>(v.getNumberOr("pdf_up",     1.L));
+                    tf.pdf_down   = static_cast<double>(v.getNumberOr("pdf_down",   1.L));
+                    tf.scale_up   = static_cast<double>(v.getNumberOr("scale_up",   1.L));
+                    tf.scale_down = static_cast<double>(v.getNumberOr("scale_down", 1.L));
+                    tf.ps_isr_up  = static_cast<double>(v.getNumberOr("ps_isr_up",  1.L));
+                    tf.ps_isr_down= static_cast<double>(v.getNumberOr("ps_isr_down",1.L));
+                    tf.ps_fsr_up  = static_cast<double>(v.getNumberOr("ps_fsr_up",  1.L));
+                    tf.ps_fsr_down= static_cast<double>(v.getNumberOr("ps_fsr_down",1.L));
+                    cfg.theory_fracs[sname][tname] = tf;
+                }
+            }
+            logMessage("Loaded theory syst yields: " + theory_path);
+        } else {
+            logMessage("WARNING: theory_syst_json not found at " + theory_path +
+                       "; run mode 8 before combine to include theory nuisances");
+        }
+    }
+
     return cfg;
 }
 
@@ -1104,8 +1154,173 @@ void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
     delete f;
 }
 
+// -------------------- Theory lnN helpers --------------------
+
+// Compute nom_sum-weighted up/down ratio for a given systematic field
+// across all samples in a class that have theory fracs loaded.
+// Returns {up_ratio, down_ratio, active} where active=true iff at least one
+// sample contributed.
+TheoryLnN classTheoryLnN(
+    const std::string& class_name,
+    const std::string& channel_name,
+    double TheoryFrac::*up_field,
+    double TheoryFrac::*dn_field,
+    const ClassRegistry& reg,
+    const std::map<std::string, std::map<std::string, TheoryFrac>>& fracs)
+{
+    auto class_it = reg.class_members.find(class_name);
+    if (class_it == reg.class_members.end()) return {};
+
+    double nom_total = 0.0, up_total = 0.0, dn_total = 0.0;
+    for (const auto& sname : class_it->second) {
+        auto s_it = fracs.find(sname);
+        if (s_it == fracs.end()) continue;
+        auto t_it = s_it->second.find(channel_name);
+        if (t_it == s_it->second.end()) continue;
+        const TheoryFrac& tf = t_it->second;
+        if (tf.nom_sum <= 0.0) continue;
+        nom_total += tf.nom_sum;
+        up_total  += tf.nom_sum * (tf.*up_field);
+        dn_total  += tf.nom_sum * (tf.*dn_field);
+    }
+    if (nom_total <= 0.0) return {};
+    TheoryLnN r;
+    r.up     = up_total  / nom_total;
+    r.down   = dn_total  / nom_total;
+    r.active = true;
+    return r;
+}
+
+// Determine the class name corresponding to a process name in a scenario.
+// Process names follow the convention: "signal" -> aggregated signal classes,
+// "bkg_<slug>" -> background class with that slug.  Returns "" if unmappable.
+std::string processNameToClass(
+    const std::string& proc_name,
+    const ClassRegistry& reg,
+    const Scenario& sc)
+{
+    if (proc_name == "bkg_qcd") return "";  // QCD: from ABCD, no theory weights
+    if (proc_name.substr(0, 4) == "bkg_") {
+        const std::string slug_want = proc_name.substr(4);
+        for (const auto& cls : reg.class_order) {
+            if (slugify(cls) == slug_want) return cls;
+        }
+        return "";
+    }
+    if (proc_name == "signal") {
+        // For group-mode combined, the signal is a merge; return "*combined*" as
+        // a sentinel — the caller must handle this specially by summing classes.
+        if (sc.scope == "combined") return "*combined*";
+        if (sc.scope == "class") return sc.name;
+        // sample scope: signal_sample_name; return first signal class containing it.
+        if (!sc.signal_samples.empty()) {
+            const auto& s = *sc.signal_samples.begin();
+            auto it = reg.sample_to_class.find(s);
+            if (it != reg.sample_to_class.end()) return it->second;
+        }
+    }
+    return "";
+}
+
+// Write all theory lnN nuisance rows.  Each row covers one process per SR per channel.
+// The format is one row per systematic (pdf, scale, ps_isr, ps_fsr); the nuisance name
+// is global so it is correlated across channels.
+void writeTheoryLnN(
+    std::ofstream& ofs,
+    const AppConfig& cfg,
+    const PerChannelCard& pc,
+    const ClassRegistry& reg,
+    const Scenario& sc)
+{
+    if (cfg.theory_fracs.empty()) return;
+
+    struct SystDef {
+        const char* name;
+        double TheoryFrac::*up;
+        double TheoryFrac::*dn;
+    };
+    const SystDef systs[] = {
+        {"theory_pdf",    &TheoryFrac::pdf_up,     &TheoryFrac::pdf_down    },
+        {"theory_scale",  &TheoryFrac::scale_up,   &TheoryFrac::scale_down  },
+        {"theory_ps_isr", &TheoryFrac::ps_isr_up,  &TheoryFrac::ps_isr_down },
+        {"theory_ps_fsr", &TheoryFrac::ps_fsr_up,  &TheoryFrac::ps_fsr_down },
+    };
+
+    for (const auto& syst : systs) {
+        // Check if any process has a non-trivial lnN for this systematic.
+        bool any_active = false;
+        std::vector<TheoryLnN> proc_lnN(pc.processes.size());
+
+        for (size_t p = 0; p < pc.processes.size(); ++p) {
+            const std::string& pname = pc.processes[p].name;
+            std::string cls = processNameToClass(pname, reg, sc);
+            if (cls.empty()) continue;
+
+            if (cls == "*combined*") {
+                // Sum contributions from all signal classes.
+                double nom_total = 0.0, up_total = 0.0, dn_total = 0.0;
+                for (const auto& sig_cls : reg.class_order) {
+                    if (!reg.signal_classes.count(sig_cls)) continue;
+                    TheoryLnN r = classTheoryLnN(
+                        sig_cls, pc.name, syst.up, syst.dn, reg, cfg.theory_fracs);
+                    if (!r.active) continue;
+                    // Recover weighted nom_sum proxy from per-sample data.
+                    double cls_nom = 0.0;
+                    auto cls_it = reg.class_members.find(sig_cls);
+                    if (cls_it != reg.class_members.end()) {
+                        for (const auto& sname : cls_it->second) {
+                            auto s_it = cfg.theory_fracs.find(sname);
+                            if (s_it == cfg.theory_fracs.end()) continue;
+                            auto t_it = s_it->second.find(pc.name);
+                            if (t_it == s_it->second.end()) continue;
+                            cls_nom += t_it->second.nom_sum;
+                        }
+                    }
+                    nom_total += cls_nom;
+                    up_total  += cls_nom * r.up;
+                    dn_total  += cls_nom * r.down;
+                }
+                if (nom_total > 0.0) {
+                    proc_lnN[p].up   = up_total  / nom_total;
+                    proc_lnN[p].down = dn_total  / nom_total;
+                    proc_lnN[p].active = true;
+                    any_active = true;
+                }
+            } else {
+                TheoryLnN r = classTheoryLnN(
+                    cls, pc.name, syst.up, syst.dn, reg, cfg.theory_fracs);
+                if (r.active) {
+                    proc_lnN[p] = r;
+                    any_active = true;
+                }
+            }
+        }
+
+        if (!any_active) continue;
+
+        // Write the lnN row.  Format: "syst_name  lnN  val11 val12 ... val1N  val21 ..."
+        // where valSR_proc is "-" when inactive or "up/down" when asymmetric.
+        ofs << syst.name << " lnN";
+        for (int sr = 0; sr < pc.n_sr; ++sr) {
+            for (size_t p = 0; p < pc.processes.size(); ++p) {
+                const TheoryLnN& lnN = proc_lnN[p];
+                if (!lnN.active) {
+                    ofs << " -";
+                } else {
+                    std::ostringstream val;
+                    val << std::setprecision(6) << std::fixed;
+                    val << lnN.up << "/" << lnN.down;
+                    ofs << " " << val.str();
+                }
+            }
+        }
+        ofs << "\n";
+    }
+}
+
 void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
-                          const std::string& shape_file) {
+                          const std::string& shape_file,
+                          const ClassRegistry& reg, const Scenario& sc) {
     std::ofstream ofs(pc.datacard_path);
     if (!ofs) {
         throw std::runtime_error("Cannot write datacard: " + pc.datacard_path);
@@ -1168,25 +1383,27 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
     ofs << "\n";
     ofs << "----------\n";
 
-    if (!use_shapes) return;
-
-    // Shape nuisances: one correlated row per process eigenmode. The row is
-    // active for that process in every SR and inactive for all other processes.
-    for (size_t p = 0; p < pc.processes.size(); ++p) {
-        const auto& proc = pc.processes[p];
-        for (size_t k = 0; k < pc.modes[p].size(); ++k) {
-            const std::string nuis = "cov_" + pc.name + "_" + proc.name +
-                                     "_eig" + std::to_string(k);
-            ofs << nuis << " shape";
-            for (int sr = 0; sr < pc.n_sr; ++sr) {
-                for (size_t q = 0; q < pc.processes.size(); ++q) {
-                    ofs << " "
-                        << (q == p ? formatDouble(1.0 / pc.modes[p][k].template_scale) : "-");
+    if (use_shapes) {
+        // Shape nuisances: one correlated row per process eigenmode. The row is
+        // active for that process in every SR and inactive for all other processes.
+        for (size_t p = 0; p < pc.processes.size(); ++p) {
+            const auto& proc = pc.processes[p];
+            for (size_t k = 0; k < pc.modes[p].size(); ++k) {
+                const std::string nuis = "cov_" + pc.name + "_" + proc.name +
+                                         "_eig" + std::to_string(k);
+                ofs << nuis << " shape";
+                for (int sr = 0; sr < pc.n_sr; ++sr) {
+                    for (size_t q = 0; q < pc.processes.size(); ++q) {
+                        ofs << " "
+                            << (q == p ? formatDouble(1.0 / pc.modes[p][k].template_scale) : "-");
+                    }
                 }
+                ofs << "\n";
             }
-            ofs << "\n";
         }
     }
+
+    writeTheoryLnN(ofs, cfg, pc, reg, sc);
 }
 
 // -------------------- Running combine --------------------
@@ -1350,7 +1567,7 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
         pc.datacard_path = (work / ("card_" + ch.name + ".txt")).string();
         // Bin names are globally unique (<channel>_sr<N>), so labels are not
         // needed and channel names stay identical to any optional shape dirs.
-        writeChannelDatacard(cfg, pc, shape_path);
+        writeChannelDatacard(cfg, pc, shape_path, reg, sc);
         card_tokens.push_back(pc.datacard_path);
     }
 

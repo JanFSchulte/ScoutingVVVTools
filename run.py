@@ -39,9 +39,11 @@ MODES = {
     7: dict(label="combine", subdir="combine",
             source="combine.C", bin_name="combine_run",
             config_env="COMBINE_CONFIG_PATH"),
+    8: dict(label="theory_syst", subdir="selections/theory_weights",
+            script="theory_syst.py", config_env="THEORY_CONFIG_PATH"),
 }
 
-PYTHON_MODES = frozenset({2, 3, 4, 5})
+PYTHON_MODES = frozenset({2, 3, 4, 5, 8})
 SAMPLE_MODES = frozenset({0, 1, 6})
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -78,6 +80,7 @@ Modes:
   5  background_estimation/qcd_est.py   (no samples)
   6  selections/mix/mix.C               (per-sample)
   7  combine/combine.C                  (no samples)
+  8  selections/theory_weights/theory_syst.py  (no samples)
 
 Sample selection for modes 0, 1, 6:
   1. CLI sample names (highest priority)
@@ -86,7 +89,7 @@ Sample selection for modes 0, 1, 6:
 """,
     )
     p.add_argument("mode", type=int, choices=MODES, metavar="MODE",
-                   help="Execution mode 0-7")
+                   help="Execution mode 0-8")
     p.add_argument("rest", nargs="*", metavar="ARG",
                    help="Optional: [config.json] [sample1 sample2 ...]")
     p.add_argument("--slurm", action="store_true",

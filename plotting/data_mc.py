@@ -86,6 +86,63 @@ convert_cfg       = _load_json(_CONVERT_CFG_PATH)
 
 SAMPLE_INFO = {s["name"]: s for s in sample_cfg["sample"]}
 
+# Optional theory-syst sidecar (produced by mode 8 / theory_syst.py).
+# If configured, the JSON is read once here and a flat fractional theory
+# uncertainty is drawn as a separate hatched band on each Data/MC plot.
+_theory_syst_json_path = plot_cfg.get("theory_syst_json", None)
+if _theory_syst_json_path is not None:
+    _theory_syst_json_path = _resolve(_theory_syst_json_path, _SCRIPT_DIR)
+THEORY_SYST_YIELDS = None
+if _theory_syst_json_path is not None and os.path.exists(_theory_syst_json_path):
+    THEORY_SYST_YIELDS = _load_json(_theory_syst_json_path)
+    log_message(f"Loaded theory syst yields from {_theory_syst_json_path}")
+elif _theory_syst_json_path is not None:
+    log_message(f"[WARN] theory_syst_json not found at {_theory_syst_json_path}; run mode 8 first")
+
+
+def _theory_frac_uncertainty(tree_name, class_groups, mc_target_totals):
+    """Return per-class fractional theory uncertainty (flat normalization).
+
+    Combines PDF, scale, PS_ISR, PS_FSR in quadrature.  Returns a dict
+    {class_name: fractional_uncertainty}.  Samples without theory weights
+    are treated as having zero theory uncertainty.
+
+    mc_target_totals: {sample_name: target_total} pre-computed by the caller.
+    """
+    if THEORY_SYST_YIELDS is None:
+        return {}
+
+    result = {}
+    for cls_name, samples in class_groups.items():
+        num2 = 0.0   # (weighted fractional uncertainty)^2 × class_yield^2
+        denom = 0.0  # total class yield (sum of target_totals)
+        for sname in samples:
+            target = mc_target_totals.get(sname, 0.0)
+            if target <= 0.0:
+                continue
+            denom += target
+            sdata = THEORY_SYST_YIELDS.get(sname, {}).get(tree_name)
+            if sdata is None:
+                continue
+            # Fractional uncertainty for each source: half-width of the band
+            # relative to central_ratio (≈ 1.0 for well-behaved MC).
+            def _half(up_key, dn_key):
+                u = float(sdata.get(up_key, 1.0))
+                d = float(sdata.get(dn_key, 1.0))
+                return 0.5 * abs(u - d)
+
+            delta = math.sqrt(
+                _half("pdf_up",     "pdf_down"    ) ** 2
+                + _half("scale_up",   "scale_down"  ) ** 2
+                + _half("ps_isr_up",  "ps_isr_down" ) ** 2
+                + _half("ps_fsr_up",  "ps_fsr_down" ) ** 2
+            )
+            num2 += (target * delta) ** 2
+
+        if denom > 0.0:
+            result[cls_name] = math.sqrt(num2) / denom
+    return result
+
 
 def _compute_lumi_total():
     total = 0.0
@@ -957,6 +1014,7 @@ def _process_tree(tree_name, no_selection=False):
     # Streaming histogram accumulation for MC.
     log_message(f"Streaming MC histograms ({len(class_groups)} classes)")
     mc_hists = {cls: {} for cls in class_names}
+    mc_target_totals = {}   # {sample_name: target_total} for theory band
     for cls_name, samples in class_groups.items():
         log_message(f"  Class '{cls_name}' ({len(samples)} samples)")
         for sname in samples:
@@ -967,6 +1025,7 @@ def _process_tree(tree_name, no_selection=False):
             raw_w_sum    = mc_raw_w_sums[sname]
             target_total = (LUMI_TOTAL * xsec * float(n_total) / raw_entries
                             if raw_entries > 0 else 0.0)
+            mc_target_totals[sname] = target_total
             sample_hists = _stream_hists(
                 mc_sample_files[sname], tree_name, branch_edges,
                 target_total, raw_w_sum, reweight_branches,
@@ -981,6 +1040,8 @@ def _process_tree(tree_name, no_selection=False):
                     mc_hists[cls_name][b][1] += h2
             log_message(f"    {sname}: target_total={target_total:.6g}")
         mc_hists[cls_name] = {b: (v[0], v[1]) for b, v in mc_hists[cls_name].items()}
+
+    theory_fracs = _theory_frac_uncertainty(tree_name, class_groups, mc_target_totals)
 
     # Streaming histogram accumulation for data.
     log_message(f"Streaming data histograms ({len(DATA_SAMPLES)} samples)")
@@ -1093,7 +1154,7 @@ def _process_tree(tree_name, no_selection=False):
             bottom += h
         ax.margins(x=0)
 
-        # Draw the total MC uncertainty band.
+        # Draw the total MC uncertainty band (statistical).
         mc_sigma = np.sqrt(np.maximum(mc_total_w2, 0.0))
         lower = np.clip(mc_total_v - mc_sigma, 1e-12, None)
         upper = np.clip(mc_total_v + mc_sigma, 1e-12, None)
@@ -1101,6 +1162,27 @@ def _process_tree(tree_name, no_selection=False):
             bin_centers, lower, upper, step="mid",
             facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
         )
+
+        # Draw the theory uncertainty band if sidecar data is available.
+        # The band is a flat normalization fraction on the total MC stack,
+        # combining PDF + scale + PS_ISR + PS_FSR uncertainties in quadrature
+        # and weighting by each class's fractional contribution to the total yield.
+        if theory_fracs:
+            total_yield = float(sum(mc_per_cls[c][0].sum() for c in class_names))
+            if total_yield > 0.0:
+                theory_frac2 = 0.0
+                for cls_name in class_names:
+                    frac_cls = float(mc_per_cls[cls_name][0].sum()) / total_yield
+                    delta_cls = theory_fracs.get(cls_name, 0.0)
+                    theory_frac2 += (frac_cls * delta_cls) ** 2
+                theory_frac = math.sqrt(theory_frac2)
+                th_lower = np.clip(mc_total_v * (1.0 - theory_frac), 1e-12, None)
+                th_upper = mc_total_v * (1.0 + theory_frac)
+                ax.fill_between(
+                    bin_centers, th_lower, th_upper, step="mid",
+                    facecolor="none", edgecolor="#e07b39", hatch="\\\\\\", linewidth=0,
+                    label="Theory unc.",
+                )
 
         # Draw the data points.
         data_sigma = np.sqrt(np.maximum(data_w2, 0.0))

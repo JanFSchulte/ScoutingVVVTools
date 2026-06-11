@@ -150,6 +150,7 @@
             { "name": "weight_pu", "type": "F", "formula": "weight_pu", "onlyMC": true },
             { "name": "weight_pu_up", "type": "F", "formula": "weight_pu_up", "onlyMC": true },
             { "name": "weight_pu_down", "type": "F", "formula": "weight_pu_down", "onlyMC": true },
+            { "name": "genWeight", "type": "F", "formula": "genWeight", "onlyMC": true },
 
             {
               "name": "ScoutingFatPFJetRecluster_mass",
@@ -336,6 +337,7 @@
             { "name": "weight_pu", "type": "F", "formula": "weight_pu", "onlyMC": true },
             { "name": "weight_pu_up", "type": "F", "formula": "weight_pu_up", "onlyMC": true },
             { "name": "weight_pu_down", "type": "F", "formula": "weight_pu_down", "onlyMC": true },
+            { "name": "genWeight", "type": "F", "formula": "genWeight", "onlyMC": true },
 
             {
               "name": "ScoutingFatPFJetRecluster_mass",

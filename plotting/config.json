@@ -10,5 +10,6 @@
   "event_reweight_branches": {
     "fat2": ["weight_pu"],
     "fat3": ["weight_pu"]
-  }
+  },
+  "theory_syst_json": "../selections/theory_weights/output/theory_syst_yields.json"
 }
