@@ -23,6 +23,7 @@
 #include <vector>
 #include <unistd.h>
 
+#include <TBranch.h>
 #include <TChain.h>
 #include <TFile.h>
 #include <TH1.h>
@@ -62,6 +63,8 @@ const char* kSuccessfulBatchesEnvVar = "CONVERT_SUCCESSFUL_BATCHES";
 const char* kDeferFinalMergeEnvVar = "CONVERT_DEFER_FINAL_MERGE";
 const char* kGoldenJsonEnvVar = "CONVERT_GOLDEN_JSON";
 const char* kDefaultSampleConfigPath = "../../src/sample.json";
+const int kRemoteInputOpenRetries = 5;
+const unsigned int kRemoteInputRetrySleepSeconds = 5;
 
 // CMS good-runs-and-lumisections list loaded from a golden JSON certification file.
 // Format: {"run": [[lumi_start, lumi_end], ...], ...}
@@ -451,12 +454,16 @@ struct SampleRuleConfig {
 
 struct AppConfig {
     string treeName = "Events";
+    string configPath;
+    string configDir;
     string outputRoot;
     string outputPattern;
     string runSample;
+    string lumiMaskPath;
     string sampleConfigPath = kDefaultSampleConfigPath;
     int maxThreads = 12;
     double maxOutputFileSizeGB = 5.;
+    bool resumeSuccessfulBatches = true;
     vector<SampleRuleConfig> sampleRules;
     string puWeightPathPattern;
 };
@@ -499,6 +506,41 @@ struct SampleMeta {
             return "data";
         }
         return isSignal ? "signal" : "bkg";
+    }
+};
+
+struct LumiRange {
+    UInt_t first = 0;
+    UInt_t last = 0;
+};
+
+struct LumiMaskRun {
+    UInt_t run = 0;
+    vector<LumiRange> ranges;
+};
+
+struct LumiMask {
+    vector<LumiMaskRun> runs;
+
+    bool contains(UInt_t run, UInt_t lumi) const {
+        const auto runIt = lower_bound(runs.begin(), runs.end(), run,
+                                       [](const LumiMaskRun& item, UInt_t value) {
+                                           return item.run < value;
+                                       });
+        if (runIt == runs.end() || runIt->run != run) {
+            return false;
+        }
+
+        const auto& ranges = runIt->ranges;
+        const auto rangeIt = upper_bound(ranges.begin(), ranges.end(), lumi,
+                                         [](UInt_t value, const LumiRange& range) {
+                                             return value < range.first;
+                                         });
+        if (rangeIt == ranges.begin()) {
+            return false;
+        }
+        const LumiRange& candidate = *(rangeIt - 1);
+        return lumi <= candidate.last;
     }
 };
 
@@ -813,6 +855,11 @@ bool endsWith(const string& text, const string& suffix) {
            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+bool startsWith(const string& text, const string& prefix) {
+    return text.size() >= prefix.size() &&
+           text.compare(0, prefix.size(), prefix) == 0;
+}
+
 size_t skipWhitespace(const string& text, size_t pos) {
     while (pos < text.size() && isspace(static_cast<unsigned char>(text[pos]))) {
         ++pos;
@@ -940,9 +987,18 @@ JsonValue loadJson(const char* path, const char* envVar = nullptr) {
     return simple_json::parseFile(resolved);
 }
 
+JsonValue loadJsonPath(const string& path) {
+    return simple_json::parseFile(path);
+}
+
 string resolveReferencedPath(const string& baseConfigPath, const string& targetPath) {
     if (targetPath.empty()) {
         return targetPath;
+    }
+
+    fs::path basePath(baseConfigPath);
+    if (!basePath.is_absolute()) {
+        basePath = fs::absolute(basePath);
     }
 
     const fs::path path(targetPath);
@@ -950,7 +1006,85 @@ string resolveReferencedPath(const string& baseConfigPath, const string& targetP
         return path.lexically_normal().string();
     }
 
-    return (fs::path(baseConfigPath).parent_path() / path).lexically_normal().string();
+    return (basePath.parent_path() / path).lexically_normal().string();
+}
+
+string resolveConfiguredPathPattern(const string& baseConfigPath, const string& pathPattern) {
+    if (pathPattern.empty() || pathPattern.find("{output_root}") != string::npos) {
+        return pathPattern;
+    }
+    return resolveReferencedPath(baseConfigPath, pathPattern);
+}
+
+string normalizeOutputPath(const AppConfig& appConfig, const string& outputPath) {
+    const fs::path path(outputPath);
+    if (path.is_absolute()) {
+        return path.lexically_normal().string();
+    }
+    return (fs::path(appConfig.configDir) / path).lexically_normal().string();
+}
+
+UInt_t parseUInt32Text(const string& text, const string& context) {
+    size_t pos = 0;
+    unsigned long long value = 0;
+    try {
+        value = stoull(text, &pos, 10);
+    } catch (const exception&) {
+        throw runtime_error("Invalid unsigned integer for " + context + ": " + text);
+    }
+    if (pos != text.size() || value > numeric_limits<UInt_t>::max()) {
+        throw runtime_error("Invalid unsigned integer for " + context + ": " + text);
+    }
+    return static_cast<UInt_t>(value);
+}
+
+UInt_t parseUInt32Json(const JsonValue& value, const string& context) {
+    const long double number = value.asNumber();
+    if (number < 0 || number > numeric_limits<UInt_t>::max() || floor(number) != number) {
+        throw runtime_error("Invalid unsigned integer for " + context);
+    }
+    return static_cast<UInt_t>(number);
+}
+
+LumiMask loadLumiMask(const string& path) {
+    const JsonValue payload = loadJsonPath(path);
+    const auto& object = payload.asObject();
+
+    LumiMask mask;
+    mask.runs.reserve(object.size());
+    for (const auto& item : object) {
+        LumiMaskRun runConfig;
+        runConfig.run = parseUInt32Text(item.first, "lumi mask run");
+
+        const auto& ranges = item.second.asArray();
+        runConfig.ranges.reserve(ranges.size());
+        for (const auto& rangeNode : ranges) {
+            const auto& range = rangeNode.asArray();
+            if (range.size() != 2) {
+                throw runtime_error("Each lumi mask range must contain exactly two values for run " +
+                                    item.first);
+            }
+
+            LumiRange lumiRange;
+            lumiRange.first = parseUInt32Json(range[0], "lumi mask range start");
+            lumiRange.last = parseUInt32Json(range[1], "lumi mask range end");
+            if (lumiRange.last < lumiRange.first) {
+                throw runtime_error("Lumi mask range end is smaller than start for run " + item.first);
+            }
+            runConfig.ranges.push_back(lumiRange);
+        }
+        sort(runConfig.ranges.begin(), runConfig.ranges.end(),
+             [](const LumiRange& lhs, const LumiRange& rhs) {
+                 return lhs.first < rhs.first;
+             });
+        mask.runs.push_back(std::move(runConfig));
+    }
+
+    sort(mask.runs.begin(), mask.runs.end(),
+         [](const LumiMaskRun& lhs, const LumiMaskRun& rhs) {
+             return lhs.run < rhs.run;
+         });
+    return mask;
 }
 
 ExprPtr compileExpression(const string& text) {
@@ -992,14 +1126,18 @@ AppConfig loadAppConfig() {
     const JsonValue payload = simple_json::parseFile(appConfigPath);
 
     AppConfig config;
+    config.configPath = fs::absolute(fs::path(appConfigPath)).lexically_normal().string();
+    config.configDir = fs::path(config.configPath).parent_path().string();
     config.treeName = payload.getStringOr("tree_name", "Events");
     config.runSample = payload.getStringOr("run_sample", "");
-    config.outputRoot = payload.at("output_root").asString();
+    config.outputRoot = resolveReferencedPath(config.configPath, payload.at("output_root").asString());
     config.outputPattern = payload.at("output_pattern").asString();
+    config.lumiMaskPath = resolveReferencedPath(config.configPath, payload.getStringOr("lumi_mask", ""));
     config.sampleConfigPath = resolveReferencedPath(
-        appConfigPath, payload.getStringOr("sample_config", kDefaultSampleConfigPath));
+        config.configPath, payload.getStringOr("sample_config", kDefaultSampleConfigPath));
     config.maxThreads = payload.getIntOr("max_threads", 12);
     config.maxOutputFileSizeGB = static_cast<double>(payload.getNumberOr("max_output_file_size_gb", 5.));
+    config.resumeSuccessfulBatches = payload.getBoolOr("resume_successful_batches", true);
 
     const JsonValue samplePayload = simple_json::parseFile(config.sampleConfigPath);
     if (samplePayload.contains("sample")) {
@@ -1017,7 +1155,8 @@ AppConfig loadAppConfig() {
         }
     }
 
-    config.puWeightPathPattern = payload.getStringOr("pu_weight_path", "");
+    config.puWeightPathPattern = resolveConfiguredPathPattern(
+        config.configPath, payload.getStringOr("pu_weight_path", ""));
     return config;
 }
 
@@ -1157,8 +1296,8 @@ void finalizeInputCollection(InputCollectionConfig& collection) {
     }
 }
 
-BranchConfig loadBranchConfig() {
-    const JsonValue payload = loadJson(kBranchConfigPath);
+BranchConfig loadBranchConfig(const AppConfig& appConfig) {
+    const JsonValue payload = loadJsonPath(resolveReferencedPath(appConfig.configPath, kBranchConfigPath));
 
     BranchConfig config;
     for (const auto& node : payload.at("input").at("scalars").asArray()) {
@@ -1214,8 +1353,8 @@ BranchConfig loadBranchConfig() {
     return config;
 }
 
-SelectionConfig loadSelectionConfig() {
-    const JsonValue payload = loadJson(kSelectionConfigPath);
+SelectionConfig loadSelectionConfig(const AppConfig& appConfig) {
+    const JsonValue payload = loadJsonPath(resolveReferencedPath(appConfig.configPath, kSelectionConfigPath));
 
     SelectionConfig config;
     config.eventPreselectionText = payload.getStringOr("event_preselection", "1");
@@ -2374,6 +2513,46 @@ Long64_t readBatchRawEntries(const fs::path& batchOutputPath) {
     return rawEntries;
 }
 
+bool validateBatchTempOutput(const fs::path& batchOutputPath,
+                             const vector<TreeConfig>& treeConfigs,
+                             Long64_t& rawEntries,
+                             string& reason) {
+    const fs::path rawEntriesPath = makeBatchRawEntriesPath(batchOutputPath);
+    if (!fs::exists(batchOutputPath)) {
+        reason = "missing ROOT output";
+        return false;
+    }
+    if (!fs::exists(rawEntriesPath)) {
+        reason = "missing raw_entries";
+        return false;
+    }
+
+    try {
+        rawEntries = readBatchRawEntries(batchOutputPath);
+    } catch (const exception& ex) {
+        reason = ex.what();
+        return false;
+    }
+
+    unique_ptr<TFile> file(TFile::Open(batchOutputPath.string().c_str(), "READ"));
+    if (!file || file->IsZombie()) {
+        reason = "cannot open ROOT output";
+        return false;
+    }
+
+    for (const auto& treeConfig : treeConfigs) {
+        TTree* tree = dynamic_cast<TTree*>(file->Get(treeConfig.name.c_str()));
+        if (tree == nullptr) {
+            reason = "missing tree " + treeConfig.name;
+            return false;
+        }
+        (void)tree->GetEntries();
+    }
+
+    reason.clear();
+    return true;
+}
+
 vector<string> listRemoteRootFiles(const string& datasetPath) {
     string query = "file dataset=" + datasetPath;
     if (isUserDataset(datasetPath)) {
@@ -2482,7 +2661,8 @@ SampleMeta resolveSampleMeta(const string& sample, const AppConfig& appConfig) {
         if (meta.inputPaths.empty()) {
             throw runtime_error("No input path configured for sample: " + sample);
         }
-        meta.outputFileName = applyTemplate(appConfig.outputPattern, templateValues);
+        meta.outputFileName = normalizeOutputPath(
+            appConfig, applyTemplate(appConfig.outputPattern, templateValues));
         return meta;
     }
 
@@ -2612,7 +2792,7 @@ string resolvePileupWeightPath(const AppConfig& appConfig, const SampleMeta& sam
     templateValues["sample"] = sampleMeta.sample;
     templateValues["sample_group"] = sampleMeta.sampleGroup();
     templateValues["output_root"] = appConfig.outputRoot;
-    return applyTemplate(appConfig.puWeightPathPattern, templateValues);
+    return normalizeOutputPath(appConfig, applyTemplate(appConfig.puWeightPathPattern, templateValues));
 }
 
 size_t countOutputGroupBranches(const vector<OutputScalarConfig>& configs, bool isMC) {
@@ -3195,28 +3375,50 @@ vector<string> writeOutputFilesStreaming(const fs::path& baseOutputPath,
     return writtenFiles;
 }
 
+unique_ptr<TFile> openInputFileWithRetry(const string& inputFileName) {
+    const bool remoteInput = startsWith(inputFileName, "root://");
+    const int maxRetries = remoteInput ? kRemoteInputOpenRetries : 0;
+
+    for (int retry = 0; retry <= maxRetries; ++retry) {
+        unique_ptr<TFile> inputFile(TFile::Open(inputFileName.c_str(), "READ"));
+        if (inputFile && !inputFile->IsZombie()) {
+            return inputFile;
+        }
+
+        if (retry < maxRetries) {
+            cerr << "Warning: failed to open remote input file " << inputFileName
+                 << "; retry " << (retry + 1) << "/" << maxRetries
+                 << " after " << kRemoteInputRetrySleepSeconds << " seconds" << endl;
+            sleep(kRemoteInputRetrySleepSeconds);
+        }
+    }
+
+    throw runtime_error("Error opening input file " + inputFileName);
+}
+
 Long64_t processInputFile(const string& inputFileName,
                           const AppConfig& appConfig,
                           const SelectionConfig& selectionConfig,
                           const SampleMeta& sampleMeta,
                           const vector<PileupBin>& pileupWeights,
+                          const LumiMask* lumiMask,
                           BranchConfig& branchConfig,
-                          vector<OutputTreeState>& outputTrees,
-                          const GoodRunsLumiList& grl) {
+                          vector<OutputTreeState>& outputTrees) {
     unique_ptr<TFile> inputFile;
-#ifdef _OPENMP
-#pragma omp critical(xrd_open)
-#endif
-    {
-        inputFile.reset(TFile::Open(inputFileName.c_str(), "READ"));
-    }
-    if (!inputFile || inputFile->IsZombie()) {
-        throw SkippableFileError("Error opening input file " + inputFileName);
+    try {
+        inputFile = openInputFileWithRetry(inputFileName);
+    } catch (const runtime_error& ex) {
+        throw SkippableFileError(ex.what());
     }
 
     TTree* tree = static_cast<TTree*>(inputFile->Get(appConfig.treeName.c_str()));
     if (!tree) {
         throw SkippableFileError("Tree " + appConfig.treeName + " not found in " + inputFileName);
+    }
+
+    const Long64_t nEntries = tree->GetEntries();
+    if (nEntries == 0) {
+        return 0;
     }
 
     configureActiveBranches(tree, branchConfig, sampleMeta.isMC);
@@ -3228,8 +3430,41 @@ Long64_t processInputFile(const string& inputFileName,
         activateTheoryInputBranches(tree, theoryInBuf);
     }
 
-    const Long64_t nEntries = tree->GetEntries();
+    const bool applyLumiMask = (!sampleMeta.isMC && lumiMask != nullptr);
+    const ScalarInputConfig* runScalar = nullptr;
+    const ScalarInputConfig* lumiScalar = nullptr;
+    TBranch* runBranch = nullptr;
+    TBranch* lumiBranch = nullptr;
+    if (applyLumiMask) {
+        const auto runIt = rawScalarByName.find("run");
+        const auto lumiIt = rawScalarByName.find("luminosityBlock");
+        if (runIt == rawScalarByName.end() || lumiIt == rawScalarByName.end()) {
+            throw runtime_error("Data lumi mask requires input scalars 'run' and 'luminosityBlock'");
+        }
+        runScalar = runIt->second;
+        lumiScalar = lumiIt->second;
+        runBranch = tree->GetBranch(runScalar->branch.c_str());
+        lumiBranch = tree->GetBranch(lumiScalar->branch.c_str());
+        if (runBranch == nullptr || lumiBranch == nullptr) {
+            throw runtime_error("Data lumi mask requires input branches '" +
+                                runScalar->branch + "' and '" + lumiScalar->branch + "'");
+        }
+    }
+
+    Long64_t rawEntries = applyLumiMask ? 0 : nEntries;
     for (Long64_t entry = 0; entry < nEntries; ++entry) {
+        if (applyLumiMask) {
+            if (runBranch->GetEntry(entry) < 0 || lumiBranch->GetEntry(entry) < 0) {
+                throw runtime_error("Failed to read run/luminosityBlock for lumi mask");
+            }
+            const UInt_t runValue = static_cast<UInt_t>(runScalar->numericValue());
+            const UInt_t lumiValue = static_cast<UInt_t>(lumiScalar->numericValue());
+            if (!lumiMask->contains(runValue, lumiValue)) {
+                continue;
+            }
+            ++rawEntries;
+        }
+
         tree->GetEntry(entry);
 
         if (!grl.empty()) {
@@ -3286,7 +3521,7 @@ Long64_t processInputFile(const string& inputFileName,
             fillOutputTree(treeState, runtimeCollections, inputCollections, baseVars, rawScalarByName, sampleMeta.isMC);
         }
     }
-    return nEntries;
+    return rawEntries;
 }
 
 vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles,
@@ -3297,6 +3532,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                                            const SelectionConfig& selectionConfig,
                                            const SampleMeta& sampleMeta,
                                            const vector<PileupBin>& pileupWeights,
+                                           const LumiMask* lumiMask,
                                            const BranchConfig& branchConfig,
                                            atomic<size_t>& processedFiles,
                                            size_t totalFiles,
@@ -3362,6 +3598,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                                                               selectionConfig,
                                                               sampleMeta,
                                                               pileupWeights,
+                                                              lumiMask,
                                                               threadConfigs[tid],
                                                               threadResults[tid].outputTrees,
                                                               grl);
@@ -3380,7 +3617,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
             } catch (const exception& ex) {
                 failed.store(true);
 #pragma omp critical(convert_error)
-                errors.push_back(ex.what());
+                errors.push_back("Input ROOT file " + batchInputFiles[index] + ": " + ex.what());
             }
         }
     }
@@ -3426,34 +3663,26 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
 
 BatchTempCollection collectSuccessfulBatchTempFiles(const AppConfig& appConfig,
                                                     const SampleMeta& sampleMeta,
+                                                    const BranchConfig& branchConfig,
                                                     const vector<size_t>& batchIndices,
                                                     size_t nBatches) {
     BatchTempCollection collection;
     collection.paths.reserve(batchIndices.size());
     for (const size_t batchIndex : batchIndices) {
         const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
-        const fs::path rawEntriesPath = makeBatchRawEntriesPath(batchOutputPath);
-        if (!fs::exists(batchOutputPath) || !fs::exists(rawEntriesPath)) {
+        Long64_t batchRawEntries = 0;
+        string invalidReason;
+        if (!validateBatchTempOutput(batchOutputPath,
+                                     branchConfig.trees,
+                                     batchRawEntries,
+                                     invalidReason)) {
             ++collection.skipped;
             cerr << "Warning: skipping incomplete batch " << (batchIndex + 1)
                  << "/" << nBatches << " for sample = " << sampleMeta.sample
-                 << " (missing"
-                 << (fs::exists(batchOutputPath) ? "" : " ROOT output")
-                 << ((!fs::exists(batchOutputPath) && !fs::exists(rawEntriesPath)) ? " and" : "")
-                 << (fs::exists(rawEntriesPath) ? "" : " raw_entries")
-                 << ")" << endl;
+                 << ": " << invalidReason << endl;
             continue;
         }
-
-        try {
-            collection.rawEntries += readBatchRawEntries(batchOutputPath);
-        } catch (const exception& ex) {
-            ++collection.skipped;
-            cerr << "Warning: skipping batch " << (batchIndex + 1)
-                 << "/" << nBatches << " for sample = " << sampleMeta.sample
-                 << ": " << ex.what() << endl;
-            continue;
-        }
+        collection.rawEntries += batchRawEntries;
         collection.paths.push_back(batchOutputPath.string());
     }
 
@@ -3471,7 +3700,7 @@ int finalizeSuccessfulBatches(const AppConfig& appConfig,
                               size_t nBatches) {
     BatchTempCollection batchFiles;
     try {
-        batchFiles = collectSuccessfulBatchTempFiles(appConfig, sampleMeta, batchIndices, nBatches);
+        batchFiles = collectSuccessfulBatchTempFiles(appConfig, sampleMeta, branchConfig, batchIndices, nBatches);
         writeSampleRawEntries(appConfig.sampleConfigPath, sampleMeta.sample, batchFiles.rawEntries);
         cout << "Updated raw_entries in " << appConfig.sampleConfigPath
              << " for sample = " << sampleMeta.sample
@@ -3566,8 +3795,8 @@ int main(int argc, char** argv) {
     SelectionConfig selectionConfig;
     try {
         appConfig = loadAppConfig();
-        branchConfig = loadBranchConfig();
-        selectionConfig = loadSelectionConfig();
+        branchConfig = loadBranchConfig(appConfig);
+        selectionConfig = loadSelectionConfig(appConfig);
     } catch (const exception& ex) {
         cerr << "Configuration error: " << ex.what() << endl;
         return 1;
@@ -3632,7 +3861,7 @@ int main(int argc, char** argv) {
             try { fpbOverride = static_cast<size_t>(stoull(fpbEnv)); } catch (...) {}
         }
         batchSize = fpbOverride > 0 ? fpbOverride
-                                    : max<size_t>(1, static_cast<size_t>(threadCount) * 6);
+                                    : max<size_t>(1, static_cast<size_t>(threadCount) * 32);
     }
     const size_t nBatches = (inputFiles.size() + batchSize - 1) / batchSize;
     if (batchRequest.printBatchCount) {
@@ -3675,18 +3904,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    GoodRunsLumiList grl;
-    if (!sampleMeta.isMC) {
-        const char* goldenJsonPath = getenv(kGoldenJsonEnvVar);
-        if (goldenJsonPath != nullptr && *goldenJsonPath != '\0') {
-            try {
-                grl = loadGoodRunsLumiList(goldenJsonPath);
-                cout << "Loaded golden JSON (" << grl.ranges.size()
-                     << " runs) from: " << goldenJsonPath << endl;
-            } catch (const exception& ex) {
-                cerr << "Golden JSON error: " << ex.what() << endl;
-                return 1;
-            }
+    unique_ptr<LumiMask> lumiMask;
+    if (!sampleMeta.isMC && !appConfig.lumiMaskPath.empty()) {
+        try {
+            lumiMask = make_unique<LumiMask>(loadLumiMask(appConfig.lumiMaskPath));
+            cout << "Loaded lumi mask from: " << appConfig.lumiMaskPath
+                 << " (" << lumiMask->runs.size() << " runs)" << endl;
+        } catch (const exception& ex) {
+            cerr << "Lumi mask error: " << ex.what() << endl;
+            return 1;
         }
     }
 
@@ -3721,6 +3947,30 @@ int main(int argc, char** argv) {
         vector<string> batchInputFiles(batchBegin, batchEnd);
         const int batchThreadCount = determineThreadCount(appConfig.maxThreads, batchInputFiles.size());
         const fs::path batchOutputPath = makeBatchTempOutputPath(appConfig, sampleMeta, batchIndex);
+        bool batchAlreadyComplete = false;
+        if (appConfig.resumeSuccessfulBatches && batchRequest.singleBatch) {
+            Long64_t existingRawEntries = 0;
+            string invalidReason;
+            if (validateBatchTempOutput(batchOutputPath,
+                                        branchConfig.trees,
+                                        existingRawEntries,
+                                        invalidReason)) {
+                cout << "Skipping completed batch " << (batchIndex + 1) << "/" << nBatches
+                     << ": found valid existing temporary batch file "
+                     << batchOutputPath.string()
+                     << " with raw_entries = " << existingRawEntries << endl;
+                batchAlreadyComplete = true;
+            }
+            if (!batchAlreadyComplete &&
+                (fs::exists(batchOutputPath) || fs::exists(makeBatchRawEntriesPath(batchOutputPath)))) {
+                cerr << "Warning: resume check will rerun batch " << (batchIndex + 1)
+                     << "/" << nBatches << " for sample = " << sampleMeta.sample
+                     << ": existing temporary output is incomplete (" << invalidReason << ")" << endl;
+            }
+        }
+        if (batchAlreadyComplete) {
+            continue;
+        }
         atomic<Long64_t> batchRawEntries{0};
 
         cout << "Processing batch " << (batchIndex + 1) << "/" << nBatches
@@ -3738,6 +3988,7 @@ int main(int argc, char** argv) {
                                                                                  selectionConfig,
                                                                                  sampleMeta,
                                                                                  pileupWeights,
+                                                                                 lumiMask.get(),
                                                                                  branchConfig,
                                                                                  processedFiles,
                                                                                  inputFiles.size(),

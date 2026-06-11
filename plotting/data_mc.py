@@ -12,6 +12,7 @@ Pass --no-selection to skip threshold and clip-range cuts on plot variables
 """
 
 import argparse
+import gc
 import os
 import sys
 import json
@@ -232,7 +233,10 @@ def _sample_group(info):
 def _input_files(sample_name, input_root, input_pattern):
     info = SAMPLE_INFO[sample_name]
     sg   = _sample_group(info)
-    base = input_pattern.format(input_root=input_root, sample_group=sg, sample=sample_name)
+    pattern = input_pattern
+    if not info.get("is_MC", True):
+        pattern = pattern.replace("{sample_group}_mixed", "{sample_group}")
+    base = pattern.format(input_root=input_root, sample_group=sg, sample=sample_name)
     stem = base[:-5] if base.endswith(".root") else base
     return sorted(glob.glob(base) + glob.glob(stem + "_*.root"))
 
@@ -247,9 +251,30 @@ def _tree_entries_total(files, tree_name):
     return total
 
 
-def _load_tree(files, tree_name, branches, strict=True):
+def _concat_parts(parts):
+    if not parts:
+        return None
+    if len(parts) == 1:
+        df = parts[0].reset_index(drop=True)
+        parts.clear()
+        gc.collect()
+        return df
+    df = pd.concat(parts, ignore_index=True)
+    parts.clear()
+    gc.collect()
+    return df
+
+
+def _load_tree(files, tree_name, branches, strict=True, max_entries=None):
     parts = []
+    remaining = None
+    if max_entries is not None:
+        remaining = max(0, int(max_entries))
+        if remaining == 0:
+            return None
     for fpath in files:
+        if remaining is not None and remaining <= 0:
+            break
         with uproot.open(fpath) as uf:
             if tree_name not in uf:
                 continue
@@ -268,10 +293,23 @@ def _load_tree(files, tree_name, branches, strict=True):
                     f"{', '.join(missing[:5])}" + (" ..." if len(missing) > 5 else "")
                 )
             load = [b for b in branches if b in avail]
-            parts.append(tree.arrays(load, library="pd"))
-    if not parts:
-        return None
-    return pd.concat(parts, ignore_index=True)
+            if not load:
+                continue
+            entry_stop = int(tree.num_entries)
+            if remaining is not None:
+                entry_stop = min(entry_stop, remaining)
+            if entry_stop <= 0:
+                continue
+            df_part = tree.arrays(
+                load,
+                library="pd",
+                entry_start=0,
+                entry_stop=entry_stop,
+            )
+            parts.append(df_part)
+            if remaining is not None:
+                remaining -= len(df_part)
+    return _concat_parts(parts)
 
 
 _CHUNK_SIZE = "200 MB"
@@ -469,6 +507,17 @@ def _apply_clip(df, clip_ranges):
     return df
 
 
+def _drop_unneeded_columns(df, keep_columns):
+    if df is None or len(df) == 0:
+        return df
+    keep = set(keep_columns)
+    drop_cols = [col for col in df.columns if col not in keep]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        gc.collect()
+    return df
+
+
 def _standardize_model_X(X, clip_ranges, log_transform):
     log_set = set(log_transform)
     for col in X.columns:
@@ -644,9 +693,7 @@ def _load_test_segments(tree_name, branches, sample_meta):
                     entry_stop=int(seg["entry_stop"]),
                 )
             )
-    if not parts:
-        return None
-    return pd.concat(parts, ignore_index=True)
+    return _concat_parts(parts)
 
 
 def _assign_test_split_mc_weight(df, sample_name, total_entries, reweight_branches=None):
@@ -775,6 +822,167 @@ def _ratio_data_over_mc(data_vals, data_vars, mc_vals, mc_vars):
     return r, sigma
 
 
+def _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2):
+    mc_sum = float(np.sum(mc_total_v))
+    data_sum = float(np.sum(data_v))
+    mc_scale = 1.0 / mc_sum if mc_sum > 0.0 else 0.0
+    data_scale = 1.0 / data_sum if data_sum > 0.0 else 0.0
+
+    mc_per_cls_norm = {
+        cls: (h * mc_scale, h2 * (mc_scale ** 2))
+        for cls, (h, h2) in mc_per_cls.items()
+    }
+    return (
+        mc_per_cls_norm,
+        mc_total_v * mc_scale,
+        mc_total_w2 * (mc_scale ** 2),
+        data_v * data_scale,
+        data_w2 * (data_scale ** 2),
+    )
+
+
+def _draw_data_mc_plot(
+    *,
+    class_names,
+    color_map,
+    edges,
+    bin_centers,
+    bin_widths,
+    mc_per_cls,
+    mc_total_v,
+    mc_total_w2,
+    data_v,
+    data_w2,
+    branch,
+    x_range,
+    logx,
+    logy,
+    y_range,
+    y_label,
+    out_path,
+    logy_floor=0.1,
+    theory_fracs=None,
+):
+    bins = len(bin_centers)
+    fig, (ax, axr) = plt.subplots(
+        2, 1, figsize=(10, 10),
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0},
+        sharex=True,
+    )
+
+    mc_yields = {cls: float(mc_per_cls[cls][0].sum()) for cls in class_names}
+    order = np.argsort([mc_yields[c] for c in class_names])
+    bottom = np.zeros(bins)
+    for idx in order:
+        cls = class_names[idx]
+        h, _ = mc_per_cls[cls]
+        ax.bar(
+            edges[:-1], h, width=bin_widths, bottom=bottom,
+            align="edge", color=color_map[cls], edgecolor="none",
+            linewidth=0, antialiased=False, alpha=0.9, label=cls,
+        )
+        bottom += h
+    ax.margins(x=0)
+
+    mc_sigma = np.sqrt(np.maximum(mc_total_w2, 0.0))
+    lower = np.clip(mc_total_v - mc_sigma, 1e-12, None)
+    upper = np.clip(mc_total_v + mc_sigma, 1e-12, None)
+    ax.fill_between(
+        bin_centers, lower, upper, step="mid",
+        facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
+    )
+
+    if theory_fracs:
+        total_yield = float(sum(mc_per_cls[c][0].sum() for c in class_names))
+        if total_yield > 0.0:
+            theory_frac2 = 0.0
+            for cls_name in class_names:
+                frac_cls = float(mc_per_cls[cls_name][0].sum()) / total_yield
+                delta_cls = theory_fracs.get(cls_name, 0.0)
+                theory_frac2 += (frac_cls * delta_cls) ** 2
+            theory_frac = math.sqrt(theory_frac2)
+            th_lower = np.clip(mc_total_v * (1.0 - theory_frac), 1e-12, None)
+            th_upper = mc_total_v * (1.0 + theory_frac)
+            ax.fill_between(
+                bin_centers, th_lower, th_upper, step="mid",
+                facecolor="none", edgecolor="#e07b39", hatch="\\\\\\", linewidth=0,
+                label="Theory unc.",
+            )
+
+    data_sigma = np.sqrt(np.maximum(data_w2, 0.0))
+    y_plot = np.where(data_v > 0, data_v, np.nan)
+    ax.errorbar(
+        bin_centers, y_plot, yerr=data_sigma,
+        fmt="o", ms=7.6, color="black", mfc="black", mec="black",
+        elinewidth=1.5, capsize=0, label="Data",
+    )
+
+    if logx:
+        ax.set_xscale("log")
+        axr.set_xscale("log")
+    if logy:
+        ax.set_yscale("log")
+    ax.set_xlim(*x_range)
+    axr.set_xlim(*x_range)
+
+    if y_range is not None:
+        ax.set_ylim(*y_range)
+    else:
+        vis = (mc_total_v > 0) | (data_v > 0)
+        if np.any(vis):
+            ymax = max(float(np.max(mc_total_v[vis])), float(np.max(data_v[vis])))
+        else:
+            ymax = 1.0
+        if logy:
+            if logy_floor is None:
+                positive = np.concatenate([mc_total_v[mc_total_v > 0], data_v[data_v > 0]])
+                ymin = max(float(np.min(positive)) / 5.0, 1e-12) if positive.size else 1e-6
+            else:
+                ymin = float(logy_floor)
+            ax.set_ylim(ymin, max(ymin * 10.0, ymax * 5.0))
+        else:
+            ax.set_ylim(0.0, max(1.0, ymax * 1.3))
+
+    ax.set_ylabel(y_label, fontsize=24)
+    hep.cms.label("Preliminary", data=True, com=13.6, year="2024", lumi=int(LUMI_TOTAL), ax=ax)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if "Data" in labels:
+        i = labels.index("Data")
+        handles.append(handles.pop(i))
+        labels.append(labels.pop(i))
+    ax.legend(handles, labels, loc="best", fontsize=17, frameon=False, ncol=2)
+
+    ratio, r_err = _ratio_data_over_mc(data_v, data_w2, mc_total_v, mc_total_w2)
+    axr.errorbar(
+        bin_centers, ratio, yerr=r_err,
+        fmt="o", ms=7.6, color="black", mfc="black", mec="black",
+        elinewidth=1.5, capsize=0,
+    )
+    axr.axhline(1.0, color="black", linestyle="--", linewidth=1.5)
+
+    finite = np.isfinite(ratio)
+    if np.any(finite):
+        safe_err = np.nan_to_num(r_err[finite], nan=0.0)
+        rmax = float(np.nanmax(ratio[finite] + safe_err))
+        rmin = float(np.nanmin(ratio[finite] - safe_err))
+        if not np.isfinite(rmax) or rmax <= 0:
+            rmax = 1.0
+        if rmax < 5.0:
+            axr.set_ylim(max(0.0, 0.8 * rmin), 1.2 * rmax)
+        else:
+            axr.set_ylim(0.0, 5.0)
+    else:
+        axr.set_ylim(0.0, 2.0)
+
+    axr.set_ylabel(r"$\frac{Data}{MC}$", fontsize=26)
+    axr.yaxis.set_label_coords(-0.05, 0.6)
+    axr.set_xlabel(branch, fontsize=24)
+
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 # -------------------- Per-tree processing --------------------
 def _process_tree(tree_name, no_selection=False):
     log_message(f"Running data_mc.py: tree={tree_name}, no_selection={no_selection}")
@@ -824,7 +1032,6 @@ def _process_tree(tree_name, no_selection=False):
         f"threshold_branches={len(thresholds)}, clip_branches={len(clip_ranges)}, "
         f"reweight_branches={len(reweight_branches)}, score_branches={len(score_branches)}"
     )
-
     out_patt = OUTPUT_ROOT_NOSEL_PATT if no_selection else OUTPUT_ROOT_PATT
     out_dir = _resolve(out_patt.format(tree_name=tree_name), _SCRIPT_DIR)
     os.makedirs(out_dir, exist_ok=True)
@@ -955,7 +1162,7 @@ def _process_tree(tree_name, no_selection=False):
 
         for cls_name, parts in score_parts_by_class.items():
             if parts:
-                score_class_dfs[cls_name] = pd.concat(parts, ignore_index=True)
+                score_class_dfs[cls_name] = _concat_parts(parts)
 
         if not ref_proba_parts:
             raise RuntimeError(f"No MC score events after filtering for tree '{tree_name}'")
@@ -968,6 +1175,8 @@ def _process_tree(tree_name, no_selection=False):
             ref_weights,
             score_proba_ref,
         )
+        del ref_sample_labels, ref_class_idx, ref_weights, ref_proba_parts, score_proba_ref
+        gc.collect()
 
         if DATA_SAMPLES:
             score_data_load = sorted(set(model_branches) | set(thresholds.keys()))
@@ -992,7 +1201,7 @@ def _process_tree(tree_name, no_selection=False):
                 score_data_parts.append(_add_score_columns(df, proba, class_names))
                 log_message(f"  data score {sname}: events={len(df)}")
             if score_data_parts:
-                score_data_df = pd.concat(score_data_parts, ignore_index=True)
+                score_data_df = _concat_parts(score_data_parts)
                 log_message(f"Loaded data score events: {len(score_data_df)}")
             else:
                 log_message("Loaded data score events: 0")
@@ -1134,128 +1343,59 @@ def _process_tree(tree_name, no_selection=False):
                 mc_yields[cls] = float(h.sum())
             data_v, data_w2 = data_hists.get(branch, (np.zeros(bins), np.zeros(bins)))
 
-        fig, (ax, axr) = plt.subplots(
-            2, 1, figsize=(10, 10),
-            gridspec_kw={"height_ratios": [3, 1], "hspace": 0},
-            sharex=True,
-        )
-
-        # Draw the stacked MC histograms from low to high total yield.
-        order = np.argsort([mc_yields[c] for c in class_names])
-        bottom = np.zeros(bins)
-        for idx in order:
-            cls = class_names[idx]
-            h, _ = mc_per_cls[cls]
-            ax.bar(
-                edges[:-1], h, width=bin_widths, bottom=bottom,
-                align="edge", color=color_map[cls], edgecolor="none",
-                linewidth=0, antialiased=False, alpha=0.9, label=cls,
-            )
-            bottom += h
-        ax.margins(x=0)
-
-        # Draw the total MC uncertainty band (statistical).
-        mc_sigma = np.sqrt(np.maximum(mc_total_w2, 0.0))
-        lower = np.clip(mc_total_v - mc_sigma, 1e-12, None)
-        upper = np.clip(mc_total_v + mc_sigma, 1e-12, None)
-        ax.fill_between(
-            bin_centers, lower, upper, step="mid",
-            facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
-        )
-
-        # Draw the theory uncertainty band if sidecar data is available.
-        # The band is a flat normalization fraction on the total MC stack,
-        # combining PDF + scale + PS_ISR + PS_FSR uncertainties in quadrature
-        # and weighting by each class's fractional contribution to the total yield.
-        if theory_fracs:
-            total_yield = float(sum(mc_per_cls[c][0].sum() for c in class_names))
-            if total_yield > 0.0:
-                theory_frac2 = 0.0
-                for cls_name in class_names:
-                    frac_cls = float(mc_per_cls[cls_name][0].sum()) / total_yield
-                    delta_cls = theory_fracs.get(cls_name, 0.0)
-                    theory_frac2 += (frac_cls * delta_cls) ** 2
-                theory_frac = math.sqrt(theory_frac2)
-                th_lower = np.clip(mc_total_v * (1.0 - theory_frac), 1e-12, None)
-                th_upper = mc_total_v * (1.0 + theory_frac)
-                ax.fill_between(
-                    bin_centers, th_lower, th_upper, step="mid",
-                    facecolor="none", edgecolor="#e07b39", hatch="\\\\\\", linewidth=0,
-                    label="Theory unc.",
-                )
-
-        # Draw the data points.
-        data_sigma = np.sqrt(np.maximum(data_w2, 0.0))
-        y_plot = np.where(data_v > 0, data_v, np.nan)
-        ax.errorbar(
-            bin_centers, y_plot, yerr=data_sigma,
-            fmt="o", ms=7.6, color="black", mfc="black", mec="black",
-            elinewidth=1.5, capsize=0, label="Data",
-        )
-
-        # Configure the axes.
-        if logx:
-            ax.set_xscale("log")
-            axr.set_xscale("log")
-        if logy:
-            ax.set_yscale("log")
-        ax.set_xlim(*x_range)
-        axr.set_xlim(*x_range)
-
-        if y_range is not None:
-            ax.set_ylim(*y_range)
-        else:
-            vis = (mc_total_v > 0) | (data_v > 0)
-            if np.any(vis):
-                ymax = max(float(np.max(mc_total_v[vis])), float(np.max(data_v[vis])))
-            else:
-                ymax = 1.0
-            if logy:
-                ax.set_ylim(0.1, max(1.0, ymax * 5.0))
-            else:
-                ax.set_ylim(0.0, max(1.0, ymax * 1.3))
-
-        ax.set_ylabel("Events", fontsize=24)
-        hep.cms.label("Preliminary", data=True, com=13.6, year="2024", lumi=LUMI_TOTAL, ax=ax)
-
-        handles, labels = ax.get_legend_handles_labels()
-        if "Data" in labels:
-            i = labels.index("Data")
-            handles.append(handles.pop(i))
-            labels.append(labels.pop(i))
-        ax.legend(handles, labels, loc="best", fontsize=17, frameon=False, ncol=2)
-
-        # Draw the Data/MC ratio panel.
-        ratio, r_err = _ratio_data_over_mc(data_v, data_w2, mc_total_v, mc_total_w2)
-        axr.errorbar(
-            bin_centers, ratio, yerr=r_err,
-            fmt="o", ms=7.6, color="black", mfc="black", mec="black",
-            elinewidth=1.5, capsize=0,
-        )
-        axr.axhline(1.0, color="black", linestyle="--", linewidth=1.5)
-
-        finite = np.isfinite(ratio)
-        if np.any(finite):
-            safe_err = np.nan_to_num(r_err[finite], nan=0.0)
-            rmax = float(np.nanmax(ratio[finite] + safe_err))
-            rmin = float(np.nanmin(ratio[finite] - safe_err))
-            if not np.isfinite(rmax) or rmax <= 0:
-                rmax = 1.0
-            if rmax < 5.0:
-                axr.set_ylim(max(0.0, 0.8 * rmin), 1.2 * rmax)
-            else:
-                axr.set_ylim(0.0, 5.0)
-        else:
-            axr.set_ylim(0.0, 2.0)
-
-        axr.set_ylabel(r"$\frac{Data}{MC}$", fontsize=26)
-        axr.yaxis.set_label_coords(-0.05, 0.6)
-        axr.set_xlabel(branch, fontsize=24)
-
         out_path = os.path.join(out_dir, f"{tree_name}_{branch}.pdf")
-        fig.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        _draw_data_mc_plot(
+            class_names=class_names,
+            color_map=color_map,
+            edges=edges,
+            bin_centers=bin_centers,
+            bin_widths=bin_widths,
+            mc_per_cls=mc_per_cls,
+            mc_total_v=mc_total_v,
+            mc_total_w2=mc_total_w2,
+            data_v=data_v,
+            data_w2=data_w2,
+            branch=branch,
+            x_range=x_range,
+            logx=logx,
+            logy=logy,
+            y_range=y_range,
+            y_label="Events",
+            out_path=out_path,
+            logy_floor=0.1,
+            theory_fracs=theory_fracs,
+        )
         log_message(f"Wrote plot file: {out_path}")
+
+        (
+            mc_per_cls_norm,
+            mc_total_v_norm,
+            mc_total_w2_norm,
+            data_v_norm,
+            data_w2_norm,
+        ) = _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2)
+        out_path_normal = os.path.join(out_dir, f"{tree_name}_{branch}_normal.pdf")
+        _draw_data_mc_plot(
+            class_names=class_names,
+            color_map=color_map,
+            edges=edges,
+            bin_centers=bin_centers,
+            bin_widths=bin_widths,
+            mc_per_cls=mc_per_cls_norm,
+            mc_total_v=mc_total_v_norm,
+            mc_total_w2=mc_total_w2_norm,
+            data_v=data_v_norm,
+            data_w2=data_w2_norm,
+            branch=branch,
+            x_range=x_range,
+            logx=logx,
+            logy=logy,
+            y_range=y_range,
+            y_label="A.U.",
+            out_path=out_path_normal,
+            logy_floor=None,
+        )
+        log_message(f"Wrote plot file: {out_path_normal}")
     log_message(f"Finished data_mc.py for tree={tree_name}")
 
 

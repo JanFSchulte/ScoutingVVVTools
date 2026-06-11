@@ -1,6 +1,33 @@
 {
   "sample": [
     {
+      "name": "2024B",
+      "path": [
+        "/ScoutingPFRun3/jschulte-ScoutingNano_Data_v4-00000000000000000000000000000000/USER"
+      ],
+      "sample_ID": 99,
+      "is_MC": false,
+      "is_signal": false,
+      "xsection": -1,
+      "lumi": 0.13,
+      "raw_entries": 21980881
+    },
+    {
+      "name": "2024I",
+      "path": [
+        "/ScoutingPFRun3/jschulte-ScoutingNano_Data_part1_v4-00000000000000000000000000000000/USER",
+        "/ScoutingPFRun3/jschulte-ScoutingNano_Data_part2_v4-00000000000000000000000000000000/USER",
+        "/ScoutingPFRun3/jschulte-ScoutingNano_Data_part3_v4-00000000000000000000000000000000/USER",
+        "/ScoutingPFRun3/jschulte-ScoutingNano_Data_part4_v4-00000000000000000000000000000000/USER"
+      ],
+      "sample_ID": 99,
+      "is_MC": false,
+      "is_signal": false,
+      "xsection": -1,
+      "lumi": 11.56,
+      "raw_entries": 2608718408
+    },
+    {
       "name": "www",
       "path": "/WWW-4F_TuneCP5_13p6TeV_amcatnlo-pythia8/yiyangz-ScoutingNano_MC_v1-00000000000000000000000000000000/USER",
       "sample_ID": 0,
@@ -180,9 +207,7 @@
     },
     {
       "name": "qcd_ht1500to2000",
-      "path": [
-        "/QCD-4Jets_Bin-HT-1500to2000_TuneCP5_13p6TeV_madgraphMLM-pythia8/yiyangz-ScoutingNano_MC_v1-00000000000000000000000000000000/USER"
-      ],
+      "path": "/QCD-4Jets_Bin-HT-1500to2000_TuneCP5_13p6TeV_madgraphMLM-pythia8/yiyangz-ScoutingNano_MC_v1-00000000000000000000000000000000/USER",
       "sample_ID": 19,
       "is_MC": true,
       "is_signal": false,
@@ -192,9 +217,7 @@
     },
     {
       "name": "qcd_ht2000",
-      "path": [
-        "/QCD-4Jets_Bin-HT-2000_TuneCP5_13p6TeV_madgraphMLM-pythia8/yiyangz-ScoutingNano_MC_v1-00000000000000000000000000000000/USER"
-      ],
+      "path": "/QCD-4Jets_Bin-HT-2000_TuneCP5_13p6TeV_madgraphMLM-pythia8/yiyangz-ScoutingNano_MC_v1-00000000000000000000000000000000/USER",
       "sample_ID": 20,
       "is_MC": true,
       "is_signal": false,
