@@ -3,6 +3,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_CONCURRENT_JOBS=1
+USE_SLURM=false
+SLURM_PARTITION="cms-express"
+SLURM_TIME="24:00:00"
+SLURM_MEM="4G"
+SLURM_CPUS=12
+SLURM_EXTRA=""
+
+X509_SRC="/tmp/x509up_u$(id -u)"
+X509_DST="/depot/cms/users/$(whoami)/x509up_u$(id -u)"
+
+
 
 usage() {
   cat >&2 <<'EOF'
@@ -103,6 +114,28 @@ case "${MODE}" in
     ;;
 esac
 
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --slurm)            USE_SLURM=true;           shift ;;
+    --slurm-partition)  SLURM_PARTITION="$2";     shift 2 ;;
+    --slurm-time)       SLURM_TIME="$2";          shift 2 ;;
+    --slurm-mem)        SLURM_MEM="$2";           shift 2 ;;
+    --slurm-cpus)       SLURM_CPUS="$2";          shift 2 ;;
+    --slurm-extra)      SLURM_EXTRA="$2";         shift 2 ;;
+    *)                  break ;;
+  esac
+done
+
+if $USE_SLURM; then
+  if [ ! -f "${X509_SRC}" ]; then
+    echo "Certificate not found: ${X509_SRC}" >&2
+    exit 1
+  fi
+  cp "${X509_SRC}" "${X509_DST}"
+  echo "[$(timestamp)] copied certificate ${X509_SRC} -> ${X509_DST}"
+fi
+
+
 CONFIG_INPUT="${DEFAULT_CONFIG}"
 if [ "$#" -gt 0 ]; then
   case "$1" in
@@ -135,6 +168,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required to read JSON config files." >&2
   exit 1
 fi
+
 
 detect_openmp_flags() {
   local test_src test_bin
@@ -258,6 +292,7 @@ cd "${WORK_DIR}"
 exec >> "${LOG_PATH}" 2>&1
 trap copy_log_to_output_dirs EXIT
 
+
 if [ "${MODE}" = "2" ] || [ "${MODE}" = "3" ] || [ "${MODE}" = "4" ] || [ "${MODE}" = "5" ]; then
   if [ "$#" -gt 0 ]; then
     echo "mode=${MODE} does not accept sample arguments: $*" >&2
@@ -276,6 +311,7 @@ if [ "${MODE}" = "2" ] || [ "${MODE}" = "3" ] || [ "${MODE}" = "4" ] || [ "${MOD
   echo "[$(timestamp)] finished job=${MODE_LABEL} pid=$$ status=${status}"
   exit "${status}"
 fi
+
 
 if ! command -v c++ >/dev/null 2>&1; then
   echo "c++ is required to compile ${MODE_LABEL}." >&2
@@ -296,7 +332,18 @@ cleanup_build_artifacts() {
   fi
 }
 
-trap 'cleanup_build_artifacts; copy_log_to_output_dirs' EXIT
+
+
+if $USE_SLURM; then
+  trap - EXIT
+else
+  trap 'cleanup_build_artifacts; copy_log_to_output_dirs' EXIT
+fi
+
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
 
 echo "[$(timestamp)] mode=${MODE} (${MODE_LABEL})"
 echo "[$(timestamp)] work_dir=${WORK_DIR}"
@@ -308,6 +355,7 @@ fi
 
 ROOT_CFLAGS="$(root-config --cflags)"
 ROOT_LIBS="$(root-config --libs)"
+ROOT_LIBDIR="$(root-config --libdir)"
 COMPILE_CMD="c++ -O3 -DNDEBUG -std=c++17 ${ROOT_CFLAGS} ${OMP_CFLAGS} ./${SOURCE_FILE} -o ${BIN_PATH} ${ROOT_LIBS} ${OMP_LDFLAGS}"
 echo "[$(timestamp)] compile: ${COMPILE_CMD}"
 eval "${COMPILE_CMD}"
@@ -404,6 +452,7 @@ for sample in selected:
 PY
 )
 
+
 if [ "${#samples[@]}" -eq 0 ]; then
   echo "No samples selected from ${CONFIG_PATH}" >&2
   exit 1
@@ -443,6 +492,50 @@ declare -a RUNNING_SAMPLES=()
 FAILED_JOBS=0
 
 reap_finished_jobs() {
+  if $USE_SLURM; then
+    reap_finished_jobs_slurm
+  else
+    reap_finished_jobs_local
+  fi
+}
+
+reap_finished_jobs_slurm() {
+  local new_pids=() new_samples=()
+  local idx job_id sample state finished_any=0
+
+  for idx in "${!RUNNING_PIDS[@]}"; do
+    job_id="${RUNNING_PIDS[$idx]}"
+    sample="${RUNNING_SAMPLES[$idx]}"
+
+    state=$(squeue --jobs="${job_id}" --noheader --format="%T" 2>/dev/null || true)
+
+    if [ -n "${state}" ]; then
+      # Job still in queue (PENDING, RUNNING, etc.)
+      new_pids+=("${job_id}")
+      new_samples+=("${sample}")
+      continue
+    fi
+
+    # Job gone from squeue — check final state via sacct
+    finished_any=1
+    local exit_code
+    exit_code=$(sacct -j "${job_id}" --noheader --format=ExitCode --parsable2 \
+                  2>/dev/null | head -1 | cut -d: -f1 || echo "1")
+
+    if [ "${exit_code}" = "0" ]; then
+      echo "[$(timestamp)] finished sample=${sample} slurm_job_id=${job_id} status=0"
+    else
+      echo "[$(timestamp)] finished sample=${sample} slurm_job_id=${job_id} status=${exit_code}"
+      FAILED_JOBS=$((FAILED_JOBS + 1))
+    fi
+  done
+
+  RUNNING_PIDS=("${new_pids[@]}")
+  RUNNING_SAMPLES=("${new_samples[@]}")
+  return "${finished_any}"
+}
+
+reap_finished_jobs_local() {
   local new_pids=()
   local new_samples=()
   local idx pid sample status finished_any=0 state
@@ -476,69 +569,104 @@ reap_finished_jobs() {
 
 launch_job() {
   local sample="$1"
-  if [ "${MODE}" = "0" ]; then
-    (
-      set -e
-      batch_count="$(env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" --batch-count)"
-      if [[ ! "${batch_count}" =~ ^[0-9]+$ ]] || [ "${batch_count}" -le 0 ]; then
-        echo "Invalid convert batch count for sample=${sample}: ${batch_count}" >&2
-        exit 1
-      fi
-      batch_failures=0
-      successful_batches=""
-      for ((batch_index = 0; batch_index < batch_count; batch_index++)); do
-        echo "[$(timestamp)] running sample=${sample} batch=$((batch_index + 1))/${batch_count}"
-        set +e
+
+  if $USE_SLURM; then
+    local job_name="${MODE_LABEL}_${sample}"
+    local slurm_log="${WORK_DIR}/${sample}_%j.out"
+
+    local sbatch_args=(
+      --job-name="${job_name}"
+      --output="${slurm_log}"
+      --error="${slurm_log}"
+      --cpus-per-task="${SLURM_CPUS}"
+      --mem="${SLURM_MEM}"
+      --time="${SLURM_TIME}"
+    )
+    [ -n "${SLURM_PARTITION}" ] && sbatch_args+=(--account="${SLURM_PARTITION}")
+    [ -n "${SLURM_EXTRA}" ]     && sbatch_args+=($SLURM_EXTRA)
+
+    local job_id
+    job_id=$(sbatch "${sbatch_args[@]}" \
+      --wrap="export X509_USER_PROXY=${X509_DST}; export LD_LIBRARY_PATH=${ROOT_LIBDIR}:\${LD_LIBRARY_PATH:-}; env ${CONFIG_ENV_VAR}=${CONFIG_PATH} ${BIN_PATH} ${sample}" \
+      | awk '{print $NF}')
+
+    # Reuse the same pid-tracking arrays — store job_id in place of pid
+    RUNNING_PIDS+=("${job_id}")
+    RUNNING_SAMPLES+=("${sample}")
+    echo "[$(timestamp)] submitted sample=${sample} slurm_job_id=${job_id}"
+  else
+    if [ "${MODE}" = "0" ]; then
+      (
+        set -e
+        batch_count="$(env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" --batch-count)"
+        if [[ ! "${batch_count}" =~ ^[0-9]+$ ]] || [ "${batch_count}" -le 0 ]; then
+          echo "Invalid convert batch count for sample=${sample}: ${batch_count}" >&2
+          exit 1
+        fi
+        batch_failures=0
+        successful_batches=""
+        for ((batch_index = 0; batch_index < batch_count; batch_index++)); do
+          echo "[$(timestamp)] running sample=${sample} batch=$((batch_index + 1))/${batch_count}"
+          set +e
+          env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
+            "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
+            "CONVERT_DEFER_FINAL_MERGE=1" \
+            "${BIN_PATH}" "${sample}" "${batch_index}"
+          batch_status=$?
+          set -e
+          if [ "${batch_status}" -ne 0 ]; then
+            batch_failures=$((batch_failures + 1))
+            echo "[$(timestamp)] warning: sample=${sample} batch=$((batch_index + 1))/${batch_count} failed status=${batch_status}; continuing"
+            continue
+          fi
+          if [ -z "${successful_batches}" ]; then
+            successful_batches="${batch_index}"
+          else
+            successful_batches="${successful_batches},${batch_index}"
+          fi
+        done
+        if [ "${batch_failures}" -gt 0 ]; then
+          echo "[$(timestamp)] warning: sample=${sample} completed with ${batch_failures}/${batch_count} failed batch(es); final output uses successful batches only"
+        fi
+        echo "[$(timestamp)] running sample=${sample} final merge from successful batches"
         env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
           "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
-          "CONVERT_DEFER_FINAL_MERGE=1" \
-          "${BIN_PATH}" "${sample}" "${batch_index}"
-        batch_status=$?
-        set -e
-        if [ "${batch_status}" -ne 0 ]; then
-          batch_failures=$((batch_failures + 1))
-          echo "[$(timestamp)] warning: sample=${sample} batch=$((batch_index + 1))/${batch_count} failed status=${batch_status}; continuing"
-          continue
-        fi
-        if [ -z "${successful_batches}" ]; then
-          successful_batches="${batch_index}"
-        else
-          successful_batches="${successful_batches},${batch_index}"
-        fi
-      done
-      if [ "${batch_failures}" -gt 0 ]; then
-        echo "[$(timestamp)] warning: sample=${sample} completed with ${batch_failures}/${batch_count} failed batch(es); final output uses successful batches only"
-      fi
-      echo "[$(timestamp)] running sample=${sample} final merge from successful batches"
-      env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" \
-        "CONVERT_SUCCESSFUL_BATCHES=${successful_batches}" \
-        "${BIN_PATH}" "${sample}" --merge-successful-batches
-    ) &
-  else
-    nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &
+          "${BIN_PATH}" "${sample}" --merge-successful-batches
+      ) &
+    else
+      nohup env "${CONFIG_ENV_VAR}=${CONFIG_PATH}" "${BIN_PATH}" "${sample}" >> "${LOG_PATH}" 2>&1 &
+    fi
+    local pid=$!
+    RUNNING_PIDS+=("${pid}")
+    RUNNING_SAMPLES+=("${sample}")
+    echo "[$(timestamp)] started sample=${sample} pid=${pid}"
   fi
-  local pid=$!
-  RUNNING_PIDS+=("${pid}")
-  RUNNING_SAMPLES+=("${sample}")
-  echo "[$(timestamp)] started sample=${sample} pid=${pid}"
 }
 
-for sample in "${samples[@]}"; do
-  while [ "${#RUNNING_PIDS[@]}" -ge "${MAX_CONCURRENT_JOBS}" ]; do
+if $USE_SLURM; then
+  # Submit all jobs at once — SLURM handles scheduling
+  for sample in "${samples[@]}"; do
+    launch_job "${sample}"
+  done
+  echo "[$(timestamp)] all jobs submitted to SLURM"
+else
+  for sample in "${samples[@]}"; do
+    while [ "${#RUNNING_PIDS[@]}" -ge "${MAX_CONCURRENT_JOBS}" ]; do
+      if ! reap_finished_jobs; then
+        sleep 2
+      fi
+    done
+    launch_job "${sample}"
+  done
+
+  while [ "${#RUNNING_PIDS[@]}" -gt 0 ]; do
     if ! reap_finished_jobs; then
       sleep 2
     fi
   done
-  launch_job "${sample}"
-done
 
-while [ "${#RUNNING_PIDS[@]}" -gt 0 ]; do
-  if ! reap_finished_jobs; then
-    sleep 2
+  echo "[$(timestamp)] all jobs finished, failed_jobs=${FAILED_JOBS}"
+  if [ "${FAILED_JOBS}" -ne 0 ]; then
+    exit 1
   fi
-done
-
-echo "[$(timestamp)] all jobs finished, failed_jobs=${FAILED_JOBS}"
-if [ "${FAILED_JOBS}" -ne 0 ]; then
-  exit 1
 fi

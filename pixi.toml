@@ -1,0 +1,17 @@
+[workspace]
+authors = ["Jan-Frederik Schulte <jschulte@cern.ch>"]
+channels = ["conda-forge"]
+name = "ScoutingVVVTools"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.11.*"
+pandas = ">=3.0.3,<4"
+numpy = ">=2.4.6,<3"
+uproot = ">=5.7.4,<6"
+matplotlib = ">=3.11.0,<4"
+mplhep = ">=1.2.0,<2"
+xgboost = ">=3.2.0,<4"
