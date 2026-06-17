@@ -1,8 +1,8 @@
 {
   "lumi": 255.8,
-  "bdt_root": "../selections/BDT/fat2_UParTv2_v3",
-  "signal_region_csv": "../selections/signal_region/output/fat2_UParTv2_v3/signal_region.csv",
-  "output_dir": "./output/fat2_UParTv2_v3",
+  "bdt_root": "../selections/BDT/fat2_UParTv2_v2_wloose",
+  "signal_region_csv": "../selections/signal_region/output/fat2_UParTv2_v2_wloose/signal_region.csv",
+  "output_dir": "./output/bveto",
   "root_file_name": "qcd_abcd_yields.root",
   "qcd_predict_scale_multipliers": {
     "fat2": 7.0,

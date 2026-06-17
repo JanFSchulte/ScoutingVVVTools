@@ -66,41 +66,6 @@ const char* kDefaultSampleConfigPath = "../../src/sample.json";
 const int kRemoteInputOpenRetries = 5;
 const unsigned int kRemoteInputRetrySleepSeconds = 5;
 
-// CMS good-runs-and-lumisections list loaded from a golden JSON certification file.
-// Format: {"run": [[lumi_start, lumi_end], ...], ...}
-struct GoodRunsLumiList {
-    unordered_map<uint32_t, vector<pair<uint32_t, uint32_t>>> ranges;
-
-    bool empty() const { return ranges.empty(); }
-
-    bool contains(uint32_t run, uint32_t lumi) const {
-        const auto it = ranges.find(run);
-        if (it == ranges.end()) return false;
-        for (const auto& r : it->second) {
-            if (lumi >= r.first && lumi <= r.second) return true;
-        }
-        return false;
-    }
-};
-
-GoodRunsLumiList loadGoodRunsLumiList(const string& path) {
-    const JsonValue payload = simple_json::parseFile(path);
-    GoodRunsLumiList grl;
-    for (const auto& entry : payload.asObject()) {
-        const uint32_t run = static_cast<uint32_t>(stoul(entry.first));
-        for (const auto& rangeVal : entry.second.asArray()) {
-            const auto& bounds = rangeVal.asArray();
-            if (bounds.size() != 2) {
-                throw runtime_error("Expected [lumi_start, lumi_end] pair in golden JSON");
-            }
-            const uint32_t lo = static_cast<uint32_t>(bounds[0].asNumber());
-            const uint32_t hi = static_cast<uint32_t>(bounds[1].asNumber());
-            grl.ranges[run].push_back({lo, hi});
-        }
-    }
-    return grl;
-}
-
 enum class DataType {
     Float,
     Short,
@@ -417,13 +382,15 @@ struct TheoryWeightBufs {
 
 // Fixed-size output arrays written as branches to the converted ROOT trees.
 struct TheoryOutBufs {
-    static constexpr int kNPdf   = 101;
-    static constexpr int kNScale =   9;
-    static constexpr int kNPS    =   4;
-    float genWeight                  = 1.f;
-    float LHEPdfWeight[kNPdf]        = {};
-    float LHEScaleWeight[kNScale]    = {};
-    float PSWeight[kNPS]             = {};
+    static constexpr int kNPdf     = 101;
+    static constexpr int kNAlphaS  =   2;
+    static constexpr int kNScale   =   9;
+    static constexpr int kNPS      =   4;
+    float genWeight                      = 1.f;
+    float LHEPdfWeight[kNPdf]            = {};
+    float LHEPdfWeightAlphaS[kNAlphaS]   = {1.f, 1.f};
+    float LHEScaleWeight[kNScale]        = {};
+    float PSWeight[kNPS]                 = {};
 };
 
 struct OutputTreeState {
@@ -1554,6 +1521,7 @@ void activateTheoryInputBranches(TTree* tree, TheoryWeightBufs& buf) {
 void setupTheoryOutputBranches(OutputTreeState& treeState) {
     treeState.tree->Branch("genWeight",      &treeState.theoryOutBuf.genWeight,       "genWeight/F");
     treeState.tree->Branch("LHEPdfWeight",    treeState.theoryOutBuf.LHEPdfWeight,    "LHEPdfWeight[101]/F");
+    treeState.tree->Branch("LHEPdfWeightAlphaS", treeState.theoryOutBuf.LHEPdfWeightAlphaS, "LHEPdfWeightAlphaS[2]/F");
     treeState.tree->Branch("LHEScaleWeight",  treeState.theoryOutBuf.LHEScaleWeight,  "LHEScaleWeight[9]/F");
     treeState.tree->Branch("PSWeight",        treeState.theoryOutBuf.PSWeight,        "PSWeight[4]/F");
     treeState.hasTheoryBranches = true;
@@ -1565,6 +1533,16 @@ void copyTheoryWeights(const TheoryWeightBufs& src, TheoryOutBufs& dst) {
     const int nPdf = min(src.nLHEPdfWeight, TheoryOutBufs::kNPdf);
     for (int i = 0; i < nPdf; ++i) dst.LHEPdfWeight[i] = src.LHEPdfWeight[i];
     for (int i = nPdf; i < TheoryOutBufs::kNPdf; ++i) dst.LHEPdfWeight[i] = 1.f;
+    // alpha_s variations: for NNPDF31_*_hessian_pdfas (LHA 306000) the two
+    // alpha_s members (306101/306102) follow the central + 100 Hessian members
+    // at source indices 101 and 102. Stored in a dedicated branch because
+    // LHEPdfWeight keeps only the 101 PDF members. Defaults to 1.0 (no
+    // variation) when the source set has no alpha_s members.
+    for (int i = 0; i < TheoryOutBufs::kNAlphaS; ++i) {
+        const int srcIdx = TheoryOutBufs::kNPdf + i;   // source indices 101, 102
+        dst.LHEPdfWeightAlphaS[i] =
+            (srcIdx < src.nLHEPdfWeight) ? src.LHEPdfWeight[srcIdx] : 1.f;
+    }
     const int nScale = min(src.nLHEScaleWeight, TheoryOutBufs::kNScale);
     for (int i = 0; i < nScale; ++i) dst.LHEScaleWeight[i] = src.LHEScaleWeight[i];
     for (int i = nScale; i < TheoryOutBufs::kNScale; ++i) dst.LHEScaleWeight[i] = 1.f;
@@ -3467,15 +3445,6 @@ Long64_t processInputFile(const string& inputFileName,
 
         tree->GetEntry(entry);
 
-        if (!grl.empty()) {
-            const auto runIt  = rawScalarByName.find("run");
-            const auto lumiIt = rawScalarByName.find("luminosityBlock");
-            if (runIt != rawScalarByName.end() && lumiIt != rawScalarByName.end()
-                    && !grl.contains(runIt->second->uintValue, lumiIt->second->uintValue)) {
-                continue;
-            }
-        }
-
         const TheoryWeightBufs* theoryBufsPtr = sampleMeta.hasTheoryWeights ? &theoryInBuf : nullptr;
         unordered_map<string, long double> baseVars = buildRawScalarValues(branchConfig, sampleMeta, &pileupWeights, theoryBufsPtr);
 
@@ -3536,8 +3505,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                                            const BranchConfig& branchConfig,
                                            atomic<size_t>& processedFiles,
                                            size_t totalFiles,
-                                           atomic<Long64_t>& batchRawEntries,
-                                           const GoodRunsLumiList& grl) {
+                                           atomic<Long64_t>& batchRawEntries) {
     if (batchInputFiles.empty()) {
         throw runtime_error("Empty input batch for sample " + sampleMeta.sample);
     }
@@ -3600,8 +3568,7 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                                                               pileupWeights,
                                                               lumiMask,
                                                               threadConfigs[tid],
-                                                              threadResults[tid].outputTrees,
-                                                              grl);
+                                                              threadResults[tid].outputTrees);
                 batchRawEntries.fetch_add(fileEntries);
                 const size_t done = processedFiles.fetch_add(1) + 1;
 #pragma omp critical(convert_progress)
@@ -3992,8 +3959,7 @@ int main(int argc, char** argv) {
                                                                                  branchConfig,
                                                                                  processedFiles,
                                                                                  inputFiles.size(),
-                                                                                 batchRawEntries,
-                                                                                 grl);
+                                                                                 batchRawEntries);
             if (writtenBatchFiles.size() != 1) {
                 throw runtime_error("Expected one temporary batch file, got " +
                                     to_string(writtenBatchFiles.size()));

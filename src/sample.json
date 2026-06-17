@@ -153,7 +153,7 @@
       "is_signal": false,
       "xsection": 1960000000,
       "lumi": -1,
-      "raw_entries": 61134351
+      "raw_entries": 115255250
     },
     {
       "name": "qcd_ht400to600",
@@ -193,7 +193,7 @@
       "is_signal": false,
       "xsection": 890300,
       "lumi": -1,
-      "raw_entries": 57739736
+      "raw_entries": 111425445
     },
     {
       "name": "qcd_ht1200to1500",
@@ -203,7 +203,7 @@
       "is_signal": false,
       "xsection": 384800,
       "lumi": -1,
-      "raw_entries": 63709577
+      "raw_entries": 48920436
     },
     {
       "name": "qcd_ht1500to2000",
@@ -213,7 +213,7 @@
       "is_signal": false,
       "xsection": 127300,
       "lumi": -1,
-      "raw_entries": 115738116
+      "raw_entries": 102180878
     },
     {
       "name": "qcd_ht2000",

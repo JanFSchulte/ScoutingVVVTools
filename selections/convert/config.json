@@ -1,7 +1,7 @@
 {
   "tree_name": "Events",
   "run_sample": "www",
-  "submit_samples": ["2024I"],
+  "submit_samples": [],
   "max_threads": 18,
   "max_output_file_size_gb": 0,
   "resume_successful_batches": true,

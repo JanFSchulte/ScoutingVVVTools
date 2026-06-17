@@ -100,8 +100,8 @@ Sample selection for modes 0, 1, 6:
     p.add_argument("--slurm-cpus", type=int, default=1, metavar="N")
     p.add_argument("--slurm-extra", default="", metavar="ARGS",
                    help="Extra sbatch arguments (space-separated)")
-    p.add_argument("--slurm-files-per-job", type=int, default=250, metavar="N",
-                   help="Target input files per SLURM job for mode 0; default 250 pairs with --slurm-cpus=1 (serial) to keep per-job wall time reasonable")
+    p.add_argument("--slurm-files-per-job", type=int, default=125, metavar="N",
+                   help="Target input files per SLURM job for mode 0; default 125 pairs with --slurm-cpus=1 (serial) to keep per-job wall time reasonable")
     p.add_argument("--max-jobs", type=int, default=1, metavar="N",
                    help="Max concurrent local jobs (default: 1)")
 
