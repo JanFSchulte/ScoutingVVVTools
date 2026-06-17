@@ -1,0 +1,28 @@
+{
+  "lumi": 255.8,
+  "n_signal_regions": 4,
+  "bdt_root": "../BDT/fat2_UParTv2_v2_wloose",
+  "output_dir": "./output/fat2_UParTv2_v2_wloose_hist",
+  "score_axes": "independent",
+  "min_bkg_weight": 5.0,
+  "min_signal_weight": 0.0,
+  "min_signal_entries": 0,
+  "min_bkg_entries": 0,
+
+  "coarse_bin_width": 0.025,
+  "fine_bin_width": 0.005,
+  "fine_refine_window": 0.025,
+  "veto_bin_width": 0.01,
+  "beam_width": 64,
+  "top_intervals_per_axis": 8,
+  "coordinate_rounds": 6,
+  "fine_refine_passes": 2,
+  "global_beam_width": 512,
+  "max_selection_candidates": 400,
+  "selection_reps_per_axis": 60,
+  "branch_bound_max_nodes": 2000000,
+  "branch_bound_time_limit_seconds": 60,
+  "max_threads": 18,
+  "progress_every_seconds": 30,
+  "validate_prediction_reference": false
+}
