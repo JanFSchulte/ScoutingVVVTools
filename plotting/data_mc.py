@@ -3,13 +3,15 @@
 
 """Data vs MC histogram comparison plotter.
 
-Reads convert_branch.C output ROOT files directly for ordinary branches,
-including branches that are not BDT inputs, applies the trained-model
-selection.json clip/threshold cuts (no log transform), and draws a stacked MC +
-data panel with a Data/MC ratio sub-panel. Derived model score branches use the
-saved MC test split and validate against the trained-model prediction reference.
+Reads convert_branch.C output ROOT files directly (per-sample trees), optionally
+applies the trained-model selection.json clip/threshold cuts (no log transform),
+and draws a stacked MC + data panel with a Data/MC ratio sub-panel.
+
+Pass --no-selection to skip threshold and clip-range cuts on plot variables
+(BDT model clip ranges are still applied internally for score computation).
 """
 
+import argparse
 import gc
 import os
 import sys
@@ -20,6 +22,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import mplhep as hep
+import multiprocessing
 import uproot
 
 
@@ -67,11 +70,12 @@ _cfg_path = _resolve(_cfg_path, _SCRIPT_DIR)
 plot_cfg             = _load_json(_cfg_path)
 branch_overrides_cfg = _load_json(os.path.join(_SCRIPT_DIR, "branch.json"))
 
-SUBMIT_TREES     = plot_cfg.get("submit_trees", ["fat2", "fat3"])
-DATA_SAMPLES     = list(plot_cfg.get("data_samples", []))
-DEFAULT_BINS     = int(plot_cfg.get("default_bins", 10))
-OUTPUT_ROOT_PATT = plot_cfg.get("output_root", "./pre-selection/{tree_name}")
-BDT_ROOT_PATT    = plot_cfg["bdt_root"]
+SUBMIT_TREES          = plot_cfg.get("submit_trees", ["fat2", "fat3"])
+DATA_SAMPLES          = list(plot_cfg.get("data_samples", []))
+DEFAULT_BINS          = int(plot_cfg.get("default_bins", 10))
+OUTPUT_ROOT_PATT      = plot_cfg.get("output_root", "./pre-selection/{tree_name}")
+OUTPUT_ROOT_NOSEL_PATT = plot_cfg.get("output_root_nosel", "./no-selection/{tree_name}")
+BDT_ROOT_PATT         = plot_cfg["bdt_root"]
 
 SAMPLE_CFG_PATH         = _resolve(plot_cfg["sample_config"], _SCRIPT_DIR)
 CONVERT_BRANCH_CFG_PATH = _resolve(plot_cfg["convert_branch_config"], _SCRIPT_DIR)
@@ -79,7 +83,67 @@ CONVERT_BRANCH_CFG_PATH = _resolve(plot_cfg["convert_branch_config"], _SCRIPT_DI
 sample_cfg         = _load_json(SAMPLE_CFG_PATH)
 convert_branch_cfg = _load_json(CONVERT_BRANCH_CFG_PATH)
 
+_CONVERT_CFG_PATH = os.path.join(os.path.dirname(CONVERT_BRANCH_CFG_PATH), "config.json")
+convert_cfg       = _load_json(_CONVERT_CFG_PATH)
+
 SAMPLE_INFO = {s["name"]: s for s in sample_cfg["sample"]}
+
+# Optional theory-syst sidecar (produced by mode 8 / theory_syst.py).
+# If configured, the JSON is read once here and a flat fractional theory
+# uncertainty is drawn as a separate hatched band on each Data/MC plot.
+_theory_syst_json_path = plot_cfg.get("theory_syst_json", None)
+if _theory_syst_json_path is not None:
+    _theory_syst_json_path = _resolve(_theory_syst_json_path, _SCRIPT_DIR)
+THEORY_SYST_YIELDS = None
+if _theory_syst_json_path is not None and os.path.exists(_theory_syst_json_path):
+    THEORY_SYST_YIELDS = _load_json(_theory_syst_json_path)
+    log_message(f"Loaded theory syst yields from {_theory_syst_json_path}")
+elif _theory_syst_json_path is not None:
+    log_message(f"[WARN] theory_syst_json not found at {_theory_syst_json_path}; run mode 8 first")
+
+
+def _theory_frac_uncertainty(tree_name, class_groups, mc_target_totals):
+    """Return per-class fractional theory uncertainty (flat normalization).
+
+    Combines PDF, scale, PS_ISR, PS_FSR in quadrature.  Returns a dict
+    {class_name: fractional_uncertainty}.  Samples without theory weights
+    are treated as having zero theory uncertainty.
+
+    mc_target_totals: {sample_name: target_total} pre-computed by the caller.
+    """
+    if THEORY_SYST_YIELDS is None:
+        return {}
+
+    result = {}
+    for cls_name, samples in class_groups.items():
+        num2 = 0.0   # (weighted fractional uncertainty)^2 × class_yield^2
+        denom = 0.0  # total class yield (sum of target_totals)
+        for sname in samples:
+            target = mc_target_totals.get(sname, 0.0)
+            if target <= 0.0:
+                continue
+            denom += target
+            sdata = THEORY_SYST_YIELDS.get(sname, {}).get(tree_name)
+            if sdata is None:
+                continue
+            # Fractional uncertainty for each source: half-width of the band
+            # relative to central_ratio (≈ 1.0 for well-behaved MC).
+            def _half(up_key, dn_key):
+                u = float(sdata.get(up_key, 1.0))
+                d = float(sdata.get(dn_key, 1.0))
+                return 0.5 * abs(u - d)
+
+            delta = math.sqrt(
+                _half("pdf_up",     "pdf_down"    ) ** 2
+                + _half("scale_up",   "scale_down"  ) ** 2
+                + _half("ps_isr_up",  "ps_isr_down" ) ** 2
+                + _half("ps_fsr_up",  "ps_fsr_down" ) ** 2
+            )
+            num2 += (target * delta) ** 2
+
+        if denom > 0.0:
+            result[cls_name] = math.sqrt(num2) / denom
+    return result
 
 
 def _compute_lumi_total():
@@ -95,6 +159,10 @@ def _compute_lumi_total():
 
 
 LUMI_TOTAL = _compute_lumi_total()
+
+# Workers for multiprocessing pools: configurable via config.json "n_workers" (0 = cpu_count).
+_n_workers_cfg = plot_cfg.get("n_workers", None)
+_N_WORKERS = int(_n_workers_cfg) if _n_workers_cfg is not None else (os.cpu_count() or 4)
 
 
 # -------------------- Branch discovery --------------------
@@ -120,9 +188,16 @@ def _tree_output_entry(tree_name):
 
 
 def _plot_branches_for_tree(tree_name):
-    """Return branch names to plot (onlyMC=false, not skipped, slots expanded)."""
+    """Return branch names to plot (onlyMC=false, not skipped, slots expanded).
+
+    If ``config.json["plot_branches"][tree_name]`` is a non-null list, only
+    those names are included (after the normal skip/slot expansion).  A null
+    value or an absent key keeps the current "plot everything" behaviour.
+    """
     tree    = _tree_output_entry(tree_name)
     skip    = _skip_branches_for_tree(tree_name)
+    only_cfg = plot_cfg.get("plot_branches", {})
+    only    = only_cfg.get(tree_name) if isinstance(only_cfg, dict) else None
     scalars = tree.get("scalars", {})
     entries = list(scalars.get("regular", [])) + list(scalars.get("extrema", []))
     out, seen = [], set()
@@ -136,10 +211,14 @@ def _plot_branches_for_tree(tree_name):
                 n = f"{name}_{i + 1}"
                 if n in skip or n in seen:
                     continue
+                if only is not None and n not in only:
+                    continue
                 seen.add(n)
                 out.append(n)
         else:
             if name in skip or name in seen:
+                continue
+            if only is not None and name not in only:
                 continue
             seen.add(name)
             out.append(name)
@@ -151,12 +230,12 @@ def _bdt_root_for_tree(tree_name):
     return _resolve(BDT_ROOT_PATT.format(tree_name=tree_name), _SCRIPT_DIR)
 
 
-def _bdt_configs_for_tree(tree_name):
+def _bdt_configs_for_tree(tree_name, load_test_meta=True):
     bdt_root = _bdt_root_for_tree(tree_name)
     cfg = _load_json(os.path.join(bdt_root, "config.json"))
     br = _load_json(os.path.join(bdt_root, "branch.json"))
     sel = _load_json(os.path.join(bdt_root, "selection.json"))
-    meta = _load_json(os.path.join(bdt_root, "test_ranges.json"))
+    meta = _load_json(os.path.join(bdt_root, "test_ranges.json")) if load_test_meta else None
     return cfg, br, sel, meta
 
 
@@ -174,7 +253,9 @@ def _input_files(sample_name, input_root, input_pattern):
     if not info.get("is_MC", True):
         pattern = pattern.replace("{sample_group}_mixed", "{sample_group}")
     base = pattern.format(input_root=input_root, sample_group=sg, sample=sample_name)
+    print (base)
     stem = base[:-5] if base.endswith(".root") else base
+    print(glob.glob(base) + glob.glob(stem + "_*.root"))
     return sorted(glob.glob(base) + glob.glob(stem + "_*.root"))
 
 
@@ -194,15 +275,13 @@ def _concat_parts(parts):
     if len(parts) == 1:
         df = parts[0].reset_index(drop=True)
         parts.clear()
-        gc.collect()
         return df
     df = pd.concat(parts, ignore_index=True)
     parts.clear()
-    gc.collect()
     return df
 
 
-def _load_tree(files, tree_name, branches, max_entries=None):
+def _load_tree(files, tree_name, branches, strict=True, max_entries=None):
     parts = []
     remaining = None
     if max_entries is not None:
@@ -219,17 +298,26 @@ def _load_tree(files, tree_name, branches, max_entries=None):
             avail = set(tree.keys())
             missing = [b for b in branches if b not in avail]
             if missing:
-                raise KeyError(
-                    f"Missing branches in {fpath}:{tree_name}: "
-                    f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else "")
+                if strict:
+                    raise KeyError(
+                        f"Missing branches in {fpath}:{tree_name}: "
+                        f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else "")
+                    )
+                log_message(
+                    f"  [WARN] skipping {len(missing)} missing branch(es) in "
+                    f"{os.path.basename(fpath)}:{tree_name}: "
+                    f"{', '.join(missing[:5])}" + (" ..." if len(missing) > 5 else "")
                 )
+            load = [b for b in branches if b in avail]
+            if not load:
+                continue
             entry_stop = int(tree.num_entries)
             if remaining is not None:
                 entry_stop = min(entry_stop, remaining)
             if entry_stop <= 0:
                 continue
             df_part = tree.arrays(
-                branches,
+                load,
                 library="pd",
                 entry_start=0,
                 entry_stop=entry_stop,
@@ -238,6 +326,272 @@ def _load_tree(files, tree_name, branches, max_entries=None):
             if remaining is not None:
                 remaining -= len(df_part)
     return _concat_parts(parts)
+
+
+_CHUNK_SIZE = "200 MB"
+
+
+def _iter_chunks(files, tree_name, branches, strict=True):
+    """Yield DataFrame chunks from a list of files without loading all events at once."""
+    for fpath in files:
+        with uproot.open(fpath) as uf:
+            if tree_name not in uf:
+                continue
+            tree  = uf[tree_name]
+            avail = set(tree.keys())
+            missing = [b for b in branches if b not in avail]
+            if missing:
+                if strict:
+                    raise KeyError(
+                        f"Missing branches in {fpath}:{tree_name}: "
+                        f"{', '.join(missing[:10])}" + (" ..." if len(missing) > 10 else "")
+                    )
+                log_message(
+                    f"  [WARN] skipping {len(missing)} missing branch(es) in "
+                    f"{os.path.basename(fpath)}:{tree_name}: "
+                    f"{', '.join(missing[:5])}" + (" ..." if len(missing) > 5 else "")
+                )
+            load = [b for b in branches if b in avail]
+            if not load:
+                continue
+            for chunk in tree.iterate(expressions=load, step_size=_CHUNK_SIZE, library="pd"):
+                yield chunk
+
+
+def _prepass(files, tree_name, auto_range_branches, reweight_branches, branch_logx, strict):
+    """Single streaming pass to collect per-branch value ranges and the raw-weight sum.
+
+    Returns (raw_w_sum, ranges) where ranges = {branch: (lo, hi)}.
+    raw_w_sum is the sum of the product of reweight_branches over all events (1.0 each
+    if reweight_branches is empty), used later to normalise MC event weights.
+    """
+    prepass_cols = sorted(set(auto_range_branches) | set(reweight_branches))
+    raw_w_sum = 0.0
+    mins = {b:  np.inf for b in auto_range_branches}
+    maxs = {b: -np.inf for b in auto_range_branches}
+
+    for chunk in _iter_chunks(files, tree_name, prepass_cols, strict=strict):
+        raw_w = np.ones(len(chunk), dtype=float)
+        for rb in reweight_branches:
+            if rb in chunk.columns:
+                raw_w *= chunk[rb].to_numpy(dtype=float, copy=False)
+        raw_w_sum += float(raw_w.sum())
+
+        for b in auto_range_branches:
+            if b not in chunk.columns:
+                continue
+            arr = chunk[b].to_numpy(dtype=float, copy=False)
+            valid = arr[arr >= -990]
+            if branch_logx.get(b, False):
+                valid = valid[valid > 0]
+            if valid.size == 0:
+                continue
+            mins[b] = min(mins[b], float(valid.min()))
+            maxs[b] = max(maxs[b], float(valid.max()))
+
+    ranges = {}
+    for b in auto_range_branches:
+        lo, hi = mins[b], maxs[b]
+        if np.isfinite(lo) and np.isfinite(hi) and lo <= hi:
+            ranges[b] = (lo, hi)
+
+    return raw_w_sum, ranges
+
+
+def _prepass_worker(args):
+    files, tree_name, auto_range_branches, reweight_branches, branch_logx, strict = args
+    return _prepass(files, tree_name, auto_range_branches, reweight_branches, branch_logx, strict)
+
+
+def _stream_hists(files, tree_name, branch_edges, target_total, raw_w_sum,
+                  reweight_branches, plot_thresholds, plot_clip_ranges, strict):
+    """Stream files and accumulate weighted histograms for all branches in branch_edges.
+
+    Returns {branch: (h, h2)} where h = sum-of-weights and h2 = sum-of-weights-squared.
+    For data pass target_total=1.0, raw_w_sum=1.0, reweight_branches=[].
+    """
+    load_cols = sorted(set(branch_edges.keys())
+                       | set(plot_thresholds.keys())
+                       | set(plot_clip_ranges.keys())
+                       | set(reweight_branches))
+
+    hists = {b: [np.zeros(len(edges) - 1, dtype=float),
+                 np.zeros(len(edges) - 1, dtype=float)]
+             for b, edges in branch_edges.items()}
+
+    for chunk in _iter_chunks(files, tree_name, load_cols, strict=strict):
+        # Compute per-event weights before any filtering.
+        raw_w = np.ones(len(chunk), dtype=float)
+        for rb in reweight_branches:
+            if rb in chunk.columns:
+                raw_w *= chunk[rb].to_numpy(dtype=float, copy=False)
+        weight = raw_w * (target_total / raw_w_sum) if raw_w_sum > 0 else np.zeros(len(chunk))
+
+        # Drop reweight columns — they are not plot variables.
+        drop = [rb for rb in reweight_branches if rb in chunk.columns]
+        if drop:
+            chunk = chunk.drop(columns=drop)
+
+        # Apply threshold cuts and clip ranges.
+        if plot_thresholds:
+            mask = _threshold_mask(chunk, plot_thresholds).to_numpy(dtype=bool)
+            chunk  = chunk[mask].reset_index(drop=True)
+            weight = weight[mask]
+
+        if len(chunk) == 0:
+            continue
+
+        if plot_clip_ranges:
+            _apply_clip(chunk, plot_clip_ranges)
+
+        # Accumulate histograms.
+        for b, edges in branch_edges.items():
+            if b not in chunk.columns:
+                continue
+            h, h2 = _weighted_hist(chunk[b].to_numpy(dtype=float, copy=False), weight, edges)
+            hists[b][0] += h
+            hists[b][1] += h2
+
+    return {b: (hists[b][0], hists[b][1]) for b in hists}
+
+
+def _stream_hists_worker(args):
+    files, tree_name, branch_edges, target_total, raw_w_sum, \
+        reweight_branches, plot_thresholds, plot_clip_ranges, strict = args
+    return _stream_hists(files, tree_name, branch_edges, target_total, raw_w_sum,
+                         reweight_branches, plot_thresholds, plot_clip_ranges, strict)
+
+
+# -------------------- Theory shape variations (per-bin) --------------------
+# Member layout of the per-event theory weights, matched to the convert output:
+#   PDF[101] (member 0 = central), alpha_s[2], scale[9], PS[4].
+_TH_N_PDF       = 101
+_TH_N_ALPHAS    = 2
+_TH_N_SCALE     = 9
+_TH_N_PS        = 4
+_TH_N_MEMBERS   = _TH_N_PDF + _TH_N_ALPHAS + _TH_N_SCALE + _TH_N_PS
+_TH_OFF_PDF     = 0
+_TH_OFF_ALPHAS  = _TH_N_PDF
+_TH_OFF_SCALE   = _TH_N_PDF + _TH_N_ALPHAS
+_TH_OFF_PS      = _TH_N_PDF + _TH_N_ALPHAS + _TH_N_SCALE
+_TH_SCALE_VALID = [0, 1, 3, 4, 5, 7, 8]   # drop anti-correlated corners 2 and 6
+
+
+def _stream_theory_shape(files, tree_name, branch_edges, target_total, raw_w_sum,
+                         reweight_branches, plot_thresholds, plot_clip_ranges, strict):
+    """Per-bin theory member histograms for one MC sample (shape variations).
+
+    Reads with library='np' so the array-valued theory weight branches load.
+    Returns {branch: member_hist} with member_hist of shape (nbins,
+    _TH_N_MEMBERS): each column is the branch histogram filled with
+    weight = nominal_weight * theory_member_weight, so deviations from column 0
+    (the central PDF member, == nominal) give the per-bin theory variation.
+    Same nominal weight / threshold / clip handling as _stream_hists.  Returns {}
+    when the sample's files carry no theory weights.
+    """
+    scalar_cols = sorted(set(branch_edges.keys())
+                         | set(plot_thresholds.keys())
+                         | set(plot_clip_ranges.keys())
+                         | set(reweight_branches))
+    theory_arr_branches = ["LHEPdfWeight", "LHEPdfWeightAlphaS", "LHEScaleWeight", "PSWeight"]
+    member_hists = {b: np.zeros((len(edges) - 1, _TH_N_MEMBERS), dtype=float)
+                    for b, edges in branch_edges.items()}
+    found = False
+
+    for fpath in files:
+        with uproot.open(fpath) as uf:
+            if tree_name not in uf:
+                continue
+            tree = uf[tree_name]
+            avail = set(tree.keys())
+            if "LHEPdfWeight" not in avail:
+                continue   # no theory weights in this file
+            found = True
+            load = ([c for c in scalar_cols if c in avail]
+                    + [b for b in theory_arr_branches if b in avail])
+            for chunk in tree.iterate(expressions=load, step_size=_CHUNK_SIZE, library="np"):
+                n = len(chunk["LHEPdfWeight"])
+                raw_w = np.ones(n, dtype=float)
+                for rb in reweight_branches:
+                    if rb in chunk:
+                        raw_w *= np.asarray(chunk[rb], dtype=float)
+                weight = raw_w * (target_total / raw_w_sum) if raw_w_sum > 0 else np.zeros(n)
+
+                # Reuse the pandas threshold/clip helpers on the scalar columns.
+                df = pd.DataFrame({c: np.asarray(chunk[c]) for c in scalar_cols if c in chunk})
+                mask = np.ones(n, dtype=bool)
+                if plot_thresholds:
+                    mask = _threshold_mask(df, plot_thresholds).to_numpy(dtype=bool)
+                if not mask.any():
+                    continue
+                df = df[mask].reset_index(drop=True)
+                weight = weight[mask]
+                if plot_clip_ranges:
+                    _apply_clip(df, plot_clip_ranges)
+
+                nsel = len(weight)
+                M = np.ones((nsel, _TH_N_MEMBERS), dtype=float)
+
+                def _fill(name, off, count):
+                    if name in chunk:
+                        a = np.asarray(chunk[name], dtype=float)[mask].reshape(nsel, -1)
+                        c = min(count, a.shape[1])
+                        M[:, off:off + c] = a[:, :c]
+
+                _fill("LHEPdfWeight",       _TH_OFF_PDF,    _TH_N_PDF)
+                _fill("LHEPdfWeightAlphaS", _TH_OFF_ALPHAS, _TH_N_ALPHAS)
+                _fill("LHEScaleWeight",     _TH_OFF_SCALE,  _TH_N_SCALE)
+                _fill("PSWeight",           _TH_OFF_PS,     _TH_N_PS)
+                WM = weight[:, None] * M
+
+                for b, edges in branch_edges.items():
+                    if b not in df.columns:
+                        continue
+                    vals = df[b].to_numpy(dtype=float)
+                    nb = len(edges) - 1
+                    in_range = np.isfinite(vals) & (vals >= edges[0]) & (vals <= edges[-1])
+                    if not in_range.any():
+                        continue
+                    bi = np.clip(np.searchsorted(edges, vals, side="right") - 1, 0, nb - 1)
+                    np.add.at(member_hists[b], bi[in_range], WM[in_range])
+
+    return member_hists if found else {}
+
+
+def _stream_theory_shape_worker(args):
+    return _stream_theory_shape(*args)
+
+
+def _theory_shape_band(member_hist):
+    """(band_up, band_down) absolute per-bin theory uncertainty from member hists.
+
+    PDF: symmetric-Hessian quadrature over the 100 members; alpha_s: half the
+    up/down spread; scale and PS(ISR/FSR): per-bin envelopes (asymmetric).  All
+    sources combined per bin in quadrature.  Column 0 (central PDF member) is the
+    nominal yield of the theory samples.
+    """
+    central = member_hist[:, _TH_OFF_PDF]
+    pdf = member_hist[:, _TH_OFF_PDF + 1:_TH_OFF_PDF + _TH_N_PDF]
+    sig_pdf2 = np.sum((pdf - central[:, None]) ** 2, axis=1)
+
+    as_dn = member_hist[:, _TH_OFF_ALPHAS]
+    as_up = member_hist[:, _TH_OFF_ALPHAS + 1]
+    sig_as2 = (0.5 * np.abs(as_up - as_dn)) ** 2
+
+    scale = member_hist[:, [_TH_OFF_SCALE + i for i in _TH_SCALE_VALID]]
+    scale_up = np.clip(scale.max(axis=1) - central, 0.0, None)
+    scale_dn = np.clip(central - scale.min(axis=1), 0.0, None)
+
+    isr = member_hist[:, [_TH_OFF_PS + 0, _TH_OFF_PS + 1]]
+    fsr = member_hist[:, [_TH_OFF_PS + 2, _TH_OFF_PS + 3]]
+    isr_up = np.clip(isr.max(axis=1) - central, 0.0, None)
+    isr_dn = np.clip(central - isr.min(axis=1), 0.0, None)
+    fsr_up = np.clip(fsr.max(axis=1) - central, 0.0, None)
+    fsr_dn = np.clip(central - fsr.min(axis=1), 0.0, None)
+
+    band_up = np.sqrt(sig_pdf2 + sig_as2 + scale_up ** 2 + isr_up ** 2 + fsr_up ** 2)
+    band_dn = np.sqrt(sig_pdf2 + sig_as2 + scale_dn ** 2 + isr_dn ** 2 + fsr_dn ** 2)
+    return band_up, band_dn
 
 
 # -------------------- Threshold and clip filtering --------------------
@@ -302,12 +656,17 @@ def _apply_clip(df, clip_ranges):
     for col, rng in clip_ranges.items():
         if col not in df.columns:
             continue
-        arr   = df[col].values.astype(float, copy=True)
+        arr = df[col].to_numpy(dtype=float, copy=False)
         valid = arr >= -990
         lo, hi = rng
-        if lo is not None:
+        lo_mask = (lo is not None) and np.any(valid & (arr < lo))
+        hi_mask = (hi is not None) and np.any(valid & (arr > hi))
+        if not lo_mask and not hi_mask:
+            continue
+        arr = arr.copy()
+        if lo_mask:
             arr[valid & (arr < lo)] = lo
-        if hi is not None:
+        if hi_mask:
             arr[valid & (arr > hi)] = hi
         df[col] = arr
     return df
@@ -320,14 +679,17 @@ def _drop_unneeded_columns(df, keep_columns):
     drop_cols = [col for col in df.columns if col not in keep]
     if drop_cols:
         df = df.drop(columns=drop_cols)
-        gc.collect()
     return df
 
 
 def _standardize_model_X(X, clip_ranges, log_transform):
     log_set = set(log_transform)
-    for col in X.columns:
-        arr = X[col].values.copy()
+    cols_to_modify = [col for col in X.columns if col in clip_ranges or col in log_set]
+    if not cols_to_modify:
+        return X
+    X = X.copy()
+    for col in cols_to_modify:
+        arr = X[col].to_numpy(dtype=float, copy=True)
         sentinel = arr < -990
         valid = ~sentinel
         if not valid.any():
@@ -340,8 +702,6 @@ def _standardize_model_X(X, clip_ranges, log_transform):
         if col in log_set:
             pos = valid & (arr > 0)
             if pos.any():
-                if not np.issubdtype(arr.dtype, np.floating):
-                    arr = arr.astype(float)
                 arr[pos] = np.log(arr[pos])
         X[col] = arr
     return X
@@ -587,6 +947,10 @@ def _resolve_binning(tree_name, branch, arrs, log_tf_set):
         x_range = (float(x_lo), float(x_hi))
     elif branch.startswith("score_"):
         x_range = (0.0, 1.0)
+    elif isinstance(arrs, tuple):
+        # Pre-computed (lo, hi) from the streaming pre-pass.
+        lo, hi = arrs
+        x_range = (lo, lo + 1.0) if lo >= hi else (lo, hi)
     else:
         x_range = _auto_range(arrs, logx)
         if x_range is None:
@@ -643,6 +1007,111 @@ def _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, dat
     )
 
 
+# -------------------- Histogram cache (for --restyle) --------------------
+def _save_branch_hists(out_dir, tree_name, branch, edges, mc_per_cls, data_v, data_w2,
+                       logx, logy, x_range, y_range, class_names, color_map, theory_fracs,
+                       theory_shape_up=None, theory_shape_down=None):
+    """Persist histogram arrays to JSON so plots can be restyled without re-reading ROOT files."""
+    payload = {
+        "branch":      branch,
+        "tree_name":   tree_name,
+        "class_names": class_names,
+        "color_map":   color_map,
+        "edges":       edges.tolist(),
+        "mc_h":  {cls: mc_per_cls[cls][0].tolist() for cls in class_names},
+        "mc_h2": {cls: mc_per_cls[cls][1].tolist() for cls in class_names},
+        "data_v":  data_v.tolist(),
+        "data_w2": data_w2.tolist(),
+        "logx":    logx,
+        "logy":    logy,
+        "x_range": list(x_range),
+        "y_range": list(y_range) if y_range is not None else None,
+        "theory_fracs": theory_fracs if theory_fracs else {},
+        "theory_shape_up":   theory_shape_up.tolist()   if theory_shape_up   is not None else None,
+        "theory_shape_down": theory_shape_down.tolist() if theory_shape_down is not None else None,
+    }
+    path = os.path.join(out_dir, f"{tree_name}_{branch}_hists.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    return path
+
+
+def _restyle_from_hists(hists_path, out_dir):
+    """Re-render the two PDFs for one branch from a saved histogram JSON."""
+    with open(hists_path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    branch      = d["branch"]
+    tree_name   = d["tree_name"]
+    class_names = d["class_names"]
+    color_map   = d["color_map"]
+    edges       = np.array(d["edges"])
+    mc_per_cls  = {cls: (np.array(d["mc_h"][cls]), np.array(d["mc_h2"][cls]))
+                   for cls in class_names}
+    data_v      = np.array(d["data_v"])
+    data_w2     = np.array(d["data_w2"])
+    logx        = d["logx"]
+    logy        = d["logy"]
+    x_range     = tuple(d["x_range"])
+    y_range     = tuple(d["y_range"]) if d["y_range"] is not None else None
+    theory_fracs = d.get("theory_fracs", {})
+    sh_up = np.array(d["theory_shape_up"])   if d.get("theory_shape_up")   is not None else None
+    sh_dn = np.array(d["theory_shape_down"]) if d.get("theory_shape_down") is not None else None
+
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_widths  = edges[1:] - edges[:-1]
+    mc_total_v  = np.zeros(len(bin_centers))
+    mc_total_w2 = np.zeros(len(bin_centers))
+    for cls in class_names:
+        mc_total_v  += mc_per_cls[cls][0]
+        mc_total_w2 += mc_per_cls[cls][1]
+
+    out_path = os.path.join(out_dir, f"{tree_name}_{branch}.pdf")
+    _draw_data_mc_plot(
+        class_names=class_names, color_map=color_map,
+        edges=edges, bin_centers=bin_centers, bin_widths=bin_widths,
+        mc_per_cls=mc_per_cls, mc_total_v=mc_total_v, mc_total_w2=mc_total_w2,
+        data_v=data_v, data_w2=data_w2,
+        branch=branch, x_range=x_range, logx=logx, logy=logy, y_range=y_range,
+        y_label="Events", out_path=out_path, logy_floor=0.1,
+        theory_fracs=theory_fracs, theory_shape_up=sh_up, theory_shape_down=sh_dn,
+    )
+    log_message(f"Wrote plot file: {out_path}")
+
+    (mc_per_cls_norm, mc_total_v_norm, mc_total_w2_norm, data_v_norm, data_w2_norm) = \
+        _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2)
+    out_path_normal = os.path.join(out_dir, f"{tree_name}_{branch}_normal.pdf")
+    _draw_data_mc_plot(
+        class_names=class_names, color_map=color_map,
+        edges=edges, bin_centers=bin_centers, bin_widths=bin_widths,
+        mc_per_cls=mc_per_cls_norm, mc_total_v=mc_total_v_norm, mc_total_w2=mc_total_w2_norm,
+        data_v=data_v_norm, data_w2=data_w2_norm,
+        branch=branch, x_range=x_range, logx=logx, logy=logy, y_range=y_range,
+        y_label="A.U.", out_path=out_path_normal, logy_floor=None,
+    )
+    log_message(f"Wrote plot file: {out_path_normal}")
+
+
+def _restyle_tree(tree_name, no_selection=False, n_workers=None):
+    """Re-render all cached branch plots for one tree without reading ROOT files."""
+    if n_workers is None:
+        n_workers = _N_WORKERS
+    out_patt = OUTPUT_ROOT_NOSEL_PATT if no_selection else OUTPUT_ROOT_PATT
+    out_dir  = _resolve(out_patt.format(tree_name=tree_name), _SCRIPT_DIR)
+    pattern  = os.path.join(out_dir, f"{tree_name}_*_hists.json")
+    hists_files = sorted(glob.glob(pattern))
+    if not hists_files:
+        log_message(f"[WARN] No histogram cache files found in {out_dir} for tree '{tree_name}'")
+        return
+    log_message(f"Restyling {len(hists_files)} cached branches for tree '{tree_name}' ({n_workers} workers)")
+    if n_workers > 1 and len(hists_files) > 1:
+        with multiprocessing.Pool(processes=min(len(hists_files), n_workers)) as pool:
+            pool.map(_restyle_worker, [(h, out_dir) for h in hists_files])
+    else:
+        for hpath in hists_files:
+            _restyle_from_hists(hpath, out_dir)
+    log_message(f"Finished restyling for tree={tree_name}")
+
+
 def _draw_data_mc_plot(
     *,
     class_names,
@@ -663,6 +1132,9 @@ def _draw_data_mc_plot(
     y_label,
     out_path,
     logy_floor=0.1,
+    theory_fracs=None,
+    theory_shape_up=None,
+    theory_shape_down=None,
 ):
     bins = len(bin_centers)
     fig, (ax, axr) = plt.subplots(
@@ -692,6 +1164,35 @@ def _draw_data_mc_plot(
         bin_centers, lower, upper, step="mid",
         facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
     )
+
+    # Theory uncertainty band.  Prefer the per-bin SHAPE band (computed from the
+    # LHE weight variations); otherwise fall back to a per-bin flat-normalization
+    # band built from the integrated per-class fractional uncertainties.
+    theory_up = theory_dn = None
+    if theory_shape_up is not None and theory_shape_down is not None:
+        up = np.asarray(theory_shape_up, dtype=float)
+        dn = np.asarray(theory_shape_down, dtype=float)
+        if up.shape == mc_total_v.shape and (np.any(up > 0.0) or np.any(dn > 0.0)):
+            theory_up, theory_dn = up, dn
+    if theory_up is None and theory_fracs:
+        # Flat-normalization fallback: scale each class's per-bin yield by its
+        # fractional uncertainty and combine classes in quadrature (symmetric).
+        theory_var = np.zeros(bins)
+        for cls_name in class_names:
+            delta_cls = float(theory_fracs.get(cls_name, 0.0))
+            if delta_cls > 0.0:
+                theory_var += (mc_per_cls[cls_name][0] * delta_cls) ** 2
+        band = np.sqrt(theory_var)
+        if np.any(band > 0.0):
+            theory_up = theory_dn = band
+    if theory_up is not None:
+        th_lower = np.clip(mc_total_v - theory_dn, 1e-12, None)
+        th_upper = mc_total_v + theory_up
+        ax.fill_between(
+            bin_centers, th_lower, th_upper, step="mid",
+            facecolor="none", edgecolor="#e07b39", hatch="\\\\\\", linewidth=0,
+            label="Theory unc.",
+        )
 
     data_sigma = np.sqrt(np.maximum(data_w2, 0.0))
     y_plot = np.where(data_v > 0, data_v, np.nan)
@@ -738,6 +1239,24 @@ def _draw_data_mc_plot(
     ax.legend(handles, labels, loc="best", fontsize=17, frameon=False, ncol=2)
 
     ratio, r_err = _ratio_data_over_mc(data_v, data_w2, mc_total_v, mc_total_w2)
+    # MC uncertainty bands around 1.0 in the ratio panel (where Data/MC
+    # agreement is read off against the systematics): gray /// = MC stat,
+    # orange \\\ = theory.  Drawn under the data points.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        safe_mc = np.where(mc_total_v > 0.0, mc_total_v, np.nan)
+        stat_rel = np.abs(mc_sigma / safe_mc)
+        axr.fill_between(
+            bin_centers, 1.0 - stat_rel, 1.0 + stat_rel, step="mid",
+            facecolor="none", edgecolor="gray", hatch="///", linewidth=0,
+        )
+        if theory_up is not None:
+            th_rel_up = np.abs(theory_up / safe_mc)
+            th_rel_dn = np.abs(theory_dn / safe_mc)
+            axr.fill_between(
+                bin_centers, 1.0 - th_rel_dn, 1.0 + th_rel_up, step="mid",
+                facecolor="none", edgecolor="#e07b39", hatch="\\\\\\", linewidth=0,
+            )
+
     axr.errorbar(
         bin_centers, ratio, yerr=r_err,
         fmt="o", ms=7.6, color="black", mfc="black", mec="black",
@@ -767,33 +1286,99 @@ def _draw_data_mc_plot(
     plt.close(fig)
 
 
+# -------------------- Parallel workers --------------------
+def _draw_plot_job(job):
+    """Render the absolute and unit-normalised PDFs for one branch (pool worker)."""
+    out_dir      = job["out_dir"]
+    tree_name    = job["tree_name"]
+    branch       = job["branch"]
+    class_names  = job["class_names"]
+    color_map    = job["color_map"]
+    edges        = job["edges"]
+    bin_centers  = job["bin_centers"]
+    bin_widths   = job["bin_widths"]
+    mc_per_cls   = job["mc_per_cls"]
+    mc_total_v   = job["mc_total_v"]
+    mc_total_w2  = job["mc_total_w2"]
+    data_v       = job["data_v"]
+    data_w2      = job["data_w2"]
+    x_range      = job["x_range"]
+    logx         = job["logx"]
+    logy         = job["logy"]
+    y_range      = job["y_range"]
+    theory_fracs = job.get("theory_fracs", {})
+    sh_up        = job.get("theory_shape_up", None)
+    sh_dn        = job.get("theory_shape_down", None)
+
+    out_path = os.path.join(out_dir, f"{tree_name}_{branch}.pdf")
+    _draw_data_mc_plot(
+        class_names=class_names, color_map=color_map,
+        edges=edges, bin_centers=bin_centers, bin_widths=bin_widths,
+        mc_per_cls=mc_per_cls, mc_total_v=mc_total_v, mc_total_w2=mc_total_w2,
+        data_v=data_v, data_w2=data_w2,
+        branch=branch, x_range=x_range, logx=logx, logy=logy, y_range=y_range,
+        y_label="Events", out_path=out_path, logy_floor=0.1,
+        theory_fracs=theory_fracs, theory_shape_up=sh_up, theory_shape_down=sh_dn,
+    )
+    (mc_per_cls_norm, mc_total_v_norm, mc_total_w2_norm, data_v_norm, data_w2_norm) = \
+        _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2)
+    out_path_normal = os.path.join(out_dir, f"{tree_name}_{branch}_normal.pdf")
+    _draw_data_mc_plot(
+        class_names=class_names, color_map=color_map,
+        edges=edges, bin_centers=bin_centers, bin_widths=bin_widths,
+        mc_per_cls=mc_per_cls_norm, mc_total_v=mc_total_v_norm, mc_total_w2=mc_total_w2_norm,
+        data_v=data_v_norm, data_w2=data_w2_norm,
+        branch=branch, x_range=x_range, logx=logx, logy=logy, y_range=y_range,
+        y_label="A.U.", out_path=out_path_normal, logy_floor=None,
+    )
+    return out_path, out_path_normal
+
+
+def _restyle_worker(args):
+    hists_path, out_dir = args
+    _restyle_from_hists(hists_path, out_dir)
+
+
 # -------------------- Per-tree processing --------------------
-def _process_tree(tree_name):
-    log_message(f"Running data_mc.py: tree={tree_name}")
+def _process_tree(tree_name, no_selection=False, use_cached_ranges=False, save_hists=False, n_workers=None):
+    if n_workers is None:
+        n_workers = _N_WORKERS
+    log_message(f"Running data_mc.py: tree={tree_name}, no_selection={no_selection}, n_workers={n_workers}")
 
     log_message("Loading trained-model config copies")
-    bdt_cfg, bdt_br, bdt_sel, test_meta = _bdt_configs_for_tree(tree_name)
+    bdt_cfg, bdt_br, bdt_sel, test_meta = _bdt_configs_for_tree(tree_name, load_test_meta=not no_selection)
     class_groups     = bdt_cfg["class_groups"]
     class_names      = list(class_groups.keys())
     model_branches   = [item["name"] for item in bdt_br[tree_name]]
-    score_branches   = [_score_branch_name(class_name) for class_name in class_names]
-    entries_per_sample = int(bdt_cfg.get("entries_per_sample", 1_000_000) * 0.5)
-    if entries_per_sample <= 0:
-        raise RuntimeError(
-            f"bdt_root config entries_per_sample must be positive, got {entries_per_sample}"
-        )
+    # Score branches require a trained model; skip them in --no-selection mode.
+    score_branches   = [] if no_selection else [_score_branch_name(class_name) for class_name in class_names]
 
-    # Resolve input_root relative to the BDT script directory used by train.py.
     bdt_root_dir   = _bdt_root_for_tree(tree_name)
     bdt_script_dir = os.path.dirname(bdt_root_dir)
-    input_root     = _resolve(bdt_cfg["input_root"], bdt_script_dir)
-    input_pattern  = bdt_cfg["input_pattern"]
+    if no_selection:
+        # Read directly from the convert output (no mixing step required).
+        _conv_dir     = os.path.dirname(_CONVERT_CFG_PATH)
+        input_root    = _resolve(convert_cfg["output_root"], _conv_dir)
+        # convert uses {output_root} as placeholder; _input_files expects {input_root}
+        input_pattern = convert_cfg["output_pattern"].replace("{output_root}", "{input_root}")
+    else:
+        input_root    = _resolve(bdt_cfg["input_root"], bdt_script_dir)
+        input_pattern = bdt_cfg["input_pattern"]
 
-    sel         = bdt_sel.get(tree_name, {})
-    clip_ranges = {k: tuple(v) for k, v in sel.get("clip_ranges", {}).items()}
-    thresholds  = {k: (tuple(v) if isinstance(v, list) else v)
-                   for k, v in sel.get("thresholds", {}).items()}
-    log_tf_set  = set(sel.get("log_transform", []))
+    sel              = bdt_sel.get(tree_name, {})
+    clip_ranges      = {k: tuple(v) for k, v in sel.get("clip_ranges", {}).items()}
+    thresholds       = {k: (tuple(v) if isinstance(v, list) else v)
+                        for k, v in sel.get("thresholds", {}).items()}
+    log_tf_set       = set(sel.get("log_transform", []))
+    # When --no-selection is active, skip event-level cuts and plot-variable clipping.
+    # clip_ranges is still passed to _standardize_model_X so BDT scores stay valid.
+    # Extra plot-only thresholds from config.json["plot_thresholds"][tree_name] are always
+    # applied (even in --no-selection mode) and do not affect BDT training/selection.json.
+    _extra_thresh_cfg = plot_cfg.get("plot_thresholds", {}).get(tree_name, {}) or {}
+    extra_plot_thresholds = {k: (tuple(v) if isinstance(v, list) else v)
+                             for k, v in _extra_thresh_cfg.items()}
+    plot_thresholds  = {**({} if no_selection else thresholds), **extra_plot_thresholds}
+    plot_clip_ranges = {} if no_selection else clip_ranges
 
     skip_score = _skip_branches_for_tree(tree_name)
     branches_to_plot = _plot_branches_for_tree(tree_name)
@@ -802,30 +1387,44 @@ def _process_tree(tree_name):
         if branch not in branches_to_plot:
             branches_to_plot.append(branch)
     root_plot_branches = [branch for branch in branches_to_plot if branch not in score_branches]
-    need_load        = sorted(set(root_plot_branches)
-                              | set(thresholds.keys())
-                              | set(clip_ranges.keys()))
     reweight_cfg      = plot_cfg.get("event_reweight_branches", {})
     reweight_branches = list(reweight_cfg.get(tree_name, []))
-    mc_need_load     = sorted(set(need_load) | set(reweight_branches))
     score_reweight_branches = list(bdt_cfg.get(tree_name, {}).get("event_reweight_branches", []))
     log_message(
         f"Resolved plotting config: branches={len(branches_to_plot)}, "
         f"threshold_branches={len(thresholds)}, clip_branches={len(clip_ranges)}, "
         f"reweight_branches={len(reweight_branches)}, score_branches={len(score_branches)}"
     )
-    log_message(f"Ordinary MC branch entry cap per sample: {entries_per_sample}")
-
-    out_dir = _resolve(OUTPUT_ROOT_PATT.format(tree_name=tree_name), _SCRIPT_DIR)
+    out_patt = OUTPUT_ROOT_NOSEL_PATT if no_selection else OUTPUT_ROOT_PATT
+    out_dir = _resolve(out_patt.format(tree_name=tree_name), _SCRIPT_DIR)
     os.makedirs(out_dir, exist_ok=True)
     log_message(f"Output directory: {out_dir}")
 
-    # Load the MC events for each class.
-    log_message(f"Loading MC samples for {len(class_names)} classes")
-    class_dfs = {}
+    # Determine which root branches need auto-ranging (no explicit x_range override).
+    branch_logx = {b: bool(_branch_override(tree_name, b).get("logx", b in log_tf_set))
+                   for b in root_plot_branches}
+    auto_range_branches = [b for b in root_plot_branches
+                           if "x_range" not in _branch_override(tree_name, b)
+                           and not b.startswith("score_")]
+
+    # Ranges cache: auto-saved after every full run; loaded with --use-cached-ranges
+    # to skip the range-collection pre-pass (MC pre-pass still runs for reweight sums).
+    _ranges_cache_path = os.path.join(out_dir, ".ranges_cache.json")
+    _using_range_cache = use_cached_ranges and os.path.exists(_ranges_cache_path)
+    if _using_range_cache:
+        _cached_ranges = _load_json(_ranges_cache_path)
+        merged_ranges = {b: tuple(v) for b, v in _cached_ranges.items()}
+        auto_range_branches = []  # skip range collection; pre-pass only reads reweight cols
+        log_message(f"Loaded ranges cache: {_ranges_cache_path} ({len(merged_ranges)} branches)")
+
+    # ---- Step 1: Discover files and count entries (serial, fast metadata reads) ----
+    n_mc_samples = sum(len(s) for s in class_groups.values())
+    log_message(f"Pre-pass: {n_mc_samples} MC samples, {len(DATA_SAMPLES)} data samples")
+    mc_n_totals     = {}
+    mc_sample_files = {}
+    mc_class_map    = {}  # sname -> cls_name
+
     for cls_name, samples in class_groups.items():
-        log_message(f"  Loading class '{cls_name}' with {len(samples)} samples")
-        dfs = []
         for sname in samples:
             if sname not in SAMPLE_INFO:
                 raise RuntimeError(f"MC sample '{sname}' not found in sample.json")
@@ -834,42 +1433,75 @@ def _process_tree(tree_name):
                 raise RuntimeError(f"No ROOT files found for MC sample '{sname}'")
             n_total = _tree_entries_total(files, tree_name)
             if n_total <= 0:
-                raise RuntimeError(f"Empty tree '{tree_name}' for MC sample '{sname}'")
-            df = _load_tree(files, tree_name, mc_need_load, max_entries=entries_per_sample)
-            if df is None or len(df) == 0:
-                raise RuntimeError(f"No events loaded for MC sample '{sname}' in tree '{tree_name}'")
-            df = _assign_mc_weight(df, sname, n_total, len(df), reweight_branches)
-            dfs.append(df)
-            log_message(
-                f"  {sname}: class={cls_name}, tree_entries={n_total}, "
-                f"loaded={len(df)}, entry_cap={entries_per_sample}, "
-                f"weight_sum={float(df['weight'].sum()):.6g}"
-            )
-        if dfs:
-            class_dfs[cls_name] = _concat_parts(dfs)
-            log_message(f"  Loaded class '{cls_name}': events={len(class_dfs[cls_name])}")
-        else:
-            raise RuntimeError(f"MC class '{cls_name}' has no usable events")
+                log_message(f"  [WARN] skipping MC sample '{sname}': no entries for tree '{tree_name}'")
+                continue
+            mc_n_totals[sname]     = n_total
+            mc_sample_files[sname] = files
+            mc_class_map[sname]    = cls_name
 
-    # Load the data events.
-    log_message(f"Loading data samples: n={len(DATA_SAMPLES)}")
-    data_dfs = []
+    data_sample_files = {}
     for sname in DATA_SAMPLES:
         files = _input_files(sname, input_root, input_pattern)
         if not files:
             raise RuntimeError(f"No ROOT files found for data sample '{sname}'")
-        df = _load_tree(files, tree_name, need_load)
-        if df is None or len(df) == 0:
-            log_message(f"  [WARN] data sample '{sname}' has zero entries in tree '{tree_name}'")
-            continue
-        df["weight"] = 1.0
-        data_dfs.append(df)
-        log_message(f"  data {sname}: loaded={len(df)}")
-    data_df = _concat_parts(data_dfs) if data_dfs else None
-    if data_df is None:
-        log_message("Loaded data events: 0")
+        data_sample_files[sname] = files
+
+    # ---- Step 2: Parallel pre-pass (range collection + reweight sums) ----
+    mc_raw_w_sums = {}
+    prepass_mins  = {b:  np.inf for b in auto_range_branches}
+    prepass_maxs  = {b: -np.inf for b in auto_range_branches}
+
+    need_prepass = bool(auto_range_branches or reweight_branches)
+    if not need_prepass:
+        for sname in mc_sample_files:
+            mc_raw_w_sums[sname] = float(mc_n_totals[sname])
+            log_message(f"  {sname}: n_total={mc_n_totals[sname]}, raw_w_sum={mc_raw_w_sums[sname]:.6g}")
+        for sname in DATA_SAMPLES:
+            log_message(f"  data {sname}: pre-pass skipped (no auto-range branches, no reweighting)")
     else:
-        log_message(f"Loaded data events: {len(data_df)}")
+        prepass_tasks  = []
+        prepass_labels = []
+        for sname in mc_sample_files:
+            prepass_tasks.append((mc_sample_files[sname], tree_name, auto_range_branches,
+                                   reweight_branches, branch_logx, not no_selection))
+            prepass_labels.append(('mc', sname))
+        if auto_range_branches:
+            for sname in DATA_SAMPLES:
+                prepass_tasks.append((data_sample_files[sname], tree_name, auto_range_branches,
+                                       [], branch_logx, not no_selection))
+                prepass_labels.append(('data', sname))
+
+        log_message(f"  Running {len(prepass_tasks)} pre-pass tasks ({n_workers} workers)")
+        if n_workers > 1 and len(prepass_tasks) > 1:
+            with multiprocessing.Pool(processes=min(len(prepass_tasks), n_workers)) as pool:
+                prepass_results = pool.map(_prepass_worker, prepass_tasks)
+        else:
+            prepass_results = [_prepass(*t) for t in prepass_tasks]
+
+        for (kind, sname), (rw_sum, ranges) in zip(prepass_labels, prepass_results):
+            for b, (lo, hi) in ranges.items():
+                prepass_mins[b] = min(prepass_mins[b], lo)
+                prepass_maxs[b] = max(prepass_maxs[b], hi)
+            if kind == 'mc':
+                mc_raw_w_sums[sname] = rw_sum if rw_sum > 0 else float(mc_n_totals[sname])
+                log_message(f"  {sname}: n_total={mc_n_totals[sname]}, raw_w_sum={mc_raw_w_sums[sname]:.6g}")
+            else:
+                log_message(f"  data {sname}: pre-pass done")
+
+        for sname in DATA_SAMPLES:
+            if not auto_range_branches:
+                log_message(f"  data {sname}: pre-pass skipped (no auto-range branches)")
+
+    if not _using_range_cache:
+        merged_ranges = {}
+        for b in auto_range_branches:
+            lo, hi = prepass_mins[b], prepass_maxs[b]
+            if np.isfinite(lo) and np.isfinite(hi) and lo <= hi:
+                merged_ranges[b] = (lo, hi)
+        if auto_range_branches:
+            with open(_ranges_cache_path, "w", encoding="utf-8") as fh:
+                json.dump({b: list(rng) for b, rng in merged_ranges.items()}, fh, indent=2)
+            log_message(f"Saved ranges cache: {_ranges_cache_path}")
 
     # Build derived model score branches. MC scores use the saved test split and
     # are validated against train.py's signal-region reference; data scores use
@@ -880,7 +1512,7 @@ def _process_tree(tree_name):
         log_message("Preparing model score branches")
         clf = _load_score_model(bdt_root_dir, bdt_cfg, tree_name)
         decorrelate = list(bdt_cfg.get(tree_name, {}).get("decorrelate", []))
-        score_load = sorted(set(model_branches) | set(thresholds.keys()) | set(score_reweight_branches))
+        score_load = sorted(set(model_branches) | set(thresholds.keys()) | set(score_reweight_branches) | set(extra_plot_thresholds.keys()))
         sample_to_class_name = {}
         sample_to_class_idx = {}
         for idx, (cls_name, samples) in enumerate(class_groups.items()):
@@ -895,7 +1527,11 @@ def _process_tree(tree_name):
         ref_proba_parts = []
         ref_feature_names = None
 
+        # Load + preprocess all MC test-split samples; defer inference until after concat.
         log_message(f"Loading MC score test split samples: n={len(test_meta['samples'])}")
+        all_X_parts = []
+        batch_meta  = []  # (sample_name, cls_name, cls_idx, weight_arr, n_rows)
+
         for sample_name, sample_meta in test_meta["samples"].items():
             if sample_name not in sample_to_class_name:
                 raise RuntimeError(f"Test split sample '{sample_name}' is not in class_groups")
@@ -903,31 +1539,52 @@ def _process_tree(tree_name):
             if df is None or len(df) == 0:
                 raise RuntimeError(f"No test split events loaded for sample '{sample_name}'")
             df = _assign_test_split_mc_weight(
-                df,
-                sample_name,
-                int(sample_meta["total_entries"]),
-                score_reweight_branches,
+                df, sample_name, int(sample_meta["total_entries"]), score_reweight_branches,
             )
-            mask = _threshold_mask(df, thresholds)
+            mask = _threshold_mask(df, plot_thresholds)
             df = df.loc[mask].reset_index(drop=True)
             if len(df) == 0:
                 log_message(f"  [WARN] score sample '{sample_name}' has zero events after filtering")
                 continue
-            X_model = _standardize_model_X(df[model_branches].copy(), clip_ranges, list(log_tf_set))
-            X_model = _drop_decorrelated_features(X_model, decorrelate)
-            proba = _predict_model_proba(clf, X_model, len(class_names))
+            X_part = _standardize_model_X(df[model_branches], clip_ranges, list(log_tf_set))
+            X_part = _drop_decorrelated_features(X_part, decorrelate)
             if ref_feature_names is None:
-                ref_feature_names = list(X_model.columns)
-            score_df = _add_score_columns(df, proba, class_names)
-            cls_name = sample_to_class_name[sample_name]
+                ref_feature_names = list(X_part.columns)
+            all_X_parts.append(X_part)
+            batch_meta.append((
+                sample_name,
+                sample_to_class_name[sample_name],
+                sample_to_class_idx[sample_name],
+                df["weight"].to_numpy(dtype=float, copy=False),
+                len(df),
+            ))
+
+        if not all_X_parts:
+            raise RuntimeError(f"No MC score events after filtering for tree '{tree_name}'")
+
+        # Single batched inference across all samples.
+        n_score_events = sum(m[4] for m in batch_meta)
+        log_message(f"  Batched BDT inference: {n_score_events} events across {len(batch_meta)} samples")
+        X_all     = pd.concat(all_X_parts, ignore_index=True)
+        proba_all = _predict_model_proba(clf, X_all, len(class_names))
+        del X_all, all_X_parts
+
+        # Split predictions back to per-sample; accumulate score DataFrames + reference arrays.
+        offset = 0
+        for sample_name, cls_name, cls_idx, weights, n_rows in batch_meta:
+            proba    = proba_all[offset : offset + n_rows]
+            score_df = pd.DataFrame({"weight": weights})
+            for i, cname in enumerate(class_names):
+                score_df[_score_branch_name(cname)] = proba[:, i]
             score_parts_by_class[cls_name].append(score_df)
-            ref_sample_labels.extend([sample_name] * len(df))
-            ref_class_idx.extend([sample_to_class_idx[sample_name]] * len(df))
-            ref_weights.extend(score_df["weight"].to_numpy(dtype=float, copy=False))
+            ref_sample_labels.extend([sample_name] * n_rows)
+            ref_class_idx.extend([cls_idx] * n_rows)
+            ref_weights.extend(weights)
             ref_proba_parts.append(proba)
+            offset += n_rows
             log_message(
-                f"  score {sample_name}: class={cls_name}, test_loaded={len(df)}, "
-                f"weight_sum={float(score_df['weight'].sum()):.6g}"
+                f"  score {sample_name}: class={cls_name}, test_loaded={n_rows}, "
+                f"weight_sum={float(weights.sum()):.6g}"
             )
 
         for cls_name, parts in score_parts_by_class.items():
@@ -937,21 +1594,21 @@ def _process_tree(tree_name):
         if not ref_proba_parts:
             raise RuntimeError(f"No MC score events after filtering for tree '{tree_name}'")
         score_proba_ref = np.concatenate(ref_proba_parts, axis=0)
-        _compare_score_reference(
-            os.path.join(bdt_root_dir, "test_reference_signal_region.npz"),
-            ref_feature_names,
-            ref_sample_labels,
-            ref_class_idx,
-            ref_weights,
-            score_proba_ref,
-        )
-        del ref_sample_labels, ref_class_idx, ref_weights, ref_proba_parts, score_proba_ref
-        gc.collect()
+        #_compare_score_reference(
+        #    os.path.join(bdt_root_dir, "test_reference_signal_region.npz"),
+        #    ref_feature_names,
+        #    ref_sample_labels,
+        #    ref_class_idx,
+        #    ref_weights,
+        #    score_proba_ref,
+        #)
+        del ref_sample_labels, ref_class_idx, ref_weights, ref_proba_parts, score_proba_ref, proba_all
 
         if DATA_SAMPLES:
             score_data_load = sorted(set(model_branches) | set(thresholds.keys()))
-            score_data_parts = []
             log_message(f"Loading data score samples: n={len(DATA_SAMPLES)}")
+            data_X_parts = []
+            data_w_parts = []
             for sname in DATA_SAMPLES:
                 files = _input_files(sname, input_root, input_pattern)
                 if not files:
@@ -960,161 +1617,298 @@ def _process_tree(tree_name):
                 if df is None or len(df) == 0:
                     log_message(f"  [WARN] data score sample '{sname}' has zero entries")
                     continue
-                df = _apply_thresholds(df, thresholds)
+                df = _apply_thresholds(df, plot_thresholds)
                 if df is None or len(df) == 0:
                     log_message(f"  [WARN] data score sample '{sname}' has zero events after filtering")
                     continue
                 df["weight"] = 1.0
-                X_model = _standardize_model_X(df[model_branches].copy(), clip_ranges, list(log_tf_set))
-                X_model = _drop_decorrelated_features(X_model, decorrelate)
-                proba = _predict_model_proba(clf, X_model, len(class_names))
-                score_data_parts.append(_add_score_columns(df, proba, class_names))
+                X_part = _standardize_model_X(df[model_branches], clip_ranges, list(log_tf_set))
+                X_part = _drop_decorrelated_features(X_part, decorrelate)
+                data_X_parts.append(X_part)
+                data_w_parts.append(df["weight"].to_numpy(dtype=float, copy=False))
                 log_message(f"  data score {sname}: events={len(df)}")
-            if score_data_parts:
-                score_data_df = _concat_parts(score_data_parts)
+            if data_X_parts:
+                X_data_all  = pd.concat(data_X_parts, ignore_index=True)
+                proba_data  = _predict_model_proba(clf, X_data_all, len(class_names))
+                del X_data_all, data_X_parts
+                score_data_df = pd.DataFrame({"weight": np.concatenate(data_w_parts)})
+                for i, cname in enumerate(class_names):
+                    score_data_df[_score_branch_name(cname)] = proba_data[:, i]
                 log_message(f"Loaded data score events: {len(score_data_df)}")
             else:
                 log_message("Loaded data score events: 0")
 
-    # Apply thresholds and then clip ranges; the weights stay fixed.
-    def _prepare(df):
-        if df is None or len(df) == 0:
-            return df
-        df = _apply_thresholds(df, thresholds)
-        df = _apply_clip(df, clip_ranges)
-        df = _drop_unneeded_columns(df, set(root_plot_branches) | {"weight"})
-        return df
-
-    log_message("Applying thresholds and clip ranges")
-    for cls in list(class_dfs.keys()):
-        class_dfs[cls] = _prepare(class_dfs[cls])
-        if class_dfs[cls] is None or len(class_dfs[cls]) == 0:
-            class_dfs.pop(cls)
-            log_message(f"  [WARN] class '{cls}' became empty after filtering")
+    # Resolve binning for all root branches using pre-pass ranges.
+    log_message("Resolving binning for all branches")
+    branch_binning = {}
+    for b in root_plot_branches:
+        precomp = merged_ranges.get(b)   # None for explicit-range branches (override takes priority)
+        binning = _resolve_binning(tree_name, b, precomp, log_tf_set)
+        if binning is None:
+            log_message(f"  [WARN] no range for {tree_name}:{b}, will skip")
         else:
-            log_message(f"  class '{cls}' after filtering: events={len(class_dfs[cls])}")
-    if data_df is not None:
-        data_df = _prepare(data_df)
-        if data_df is None or len(data_df) == 0:
-            data_df = None
-            log_message("  data after filtering: 0 events")
-        else:
-            log_message(f"  data after filtering: events={len(data_df)}")
+            branch_binning[b] = binning
+    branch_edges = {b: _bin_edges(bins, x_range, logx)
+                    for b, (bins, x_range, logx, logy, y_range) in branch_binning.items()}
+    log_message(f"  {len(branch_binning)}/{len(root_plot_branches)} root branches have valid binning")
 
-    # Plot each requested branch.
-    log_message(f"Plotting branches: total={len(branches_to_plot)}")
+    # ---- Step 5: Parallel histogram streaming (MC + data) ----
+    mc_target_totals = {}
+    stream_tasks  = []
+    stream_labels = []  # ('mc', cls_name, sname, target_total) or ('data', sname, ...)
+
+    for cls_name, samples in class_groups.items():
+        for sname in samples:
+            if sname not in mc_sample_files:
+                continue
+            info = SAMPLE_INFO[sname]
+            xsec = float(info.get("xsection", 0.0))
+            raw_entries = float(info.get("raw_entries", 0.0))
+            n_total  = mc_n_totals[sname]
+            raw_w_sum = mc_raw_w_sums[sname]
+            target_total = (LUMI_TOTAL * xsec * float(n_total) / raw_entries
+                            if raw_entries > 0 else 0.0)
+            mc_target_totals[sname] = target_total
+            stream_tasks.append((mc_sample_files[sname], tree_name, branch_edges,
+                                   target_total, raw_w_sum, reweight_branches,
+                                   plot_thresholds, plot_clip_ranges, not no_selection))
+            stream_labels.append(('mc', cls_name, sname, target_total))
+
+    for sname in DATA_SAMPLES:
+        stream_tasks.append((data_sample_files[sname], tree_name, branch_edges,
+                              1.0, 1.0, [], plot_thresholds, plot_clip_ranges, not no_selection))
+        stream_labels.append(('data', sname, sname, 1.0))
+
+    log_message(f"Streaming histograms: {len(stream_tasks)} samples ({n_workers} workers)")
+    if n_workers > 1 and len(stream_tasks) > 1:
+        with multiprocessing.Pool(processes=min(len(stream_tasks), n_workers)) as pool:
+            stream_results = pool.map(_stream_hists_worker, stream_tasks)
+    else:
+        stream_results = [_stream_hists(*t) for t in stream_tasks]
+
+    mc_hists   = {cls: {} for cls in class_names}
+    data_hists = {}
+    for label, sample_hists in zip(stream_labels, stream_results):
+        kind = label[0]
+        if kind == 'mc':
+            _, cls_name, sname, target_total = label
+            log_message(f"  MC {sname} (class={cls_name}): target_total={target_total:.6g}")
+            for b, (h, h2) in sample_hists.items():
+                if b not in mc_hists[cls_name]:
+                    mc_hists[cls_name][b] = [h, h2]
+                else:
+                    mc_hists[cls_name][b][0] += h
+                    mc_hists[cls_name][b][1] += h2
+        else:
+            _, sname, _, _ = label
+            log_message(f"  data {sname}: streaming done")
+            for b, (h, h2) in sample_hists.items():
+                if b not in data_hists:
+                    data_hists[b] = [h, h2]
+                else:
+                    data_hists[b][0] += h
+                    data_hists[b][1] += h2
+
+    mc_hists   = {cls: {b: (v[0], v[1]) for b, v in mc_hists[cls].items()} for cls in class_names}
+    data_hists = {b: (v[0], v[1]) for b, v in data_hists.items()}
+    theory_fracs = _theory_frac_uncertainty(tree_name, class_groups, mc_target_totals)
+
+    # ---- Step 5b: Per-bin theory SHAPE variations from the LHE weights ----
+    # A separate pass over the theory-weight samples (read with library='np' so
+    # the array branches load) accumulates per-bin member histograms; the band
+    # is the per-bin spread (PDF Hessian + alpha_s + scale/PS envelopes) summed
+    # in quadrature, placed around the total MC.  Falls back to the flat
+    # theory_fracs band for branches it cannot cover (e.g. score branches).
+    theory_shape = {}   # branch -> (band_up, band_down) absolute per-bin arrays
+    theory_samples = [sname for _cls, samples in class_groups.items()
+                      for sname in samples
+                      if sname in mc_sample_files
+                      and SAMPLE_INFO.get(sname, {}).get("has_theory_weights", False)]
+    if theory_samples and branch_edges:
+        th_tasks = [
+            (mc_sample_files[sname], tree_name, branch_edges,
+             mc_target_totals.get(sname, 0.0), mc_raw_w_sums[sname],
+             reweight_branches, plot_thresholds, plot_clip_ranges, not no_selection)
+            for sname in theory_samples
+        ]
+        log_message(f"Theory-shape pass: {len(th_tasks)} theory samples ({n_workers} workers)")
+        if n_workers > 1 and len(th_tasks) > 1:
+            with multiprocessing.Pool(processes=min(len(th_tasks), n_workers)) as pool:
+                th_results = pool.map(_stream_theory_shape_worker, th_tasks)
+        else:
+            th_results = [_stream_theory_shape(*t) for t in th_tasks]
+        summed = {}
+        for res in th_results:
+            for b, mh in res.items():
+                if b in summed:
+                    summed[b] += mh
+                else:
+                    summed[b] = mh.copy()
+        for b, mh in summed.items():
+            up, dn = _theory_shape_band(mh)
+            if np.any(up > 0.0) or np.any(dn > 0.0):
+                theory_shape[b] = (up, dn)
+        log_message(f"Theory-shape pass: per-bin bands for {len(theory_shape)} branches")
+
+    # ---- Step 6: Collect plot jobs ----
     palette = plt.rcParams["axes.prop_cycle"].by_key().get(
         "color", ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
     )
     color_map = {c: palette[i % len(palette)] for i, c in enumerate(class_names)}
 
-    for idx, branch in enumerate(branches_to_plot, start=1):
-        log_message(f"Plotting branch {idx}/{len(branches_to_plot)}: {branch}")
+    log_message(f"Collecting plot data: {len(branches_to_plot)} branches")
+    plot_jobs = []
+    for branch in branches_to_plot:
         is_score_branch = branch in score_branches
-        plot_class_dfs = score_class_dfs if is_score_branch else class_dfs
-        plot_data_df = score_data_df if is_score_branch else data_df
-        arrs = []
-        for cls in class_names:
-            if cls in plot_class_dfs and branch in plot_class_dfs[cls].columns:
-                arrs.append(plot_class_dfs[cls][branch].values)
-        if plot_data_df is not None and branch in plot_data_df.columns:
-            arrs.append(plot_data_df[branch].values)
 
-        binning = _resolve_binning(tree_name, branch, arrs, log_tf_set)
-        if binning is None:
-            log_message(f"  [WARN] no data for {tree_name}:{branch}, skipping")
-            continue
-        bins, x_range, logx, logy, y_range = binning
-        edges       = _bin_edges(bins, x_range, logx)
-        bin_centers = 0.5 * (edges[:-1] + edges[1:])
-        bin_widths  = edges[1:] - edges[:-1]
-
-        mc_total_v  = np.zeros(bins)
-        mc_total_w2 = np.zeros(bins)
-        mc_per_cls  = {}
-        for cls in class_names:
-            if cls in plot_class_dfs and branch in plot_class_dfs[cls].columns:
-                h, h2 = _weighted_hist(
-                    plot_class_dfs[cls][branch].values,
-                    plot_class_dfs[cls]["weight"].values, edges
+        if is_score_branch:
+            arrs = []
+            for cls in class_names:
+                if cls in score_class_dfs and branch in score_class_dfs[cls].columns:
+                    arrs.append(score_class_dfs[cls][branch].values)
+            if score_data_df is not None and branch in score_data_df.columns:
+                arrs.append(score_data_df[branch].values)
+            binning = _resolve_binning(tree_name, branch, arrs, log_tf_set)
+            if binning is None:
+                log_message(f"  [WARN] no data for {tree_name}:{branch}, skipping")
+                continue
+            bins, x_range, logx, logy, y_range = binning
+            edges       = _bin_edges(bins, x_range, logx)
+            bin_centers = 0.5 * (edges[:-1] + edges[1:])
+            bin_widths  = edges[1:] - edges[:-1]
+            mc_total_v  = np.zeros(bins)
+            mc_total_w2 = np.zeros(bins)
+            mc_per_cls  = {}
+            for cls in class_names:
+                if cls in score_class_dfs and branch in score_class_dfs[cls].columns:
+                    h, h2 = _weighted_hist(
+                        score_class_dfs[cls][branch].values,
+                        score_class_dfs[cls]["weight"].values, edges,
+                    )
+                else:
+                    h, h2 = np.zeros(bins), np.zeros(bins)
+                mc_per_cls[cls] = (h, h2)
+                mc_total_v  += h
+                mc_total_w2 += h2
+            if score_data_df is not None and branch in score_data_df.columns:
+                data_v, data_w2 = _weighted_hist(
+                    score_data_df[branch].values, score_data_df["weight"].values, edges,
                 )
             else:
-                h  = np.zeros(bins)
-                h2 = np.zeros(bins)
-            mc_per_cls[cls] = (h, h2)
-            mc_total_v  += h
-            mc_total_w2 += h2
-
-        if plot_data_df is not None and branch in plot_data_df.columns:
-            data_v, data_w2 = _weighted_hist(
-                plot_data_df[branch].values, plot_data_df["weight"].values, edges
-            )
+                data_v, data_w2 = np.zeros(bins), np.zeros(bins)
         else:
-            data_v  = np.zeros(bins)
-            data_w2 = np.zeros(bins)
+            if branch not in branch_binning:
+                log_message(f"  [WARN] no range for {tree_name}:{branch}, skipping")
+                continue
+            bins, x_range, logx, logy, y_range = branch_binning[branch]
+            edges       = branch_edges[branch]
+            bin_centers = 0.5 * (edges[:-1] + edges[1:])
+            bin_widths  = edges[1:] - edges[:-1]
+            mc_total_v  = np.zeros(bins)
+            mc_total_w2 = np.zeros(bins)
+            mc_per_cls  = {}
+            for cls in class_names:
+                h, h2 = mc_hists[cls].get(branch, (np.zeros(bins), np.zeros(bins)))
+                mc_per_cls[cls] = (h, h2)
+                mc_total_v  += h
+                mc_total_w2 += h2
+            data_v, data_w2 = data_hists.get(branch, (np.zeros(bins), np.zeros(bins)))
 
-        out_path = os.path.join(out_dir, f"{tree_name}_{branch}.pdf")
-        _draw_data_mc_plot(
-            class_names=class_names,
-            color_map=color_map,
-            edges=edges,
-            bin_centers=bin_centers,
-            bin_widths=bin_widths,
-            mc_per_cls=mc_per_cls,
-            mc_total_v=mc_total_v,
-            mc_total_w2=mc_total_w2,
-            data_v=data_v,
-            data_w2=data_w2,
-            branch=branch,
-            x_range=x_range,
-            logx=logx,
-            logy=logy,
-            y_range=y_range,
-            y_label="Events",
-            out_path=out_path,
-            logy_floor=0.1,
-        )
-        log_message(f"Wrote plot file: {out_path}")
+        sh_up, sh_dn = theory_shape.get(branch, (None, None))
 
-        (
-            mc_per_cls_norm,
-            mc_total_v_norm,
-            mc_total_w2_norm,
-            data_v_norm,
-            data_w2_norm,
-        ) = _unit_normalized_histograms(mc_per_cls, mc_total_v, mc_total_w2, data_v, data_w2)
-        out_path_normal = os.path.join(out_dir, f"{tree_name}_{branch}_normal.pdf")
-        _draw_data_mc_plot(
-            class_names=class_names,
-            color_map=color_map,
-            edges=edges,
-            bin_centers=bin_centers,
-            bin_widths=bin_widths,
-            mc_per_cls=mc_per_cls_norm,
-            mc_total_v=mc_total_v_norm,
-            mc_total_w2=mc_total_w2_norm,
-            data_v=data_v_norm,
-            data_w2=data_w2_norm,
-            branch=branch,
-            x_range=x_range,
-            logx=logx,
-            logy=logy,
-            y_range=y_range,
-            y_label="A.U.",
-            out_path=out_path_normal,
-            logy_floor=None,
-        )
-        log_message(f"Wrote plot file: {out_path_normal}")
+        if save_hists:
+            _save_branch_hists(
+                out_dir, tree_name, branch, edges, mc_per_cls, data_v, data_w2,
+                logx, logy, x_range, y_range, class_names, color_map, theory_fracs,
+                sh_up, sh_dn,
+            )
+
+        plot_jobs.append({
+            "out_dir": out_dir, "tree_name": tree_name, "branch": branch,
+            "class_names": class_names, "color_map": color_map,
+            "edges": edges, "bin_centers": bin_centers, "bin_widths": bin_widths,
+            "mc_per_cls": mc_per_cls, "mc_total_v": mc_total_v, "mc_total_w2": mc_total_w2,
+            "data_v": data_v, "data_w2": data_w2,
+            "x_range": x_range, "logx": logx, "logy": logy, "y_range": y_range,
+            "theory_fracs": theory_fracs,
+            "theory_shape_up": sh_up, "theory_shape_down": sh_dn,
+        })
+
+    # ---- Step 7: Parallel plot rendering ----
+    log_message(f"Rendering {len(plot_jobs) * 2} PDFs ({n_workers} workers)")
+    if n_workers > 1 and len(plot_jobs) > 1:
+        with multiprocessing.Pool(processes=min(len(plot_jobs), n_workers)) as pool:
+            pool.map(_draw_plot_job, plot_jobs)
+    else:
+        for job in plot_jobs:
+            _draw_plot_job(job)
     log_message(f"Finished data_mc.py for tree={tree_name}")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Data vs MC comparison plotter")
+    parser.add_argument(
+        "--no-selection", action="store_true",
+        help="Skip threshold and clip-range cuts on plot variables (writes to output_root_nosel).",
+    )
+    parser.add_argument(
+        "--use-cached-ranges", action="store_true",
+        help=(
+            "Load axis ranges from .ranges_cache.json (written by a previous run) and skip "
+            "the range-collection pre-pass.  The MC pre-pass still runs to compute reweight "
+            "branch sums when event_reweight_branches are configured."
+        ),
+    )
+    parser.add_argument(
+        "--save-hists", action="store_true",
+        help=(
+            "Save per-branch histogram arrays to {tree}_{branch}_hists.json alongside the PDFs. "
+            "Use --restyle on a later run to re-render plots from these files without reading ROOT files."
+        ),
+    )
+    parser.add_argument(
+        "--restyle", action="store_true",
+        help=(
+            "Re-render all plots from previously saved *_hists.json files.  "
+            "No ROOT files are read.  Requires a prior run with --save-hists."
+        ),
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help=(
+            f"Number of parallel worker processes (default: n_workers from config.json, "
+            f"or {os.cpu_count() or 4} = cpu_count).  Pass 1 to disable parallelism."
+        ),
+    )
+    args = parser.parse_args()
+    n_workers = args.workers if args.workers is not None else _N_WORKERS
+
+    out_patt = OUTPUT_ROOT_NOSEL_PATT if args.no_selection else OUTPUT_ROOT_PATT
+
+    if args.restyle:
+        log_message(
+            f"Restyling from histogram cache: trees={','.join(SUBMIT_TREES)}, "
+            f"output_root={out_patt}, no_selection={args.no_selection}, n_workers={n_workers}"
+        )
+        for tree_name in SUBMIT_TREES:
+            _restyle_tree(tree_name, no_selection=args.no_selection, n_workers=n_workers)
+        return
+
     log_message(
         f"Running data_mc.py: trees={','.join(SUBMIT_TREES)}, "
-        f"bdt_root={BDT_ROOT_PATT}, output_root={OUTPUT_ROOT_PATT}"
+        f"bdt_root={BDT_ROOT_PATT}, output_root={out_patt}, "
+        f"no_selection={args.no_selection}, "
+        f"use_cached_ranges={args.use_cached_ranges}, save_hists={args.save_hists}, "
+        f"n_workers={n_workers}"
     )
     for tree_name in SUBMIT_TREES:
-        _process_tree(tree_name)
+        _process_tree(
+            tree_name,
+            no_selection=args.no_selection,
+            use_cached_ranges=args.use_cached_ranges,
+            save_hists=args.save_hists,
+            n_workers=n_workers,
+        )
 
 
 if __name__ == "__main__":
