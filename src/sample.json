@@ -33,7 +33,8 @@
       "sample_ID": 0,
       "is_MC": true,
       "is_signal": true,
-      "xsection": 208.6,
+      "has_theory_weights": true,
+      "xsection": 232.8,
       "lumi": -1,
       "raw_entries": 4299284
     },
@@ -43,7 +44,8 @@
       "sample_ID": 1,
       "is_MC": true,
       "is_signal": true,
-      "xsection": 165.1,
+      "has_theory_weights": true,
+      "xsection": 185.1,
       "lumi": -1,
       "raw_entries": 16197159
     },
@@ -53,7 +55,8 @@
       "sample_ID": 2,
       "is_MC": true,
       "is_signal": true,
-      "xsection": 55.65,
+      "has_theory_weights": true,
+      "xsection": 62.06,
       "lumi": -1,
       "raw_entries": 16199286
     },
@@ -63,7 +66,8 @@
       "sample_ID": 3,
       "is_MC": true,
       "is_signal": true,
-      "xsection": 13.98,
+      "has_theory_weights": true,
+      "xsection": 15.91,
       "lumi": -1,
       "raw_entries": 16192091
     },
@@ -73,7 +77,8 @@
       "sample_ID": 4,
       "is_MC": true,
       "is_signal": true,
-      "xsection": 64.5,
+      "has_theory_weights": true,
+      "xsection": 84.28,
       "lumi": -1,
       "raw_entries": 6379386
     },
@@ -83,6 +88,7 @@
       "sample_ID": 5,
       "is_MC": true,
       "is_signal": true,
+      "has_theory_weights": true,
       "xsection": 9.4,
       "lumi": -1,
       "raw_entries": 6756000
@@ -93,6 +99,7 @@
       "sample_ID": 6,
       "is_MC": true,
       "is_signal": true,
+      "has_theory_weights": true,
       "xsection": 58.5,
       "lumi": -1,
       "raw_entries": 3395977
@@ -103,6 +110,7 @@
       "sample_ID": 7,
       "is_MC": true,
       "is_signal": true,
+      "has_theory_weights": true,
       "xsection": 37.4,
       "lumi": -1,
       "raw_entries": 3382165
@@ -223,7 +231,8 @@
       "sample_ID": 21,
       "is_MC": true,
       "is_signal": false,
-      "xsection": 378900,
+      "has_theory_weights": true,
+      "xsection": 419657,
       "lumi": -1,
       "raw_entries": 468776258
     },
@@ -233,7 +242,8 @@
       "sample_ID": 22,
       "is_MC": true,
       "is_signal": false,
-      "xsection": 366300,
+      "has_theory_weights": true,
+      "xsection": 405702,
       "lumi": -1,
       "raw_entries": 484298177
     },
@@ -243,7 +253,8 @@
       "sample_ID": 23,
       "is_MC": true,
       "is_signal": false,
-      "xsection": 75950,
+      "has_theory_weights": true,
+      "xsection": 80230,
       "lumi": -1,
       "raw_entries": 63994208
     },
@@ -253,7 +264,8 @@
       "sample_ID": 24,
       "is_MC": true,
       "is_signal": false,
-      "xsection": 27950,
+      "has_theory_weights": true,
+      "xsection": 29100,
       "lumi": -1,
       "raw_entries": 30260725
     },
@@ -263,7 +275,8 @@
       "sample_ID": 25,
       "is_MC": true,
       "is_signal": false,
-      "xsection": 12170,
+      "has_theory_weights": true,
+      "xsection": 12750,
       "lumi": -1,
       "raw_entries": 4800000
     },
@@ -273,6 +286,7 @@
       "sample_ID": 26,
       "is_MC": true,
       "is_signal": false,
+      "has_theory_weights": true,
       "xsection": 19971,
       "lumi": -1,
       "raw_entries": 24000000
@@ -283,6 +297,7 @@
       "sample_ID": 27,
       "is_MC": true,
       "is_signal": false,
+      "has_theory_weights": true,
       "xsection": 19971,
       "lumi": -1,
       "raw_entries": 23999000
