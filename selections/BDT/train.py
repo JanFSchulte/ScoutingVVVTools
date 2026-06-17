@@ -805,7 +805,7 @@ def _sample_color_palette(n):
     cmaps = ["tab20", "tab20b", "tab20c"]
     colors = []
     for cm in cmaps:
-        colors.extend(list(plt.cm.get_cmap(cm).colors))
+        colors.extend(list(plt.colormaps[cm].colors))
     if n <= 0:
         return []
     if n <= len(colors):
@@ -834,7 +834,7 @@ def plot_branch_distributions(output_root, branches, clip_ranges,
     s_all = np.concatenate([np.asarray(sample_labels_train, dtype=object),
                             np.asarray(sample_labels_test, dtype=object)])
 
-    class_palette = plt.cm.get_cmap("tab10", max(NUM_CLASSES, 3))(np.arange(max(NUM_CLASSES, 3)))
+    class_palette = plt.colormaps["tab10"].resampled(max(NUM_CLASSES, 2))(np.arange(max(NUM_CLASSES, 2)))
 
     # Keep TRAINING_SAMPLES ordering (which follows class_groups) so samples
     # from the same class sit together in the legend and color palette.
@@ -2768,7 +2768,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
     n_classes = NUM_CLASSES
     class_names = CLASS_NAMES
     is_nn_model = isinstance(stage1_model, TorchModelHandle) or isinstance(stage2_model, TorchModelHandle)
-    palette = plt.cm.get_cmap("tab10", max(n_classes, 3))(np.arange(max(n_classes, 3)))
+    palette = plt.colormaps["tab10"].resampled(max(n_classes, 2))(np.arange(max(n_classes, 2)))
 
     def _savefig(stem, fig=None, tight=True):
         fig = plt.gcf() if fig is None else fig
@@ -3053,7 +3053,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         wv_all = np.asarray(w_test_decor, dtype=float)
         path = _figure_path(output_root, f"decor_branch_shapes_by_signal_score{suffix}")
         pdf_state = {"pdf": None, "pages": 0}
-        colors = plt.cm.get_cmap("viridis", max(len(decor_efficiencies), 2))(
+        colors = plt.colormaps["viridis"].resampled(max(len(decor_efficiencies), 2))(
             np.arange(max(len(decor_efficiencies), 2))
         )
 

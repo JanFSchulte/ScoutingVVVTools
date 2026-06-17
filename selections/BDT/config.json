@@ -3,7 +3,7 @@
   "sample_config": "../../src/sample.json",
   "input_root": "../../dataset",
   "input_pattern": "{input_root}/{sample_group}_mixed/{sample}.root",
-  "output_root": "./{tree_name}_UParTv2_v3",
+  "output_root": "./{tree_name}_simplified_v1",
   "model_pattern": "{output_root}/{tree_name}_model",
   "model_type": "bdt",
   "entries_per_sample": 10000000,
@@ -17,13 +17,9 @@
   "decor_bin_tau_scale": 0.25,
   "decor_msoftdrop_training_max": 200,
   "class_groups": {
-    "VVV": ["www", "wwz", "wzz", "zzz"],
-    "VH":  ["zh_had", "ggzh_had", "wplush", "wminush"],
-    "Top": ["ttbar_had", "ttbar_semilep"],
-    "VT": ["tbarwplus_had", "twminus_had"],
-    "VV":  ["ww", "wz", "zz"],
-    "QCD": ["qcd_ht100to200", "qcd_ht200to400", "qcd_ht400to600", 
-            "qcd_ht600to800", "qcd_ht800to1000", "qcd_ht1000to1200", 
+    "signal": ["www", "wwz", "wzz", "zzz","zh_had", "ggzh_had", "wplush", "wminush"],
+    "background": [ "ttbar_had", "ttbar_semilep","tbarwplus_had", "twminus_had","ww", "wz", "zz", "qcd_ht40to70", "qcd_ht70to100", "qcd_ht100to200", "qcd_ht200to400", "qcd_ht400to600",
+            "qcd_ht600to800", "qcd_ht800to1000", "qcd_ht1000to1200",
             "qcd_ht1200to1500", "qcd_ht1500to2000", "qcd_ht2000"]
   },
   "fat2": {
