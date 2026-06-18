@@ -154,6 +154,9 @@ struct AppConfig {
     bool rescale_shape_modes_to_positive = true;
     bool keep_work = true;
     std::string work_dir;  // resolved under output_dir
+    // Fractional luminosity uncertainty applied as a symmetric lnN to all
+    // MC processes (i.e. everything except bkg_qcd).  0.0 disables the row.
+    double lumi_unc = 0.0;
     // Optional path to theory_syst_yields.json (output of mode 8).
     // {sample_name -> {channel_name -> TheoryFrac}}
     std::map<std::string, std::map<std::string, TheoryFrac>> theory_fracs;
@@ -194,6 +197,7 @@ AppConfig loadAppConfig() {
         payload.getBoolOr("rescale_shape_modes_to_positive", true);
     cfg.keep_work = payload.getBoolOr("keep_work", true);
     cfg.work_dir = (fs::path(cfg.output_dir) / "work").string();
+    cfg.lumi_unc = static_cast<double>(payload.getNumberOr("lumi_unc", 0.0L));
 
     // Optional theory syst yields (produced by mode 8 / theory_syst.py).
     if (payload.contains("theory_syst_json")) {
@@ -1404,6 +1408,21 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
     }
 
     writeTheoryLnN(ofs, cfg, pc, reg, sc);
+
+    // Luminosity lnN — correlated across all channels (same row name "lumi").
+    // Applied to every MC process; bkg_qcd is data-driven (ABCD) so excluded.
+    if (cfg.lumi_unc > 0.0) {
+        const double kappa = 1.0 + cfg.lumi_unc;
+        std::ostringstream kappa_str;
+        kappa_str << std::setprecision(6) << std::fixed << kappa;
+        ofs << "lumi lnN";
+        for (int sr = 0; sr < pc.n_sr; ++sr) {
+            for (const auto& proc : pc.processes) {
+                ofs << (proc.name == "bkg_qcd" ? " -" : " " + kappa_str.str());
+            }
+        }
+        ofs << "\n";
+    }
 }
 
 // -------------------- Running combine --------------------
@@ -1729,6 +1748,12 @@ int runMain() {
     logMessage("combine.C: work_dir=" + cfg.work_dir);
     logMessage(std::string("combine.C: root covariance nuisances=") +
                (cfg.use_root_covariance ? "enabled" : "disabled"));
+    if (cfg.lumi_unc > 0.0) {
+        std::ostringstream lumi_msg;
+        lumi_msg << "combine.C: lumi_unc=" << std::setprecision(4) << (cfg.lumi_unc * 100.0)
+                 << "% (kappa=" << std::setprecision(6) << std::fixed << (1.0 + cfg.lumi_unc) << ")";
+        logMessage(lumi_msg.str());
+    }
     for (const auto& ch : cfg.channels) {
         logMessage("combine.C: channel=" + ch.name +
                    " root_file=" + ch.root_file +
