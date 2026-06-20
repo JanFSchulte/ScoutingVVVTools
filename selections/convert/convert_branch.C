@@ -44,6 +44,12 @@ using JsonValue = simple_json::Value;
 
 namespace {
 
+// Thrown when a single input file is malformed or has an incompatible schema.
+// The file is skipped and processing continues with the next file.
+struct SkippableFileError : std::runtime_error {
+    using runtime_error::runtime_error;
+};
+
 const float def = -99.f;
 const double kMissingDistance = -999.;
 const double kLargeDistance = 999.;
@@ -55,6 +61,7 @@ const char* kSelectionConfigPath = "./selection.json";
 const char* kAppConfigEnvVar = "CONVERT_CONFIG_PATH";
 const char* kSuccessfulBatchesEnvVar = "CONVERT_SUCCESSFUL_BATCHES";
 const char* kDeferFinalMergeEnvVar = "CONVERT_DEFER_FINAL_MERGE";
+const char* kGoldenJsonEnvVar = "CONVERT_GOLDEN_JSON";
 const char* kDefaultSampleConfigPath = "../../src/sample.json";
 const int kRemoteInputOpenRetries = 5;
 const unsigned int kRemoteInputRetrySleepSeconds = 5;
@@ -141,7 +148,7 @@ struct ScalarInputConfig {
             return;
         }
         if (!tree->GetBranch(branch.c_str())) {
-            throw runtime_error("Missing scalar branch: " + branch);
+            throw SkippableFileError("Missing scalar branch: " + branch);
         }
 
         if (type == DataType::Float) {
@@ -241,7 +248,7 @@ struct ArrayInputConfig {
             return;
         }
         if (!tree->GetBranch(branch.c_str())) {
-            throw runtime_error("Missing array branch: " + branch);
+            throw SkippableFileError("Missing array branch: " + branch);
         }
 
         if (type == DataType::Float) {
@@ -359,11 +366,40 @@ struct OutputBranchRuntime {
     ULong64_t ulong64Value = 0;
 };
 
+// Input buffers for reading LHE/PS theory weight branches from NANOAOD.
+struct TheoryWeightBufs {
+    static constexpr int kMaxPdf   = 200;
+    static constexpr int kMaxScale =  20;
+    static constexpr int kMaxPS    =  10;
+    float genWeight              = 1.f;
+    int   nLHEPdfWeight          = 0;
+    float LHEPdfWeight[kMaxPdf]  = {};
+    int   nLHEScaleWeight        = 0;
+    float LHEScaleWeight[kMaxScale] = {};
+    int   nPSWeight              = 0;
+    float PSWeight[kMaxPS]       = {};
+};
+
+// Fixed-size output arrays written as branches to the converted ROOT trees.
+struct TheoryOutBufs {
+    static constexpr int kNPdf     = 101;
+    static constexpr int kNAlphaS  =   2;
+    static constexpr int kNScale   =   9;
+    static constexpr int kNPS      =   4;
+    float genWeight                      = 1.f;
+    float LHEPdfWeight[kNPdf]            = {};
+    float LHEPdfWeightAlphaS[kNAlphaS]   = {1.f, 1.f};
+    float LHEScaleWeight[kNScale]        = {};
+    float PSWeight[kNPS]                 = {};
+};
+
 struct OutputTreeState {
     TreeConfig config;
     TTree* tree = nullptr;
     vector<OutputBranchRuntime> branches;
     unordered_map<string, size_t> branchIndexByName;
+    TheoryOutBufs theoryOutBuf;
+    bool hasTheoryBranches = false;
 };
 
 struct ThreadConvertResult {
@@ -378,6 +414,7 @@ struct SampleRuleConfig {
     int sampleId = -1;
     bool isMC = true;
     bool isSignal = false;
+    bool hasTheoryWeights = false;
     double xsection = -1.;
     double lumi = -1.;
 };
@@ -426,6 +463,7 @@ struct SampleMeta {
     int sampleId = -1;
     bool isMC = true;
     bool isSignal = false;
+    bool hasTheoryWeights = false;
     double xsection = -1.;
     double lumi = -1.;
     size_t remoteSourceCount = 0;
@@ -1077,6 +1115,7 @@ AppConfig loadAppConfig() {
             rule.sampleId = node.at("sample_ID").asInt();
             rule.isMC = node.at("is_MC").asBool();
             rule.isSignal = node.at("is_signal").asBool();
+            rule.hasTheoryWeights = node.contains("has_theory_weights") && node.at("has_theory_weights").asBool();
             rule.xsection = static_cast<double>(node.getNumberOr("xsection", -1.));
             rule.lumi = static_cast<double>(node.getNumberOr("lumi", -1.));
             config.sampleRules.push_back(std::move(rule));
@@ -1461,9 +1500,61 @@ long double lookupPileupWeight(const vector<PileupBin>& bins, float pu, int col)
     return 1.0L;
 }
 
+// Enable and bind theory weight branches on an input TTree. Silently skips missing branches.
+void activateTheoryInputBranches(TTree* tree, TheoryWeightBufs& buf) {
+    const auto tryBind = [&](const char* name, void* addr) {
+        if (tree->GetBranch(name) != nullptr) {
+            tree->SetBranchStatus(name, 1);
+            tree->SetBranchAddress(name, addr);
+        }
+    };
+    tryBind("genWeight",       &buf.genWeight);
+    tryBind("nLHEPdfWeight",   &buf.nLHEPdfWeight);
+    tryBind("LHEPdfWeight",     buf.LHEPdfWeight);
+    tryBind("nLHEScaleWeight", &buf.nLHEScaleWeight);
+    tryBind("LHEScaleWeight",   buf.LHEScaleWeight);
+    tryBind("nPSWeight",       &buf.nPSWeight);
+    tryBind("PSWeight",         buf.PSWeight);
+}
+
+// Create fixed-size array branches on an output tree, pointed at treeState.theoryOutBuf.
+void setupTheoryOutputBranches(OutputTreeState& treeState) {
+    treeState.tree->Branch("genWeight",      &treeState.theoryOutBuf.genWeight,       "genWeight/F");
+    treeState.tree->Branch("LHEPdfWeight",    treeState.theoryOutBuf.LHEPdfWeight,    "LHEPdfWeight[101]/F");
+    treeState.tree->Branch("LHEPdfWeightAlphaS", treeState.theoryOutBuf.LHEPdfWeightAlphaS, "LHEPdfWeightAlphaS[2]/F");
+    treeState.tree->Branch("LHEScaleWeight",  treeState.theoryOutBuf.LHEScaleWeight,  "LHEScaleWeight[9]/F");
+    treeState.tree->Branch("PSWeight",        treeState.theoryOutBuf.PSWeight,        "PSWeight[4]/F");
+    treeState.hasTheoryBranches = true;
+}
+
+// Copy input theory weight buffers to an output struct, padding unused slots with 1.0.
+void copyTheoryWeights(const TheoryWeightBufs& src, TheoryOutBufs& dst) {
+    dst.genWeight = src.genWeight;
+    const int nPdf = min(src.nLHEPdfWeight, TheoryOutBufs::kNPdf);
+    for (int i = 0; i < nPdf; ++i) dst.LHEPdfWeight[i] = src.LHEPdfWeight[i];
+    for (int i = nPdf; i < TheoryOutBufs::kNPdf; ++i) dst.LHEPdfWeight[i] = 1.f;
+    // alpha_s variations: for NNPDF31_*_hessian_pdfas (LHA 306000) the two
+    // alpha_s members (306101/306102) follow the central + 100 Hessian members
+    // at source indices 101 and 102. Stored in a dedicated branch because
+    // LHEPdfWeight keeps only the 101 PDF members. Defaults to 1.0 (no
+    // variation) when the source set has no alpha_s members.
+    for (int i = 0; i < TheoryOutBufs::kNAlphaS; ++i) {
+        const int srcIdx = TheoryOutBufs::kNPdf + i;   // source indices 101, 102
+        dst.LHEPdfWeightAlphaS[i] =
+            (srcIdx < src.nLHEPdfWeight) ? src.LHEPdfWeight[srcIdx] : 1.f;
+    }
+    const int nScale = min(src.nLHEScaleWeight, TheoryOutBufs::kNScale);
+    for (int i = 0; i < nScale; ++i) dst.LHEScaleWeight[i] = src.LHEScaleWeight[i];
+    for (int i = nScale; i < TheoryOutBufs::kNScale; ++i) dst.LHEScaleWeight[i] = 1.f;
+    const int nPS = min(src.nPSWeight, TheoryOutBufs::kNPS);
+    for (int i = 0; i < nPS; ++i) dst.PSWeight[i] = src.PSWeight[i];
+    for (int i = nPS; i < TheoryOutBufs::kNPS; ++i) dst.PSWeight[i] = 1.f;
+}
+
 unordered_map<string, long double> buildRawScalarValues(const BranchConfig& branchConfig,
                                                         const SampleMeta& sampleMeta,
-                                                        const vector<PileupBin>* pileupWeights = nullptr) {
+                                                        const vector<PileupBin>* pileupWeights = nullptr,
+                                                        const TheoryWeightBufs* theoryBufs = nullptr) {
     unordered_map<string, long double> values;
     values.reserve(branchConfig.scalars.size() + 8);
     for (const auto& scalar : branchConfig.scalars) {
@@ -1486,6 +1577,7 @@ unordered_map<string, long double> buildRawScalarValues(const BranchConfig& bran
             values["weight_pu_down"] = 1.;
             values["weight_pu_up"] = 1.;
         }
+        values["genWeight"] = theoryBufs ? static_cast<long double>(theoryBufs->genWeight) : 1.L;
     }
     return values;
 }
@@ -2525,6 +2617,7 @@ SampleMeta resolveSampleMeta(const string& sample, const AppConfig& appConfig) {
         meta.sampleId = rule.sampleId;
         meta.isMC = rule.isMC;
         meta.isSignal = rule.isSignal;
+        meta.hasTheoryWeights = rule.hasTheoryWeights;
         meta.xsection = rule.xsection;
         meta.lumi = rule.lumi;
 
@@ -2783,6 +2876,12 @@ string makeThreadTempFilePath(const fs::path& tempDir,
     const string fileName = "convert_" + sample + "_batch_" + to_string(batchIndex) +
                             "_" + to_string(static_cast<long long>(getpid())) +
                             "_" + to_string(threadIndex) + ".root";
+    // Prefer local node scratch over NFS to avoid ESTALE errors during auto-save
+    // flushes on long-running jobs. Fall back to tempDir (NFS) if $TMPDIR is unset.
+    const char* scratch = getenv("TMPDIR");
+    if (scratch != nullptr && *scratch != '\0' && fs::is_directory(scratch)) {
+        return (fs::path(scratch) / fileName).string();
+    }
     return (tempDir / fileName).string();
 }
 
@@ -3283,11 +3382,16 @@ Long64_t processInputFile(const string& inputFileName,
                           const LumiMask* lumiMask,
                           BranchConfig& branchConfig,
                           vector<OutputTreeState>& outputTrees) {
-    unique_ptr<TFile> inputFile = openInputFileWithRetry(inputFileName);
+    unique_ptr<TFile> inputFile;
+    try {
+        inputFile = openInputFileWithRetry(inputFileName);
+    } catch (const runtime_error& ex) {
+        throw SkippableFileError(ex.what());
+    }
 
     TTree* tree = static_cast<TTree*>(inputFile->Get(appConfig.treeName.c_str()));
     if (!tree) {
-        throw runtime_error("Tree " + appConfig.treeName + " not found in " + inputFileName);
+        throw SkippableFileError("Tree " + appConfig.treeName + " not found in " + inputFileName);
     }
 
     const Long64_t nEntries = tree->GetEntries();
@@ -3298,6 +3402,11 @@ Long64_t processInputFile(const string& inputFileName,
     configureActiveBranches(tree, branchConfig, sampleMeta.isMC);
     ensureCollectionBufferCapacities(tree, branchConfig, sampleMeta.isMC);
     unordered_map<string, const ScalarInputConfig*> rawScalarByName = bindInputBranches(tree, branchConfig, sampleMeta.isMC);
+
+    TheoryWeightBufs theoryInBuf;
+    if (sampleMeta.hasTheoryWeights) {
+        activateTheoryInputBranches(tree, theoryInBuf);
+    }
 
     const bool applyLumiMask = (!sampleMeta.isMC && lumiMask != nullptr);
     const ScalarInputConfig* runScalar = nullptr;
@@ -3336,7 +3445,8 @@ Long64_t processInputFile(const string& inputFileName,
 
         tree->GetEntry(entry);
 
-        unordered_map<string, long double> baseVars = buildRawScalarValues(branchConfig, sampleMeta, &pileupWeights);
+        const TheoryWeightBufs* theoryBufsPtr = sampleMeta.hasTheoryWeights ? &theoryInBuf : nullptr;
+        unordered_map<string, long double> baseVars = buildRawScalarValues(branchConfig, sampleMeta, &pileupWeights, theoryBufsPtr);
 
         EvalContext preContext;
         preContext.vars = &baseVars;
@@ -3374,6 +3484,9 @@ Long64_t processInputFile(const string& inputFileName,
                 continue;
             }
 
+            if (treeState.hasTheoryBranches) {
+                copyTheoryWeights(theoryInBuf, treeState.theoryOutBuf);
+            }
             fillOutputTree(treeState, runtimeCollections, inputCollections, baseVars, rawScalarByName, sampleMeta.isMC);
         }
     }
@@ -3420,6 +3533,14 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
         throw runtime_error("Temporary output initialization error: " + string(ex.what()));
     }
 
+    if (sampleMeta.hasTheoryWeights) {
+        for (auto& result : threadResults) {
+            for (auto& treeState : result.outputTrees) {
+                setupTheoryOutputBranches(treeState);
+            }
+        }
+    }
+
     vector<BranchConfig> threadConfigs(threadCount, branchConfig);
     atomic<bool> failed{false};
     vector<string> errors;
@@ -3452,6 +3573,14 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
                 const size_t done = processedFiles.fetch_add(1) + 1;
 #pragma omp critical(convert_progress)
                 printFileProgress(sampleMeta.sample, done, totalFiles);
+            } catch (const SkippableFileError& ex) {
+                const size_t done = processedFiles.fetch_add(1) + 1;
+#pragma omp critical(convert_progress)
+                {
+                    cerr << "\nWarning: skipping " << batchInputFiles[index]
+                         << ": " << ex.what() << '\n';
+                    printFileProgress(sampleMeta.sample, done, totalFiles);
+                }
             } catch (const exception& ex) {
                 failed.store(true);
 #pragma omp critical(convert_error)
@@ -3465,6 +3594,20 @@ vector<string> processInputBatchToTempFile(const vector<string>& batchInputFiles
             cleanupThreadResult(result);
         }
         throw runtime_error(errors.front());
+    }
+
+    // Detect NFS stale-handle or other write failures before attempting to read
+    // the temp files back. ROOT sets TFile::kWriteError when a flush/write fails.
+    for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        TFile* f = threadResults[threadIndex].tempFile;
+        if (f != nullptr && f->TestBit(TFile::kWriteError)) {
+            for (auto& result : threadResults) {
+                cleanupThreadResult(result);
+            }
+            throw runtime_error("Thread " + to_string(threadIndex) +
+                                " temp file write error (possibly NFS stale handle): " +
+                                threadResults[threadIndex].tempFilePath);
+        }
     }
 
     try {
@@ -3574,6 +3717,41 @@ int finalizeSuccessfulBatches(const AppConfig& appConfig,
     return 0;
 }
 
+size_t inferNBatchesFromTempDir(const fs::path& batchTempDir, const string& sampleName) {
+    if (!fs::is_directory(batchTempDir)) {
+        return 0;
+    }
+    const string prefix = sampleName + "_";
+    const string suffix = ".root";
+    size_t maxIndex = 0;
+    bool found = false;
+    for (const auto& entry : fs::directory_iterator(batchTempDir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const string name = entry.path().filename().string();
+        if (name.size() <= prefix.size() + suffix.size()) {
+            continue;
+        }
+        if (name.substr(0, prefix.size()) != prefix) {
+            continue;
+        }
+        if (name.substr(name.size() - suffix.size()) != suffix) {
+            continue;
+        }
+        const string indexStr = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        size_t batchIndex = 0;
+        if (!parseNonNegativeIndex(indexStr, batchIndex)) {
+            continue;
+        }
+        if (!found || batchIndex > maxIndex) {
+            maxIndex = batchIndex;
+            found = true;
+        }
+    }
+    return found ? maxIndex + 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3615,6 +3793,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (batchRequest.mergeSuccessfulBatches) {
+        const fs::path batchTempDir = makeBatchTempOutputDir(appConfig, sampleMeta);
+        const size_t nBatches = inferNBatchesFromTempDir(batchTempDir, sampleMeta.sample);
+        cout << "Running convert_branch for sample = " << sample
+             << ", merge successful batches" << endl;
+        cout << "Batch mode: " << nBatches
+             << " batch" << (nBatches == 1 ? "" : "es")
+             << ", temporary output = " << batchTempDir.string() << endl;
+        vector<size_t> batchIndices;
+        try {
+            batchIndices = resolveBatchIndicesForFinalMerge(nBatches, batchRequest);
+        } catch (const exception& ex) {
+            cerr << "Batch selection error: " << ex.what() << endl;
+            return 1;
+        }
+        return finalizeSuccessfulBatches(appConfig, sampleMeta, branchConfig, batchIndices, nBatches);
+    }
+
     vector<string> inputFiles;
     try {
         inputFiles = discoverInputFiles(sampleMeta);
@@ -3624,7 +3820,16 @@ int main(int argc, char** argv) {
     }
 
     const int threadCount = determineThreadCount(appConfig.maxThreads, inputFiles.size());
-    const size_t batchSize = max<size_t>(1, static_cast<size_t>(threadCount) * 32);
+    size_t batchSize;
+    {
+        const char* fpbEnv = getenv("CONVERT_FILES_PER_BATCH");
+        size_t fpbOverride = 0;
+        if (fpbEnv != nullptr && *fpbEnv != '\0') {
+            try { fpbOverride = static_cast<size_t>(stoull(fpbEnv)); } catch (...) {}
+        }
+        batchSize = fpbOverride > 0 ? fpbOverride
+                                    : max<size_t>(1, static_cast<size_t>(threadCount) * 32);
+    }
     const size_t nBatches = (inputFiles.size() + batchSize - 1) / batchSize;
     if (batchRequest.printBatchCount) {
         cout << nBatches << endl;
@@ -3641,8 +3846,6 @@ int main(int argc, char** argv) {
          << ", files = " << inputFiles.size();
     if (batchRequest.singleBatch) {
         cout << ", batch = " << (batchRequest.batchIndex + 1) << "/" << nBatches;
-    } else if (batchRequest.mergeSuccessfulBatches) {
-        cout << ", merge successful batches";
     }
     if (sampleMeta.inputPaths.size() == 1) {
         cout << ", source = " << sampleMeta.inputPaths.front()
@@ -3655,19 +3858,6 @@ int main(int argc, char** argv) {
     cout << endl;
 
     const fs::path batchTempDir = makeBatchTempOutputDir(appConfig, sampleMeta);
-    if (batchRequest.mergeSuccessfulBatches) {
-        cout << "Batch mode: " << nBatches
-             << " batch" << (nBatches == 1 ? "" : "es")
-             << ", temporary output = " << batchTempDir.string() << endl;
-        vector<size_t> batchIndices;
-        try {
-            batchIndices = resolveBatchIndicesForFinalMerge(nBatches, batchRequest);
-        } catch (const exception& ex) {
-            cerr << "Batch selection error: " << ex.what() << endl;
-            return 1;
-        }
-        return finalizeSuccessfulBatches(appConfig, sampleMeta, branchConfig, batchIndices, nBatches);
-    }
 
     vector<PileupBin> pileupWeights;
     if (sampleMeta.isMC && !appConfig.puWeightPathPattern.empty()) {

@@ -1,0 +1,19 @@
+{
+  "submit_trees": ["fat2", "fat3"],
+  "sample_config": "../../src/sample.json",
+  "input_root": "../../dataset",
+  "input_pattern": "{input_root}/{sample_group}/{sample}.root",
+  "bdt_root": {
+    "fat2": "../BDT/fat2_UParTv2_v2_wloose",
+    "fat3": "../BDT/fat3_UParTv2_v2_wloose"
+  },
+  "signal_region_csv": {
+    "fat2": "../signal_region/output/fat2_UParTv2_v2_wloose_hist/signal_region.csv",
+    "fat3": "../signal_region/output/fat3_UParTv2_v2_wloose_hist/signal_region.csv"
+  },
+  "min_region_events": 1,
+  "pdf_uncertainty_method": "hessian_symmetric",
+  "output_dir": "./output",
+  "lumi": 255.8,
+  "chunk_size": "200 MB"
+}
