@@ -216,3 +216,6 @@ __marimo__/
 *.csv
 *.out
 CMSSW_*
+# pixi environments
+.pixi/*
+!.pixi/config.toml
