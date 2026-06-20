@@ -2,18 +2,19 @@
   "channels": [
     {
       "name": "fat2",
-      "root_file": "../background_estimation/output/fat2_UParTv2_v3/qcd_abcd_yields.root",
-      "bdt_root": "../selections/BDT/fat2_UParTv2_v3"
+      "root_file": "../background_estimation/output/fat2_UParTv2_v2_wloose/qcd_abcd_yields.root",
+      "bdt_root": "../selections/BDT/fat2_UParTv2_v2_wloose"
     },
     {
       "name": "fat3",
-      "root_file": "../background_estimation/output/fat3_UParTv2_v3/qcd_abcd_yields.root",
-      "bdt_root": "../selections/BDT/fat3_UParTv2_v3"
+      "root_file": "../background_estimation/output/fat3_UParTv2_v2_wloose/qcd_abcd_yields.root",
+      "bdt_root": "../selections/BDT/fat3_UParTv2_v2_wloose"
     }
   ],
-  "output_dir": "./UParTv2_v3",
+  "output_dir": "./bveto",
   "combine_cmd": "combine",
   "combine_cards_cmd": "combineCards.py",
+  "theory_syst_json": "../selections/theory_weights/output/theory_syst_yields.json",
   "use_root_covariance": false,
   "eigen_rel_cutoff": 1e-10,
   "rescale_shape_modes_to_positive": true,
