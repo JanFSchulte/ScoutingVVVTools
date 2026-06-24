@@ -14,6 +14,18 @@
       "sort": "pt(self) desc"
     },
     {
+      "name": "ak4_dR0p4",
+      "source": "ScoutingPFJetRecluster2",
+      "selection": "pt(self) > 30 && abs(eta(self)) < 2.5 && ScoutingPFJetRecluster2_nConstituents > 1 && ScoutingPFJetRecluster2_neHEF < 0.99 && ScoutingPFJetRecluster2_neEmEF < 0.90 && ScoutingPFJetRecluster2_chHadMultiplicity > 0 && ScoutingPFJetRecluster2_muEF < 0.80 && min_deltaR(self, ak8) > 0.4",
+      "sort": "pt(self) desc"
+    },
+    {
+      "name": "ak4_all",
+      "source": "ScoutingPFJetRecluster2",
+      "selection": "pt(self) > 30 && abs(eta(self)) < 2.5 && ScoutingPFJetRecluster2_nConstituents > 1 && ScoutingPFJetRecluster2_neHEF < 0.99 && ScoutingPFJetRecluster2_neEmEF < 0.90 && ScoutingPFJetRecluster2_chHadMultiplicity > 0 && ScoutingPFJetRecluster2_muEF < 0.80",
+      "sort": "pt(self) desc"
+    },
+    {
       "name": "ele",
       "source": "ScoutingElectron",
       "selection": "pt(self) > 10 && abs(eta(self)) < 2.5 && min_deltaR(self, ak8) > 0.8",

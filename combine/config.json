@@ -16,6 +16,8 @@
   "combine_cards_cmd": "combineCards.py",
   "lumi_unc": 0.016,
   "theory_syst_json": "../selections/theory_weights/output/theory_syst_yields.json",
+  "pileup_syst_json": "../selections/pileup_syst/output/pileup_syst_yields.json",
+  "enabled_nuisances": [],
   "use_root_covariance": false,
   "eigen_rel_cutoff": 1e-10,
   "rescale_shape_modes_to_positive": true,

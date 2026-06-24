@@ -41,9 +41,11 @@ MODES = {
             config_env="COMBINE_CONFIG_PATH"),
     8: dict(label="theory_syst", subdir="selections/theory_weights",
             script="theory_syst.py", config_env="THEORY_CONFIG_PATH"),
+    9: dict(label="pileup_syst", subdir="selections/pileup_syst",
+            script="pileup_syst.py", config_env="PILEUP_SYST_CONFIG_PATH"),
 }
 
-PYTHON_MODES = frozenset({2, 3, 4, 5, 8})
+PYTHON_MODES = frozenset({2, 3, 4, 5, 8, 9})
 SAMPLE_MODES = frozenset({0, 1, 6})
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -100,12 +102,13 @@ Sample selection for modes 0, 1, 6:
     p.add_argument("--slurm-cpus", type=int, default=1, metavar="N")
     p.add_argument("--slurm-extra", default="", metavar="ARGS",
                    help="Extra sbatch arguments (space-separated)")
-    p.add_argument("--slurm-files-per-job", type=int, default=125, metavar="N",
-                   help="Target input files per SLURM job for mode 0; default 125 pairs with --slurm-cpus=1 (serial) to keep per-job wall time reasonable")
+    p.add_argument("--slurm-files-per-job", type=int, default=50, metavar="N",
+                   help="Target input files per SLURM job for mode 0; default 50 pairs with --slurm-cpus=1 (serial) to keep per-job wall time reasonable")
     p.add_argument("--max-jobs", type=int, default=1, metavar="N",
                    help="Max concurrent local jobs (default: 1)")
 
-    args = p.parse_args()
+    args, passthrough = p.parse_known_args()
+    args.passthrough = passthrough  # forwarded verbatim to python-script modes (e.g. --no-selection)
 
     rest = list(args.rest)
     args.config_input = None
@@ -350,11 +353,12 @@ def copy_log_to_output_dirs(mode, config_path, work_dir, log_path):
 # Python-script modes (2-5)
 # ---------------------------------------------------------------------------
 
-def run_python_mode(mode_cfg, config_path, work_dir):
+def run_python_mode(mode_cfg, config_path, work_dir, passthrough=None):
     env = {**os.environ, mode_cfg["config_env"]: str(config_path)}
     script = mode_cfg["script"]
-    log(f"run: env {mode_cfg['config_env']}={config_path} python3 ./{script}")
-    r = subprocess.run(["python3", f"./{script}"], env=env, cwd=work_dir)
+    cmd = ["python3", f"./{script}", *(passthrough or [])]
+    log(f"run: env {mode_cfg['config_env']}={config_path} {' '.join(cmd)}")
+    r = subprocess.run(cmd, env=env, cwd=work_dir)
     return r.returncode
 
 
@@ -750,7 +754,7 @@ def main():
         log(f"work_dir={work_dir}")
         log(f"config={config_path}")
         log(f"started job={label} pid={os.getpid()}")
-        status = run_python_mode(mode_cfg, config_path, work_dir)
+        status = run_python_mode(mode_cfg, config_path, work_dir, args.passthrough)
         log(f"finished job={label} pid={os.getpid()} status={status}")
         sys.exit(status)
 

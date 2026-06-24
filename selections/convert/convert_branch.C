@@ -1923,6 +1923,31 @@ Value evalMinDeltaR(const vector<ExprPtr>& args, const EvalContext& context) {
     return makeNumberValue(best);
 }
 
+// Among the reference objects (args[1..]), pick the one closest to args[0] in deltaR
+// and return the deltaPhi between args[0] and that closest reference. Used to attach,
+// per AK4 jet, the deltaPhi to the closest signal AK8 jet.
+Value evalDeltaPhiAtMinDeltaR(const vector<ExprPtr>& args, const EvalContext& context) {
+    if (args.size() < 2) {
+        throw runtime_error("deltaPhi_at_min_deltaR requires an object and at least one reference");
+    }
+
+    const TLorentzVector objectP4 = toP4(evalExpression(args[0], context));
+
+    bool found = false;
+    double bestDeltaR = numeric_limits<double>::max();
+    double bestDeltaPhi = kMissingDistance;
+    for (size_t index = 1; index < args.size(); ++index) {
+        const TLorentzVector ref = toP4(evalExpression(args[index], context));
+        const double dr = objectP4.DeltaR(ref);
+        if (!found || dr < bestDeltaR) {
+            bestDeltaR = dr;
+            bestDeltaPhi = objectP4.DeltaPhi(ref);
+            found = true;
+        }
+    }
+    return makeNumberValue(found ? bestDeltaPhi : kMissingDistance);
+}
+
 Value evalCall(const ExprPtr& expr, const EvalContext& context) {
     const string& op = expr->text;
     const auto& args = expr->args;
@@ -1932,6 +1957,12 @@ Value evalCall(const ExprPtr& expr, const EvalContext& context) {
     }
     if (op == "sqrt") {
         return makeNumberValue(sqrtl(evalNumber(args.at(0), context)));
+    }
+    if (op == "cos") {
+        return makeNumberValue(cosl(evalNumber(args.at(0), context)));
+    }
+    if (op == "sin") {
+        return makeNumberValue(sinl(evalNumber(args.at(0), context)));
     }
     if (op == "pow") {
         return makeNumberValue(powl(evalNumber(args.at(0), context), evalNumber(args.at(1), context)));
@@ -2027,6 +2058,9 @@ Value evalCall(const ExprPtr& expr, const EvalContext& context) {
     }
     if (op == "min_deltaR") {
         return evalMinDeltaR(args, context);
+    }
+    if (op == "deltaPhi_at_min_deltaR") {
+        return evalDeltaPhiAtMinDeltaR(args, context);
     }
 
     throw runtime_error("Unsupported function in expression: " + op);

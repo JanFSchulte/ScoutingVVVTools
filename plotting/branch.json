@@ -8,7 +8,10 @@
     "branches": {
       "ScoutingFatPFJetRecluster_mass": {
         "bins": 50,
-        "x_range": [0, 5000]
+        "x_range": [
+          0,
+          5000
+        ]
       }
     }
   },
@@ -18,7 +21,95 @@
       "is_MC",
       "is_signal"
     ],
+    "branches": {}
+  },
+  "ttbar_cr": {
+    "skip_branches": [
+      "sample_ID",
+      "is_MC",
+      "is_signal",
+      "run",
+      "luminosityBlock",
+      "event"
+    ],
     "branches": {
+      "ScoutingFatPFJetRecluster_msoftdrop_1": {
+        "bins": 50,
+        "x_range": [
+          0,
+          250
+        ]
+      },
+      "ScoutingFatPFJetRecluster_msoftdrop_2": {
+        "bins": 50,
+        "x_range": [
+          0,
+          250
+        ]
+      },
+      "ScoutingMET_pt": {
+        "bins": 50,
+        "x_range": [
+          0,
+          300
+        ]
+      },
+      "ScoutingMuonVtx_pt_1": {
+        "bins": 50,
+        "x_range": [
+          0,
+          300
+        ]
+      },
+      "ScoutingMuonVtx_relIso_1": {
+        "bins": 50,
+        "x_range": [
+          0,
+          1
+        ]
+      },
+      "ScoutingMuonVtx_trkRelIso_1": {
+        "bins": 50,
+        "x_range": [
+          0,
+          0.5
+        ]
+      },
+      "ScoutingPFJetRecluster2_scoutUParT_probb_max": {
+        "bins": 50,
+        "x_range": [
+          0,
+          1
+        ]
+      },
+      "ScoutingPFJetRecluster2_selected_HT": {
+        "bins": 50,
+        "x_range": [
+          0,
+          2000
+        ]
+      },
+      "MuonMET_mT": {
+        "bins": 50,
+        "x_range": [
+          0,
+          200
+        ]
+      },
+      "LeptonicW_pt": {
+        "bins": 50,
+        "x_range": [
+          0,
+          400
+        ]
+      },
+      "ScoutingMuonVtx_mediumId_1": {
+        "bins": 2,
+        "x_range": [
+          0,
+          2
+        ]
+      }
     }
   }
 }
