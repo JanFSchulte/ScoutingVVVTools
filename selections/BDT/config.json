@@ -1,8 +1,8 @@
 {
   "submit_trees": ["fat2", "fat3"],
   "sample_config": "../../src/sample.json",
-  "input_root": "../../dataset_bveto_study/",
-  "input_pattern": "{input_root}/{sample_group}_mixed/{sample}.root",
+  "input_root": "/depot/cms/private/users/schul105/VVV/analysis/CMSSW_16_1_0_pre4/src/ScoutingVVVTools/dataset/",
+  "input_pattern": "{input_root}/{sample_group}/{sample}.root",
   "output_root": "./{tree_name}_bveto_study",
   "model_pattern": "{output_root}/{tree_name}_model",
   "model_type": "bdt",
@@ -19,8 +19,7 @@
   "class_groups": {
     "VVV": ["www", "wwz", "wzz", "zzz"],
     "VH":  ["zh_had", "ggzh_had", "wplush", "wminush"],
-    "Top": ["ttbar_had", "ttbar_semilep"],
-    "VT": ["tbarwplus_had", "twminus_had"],
+    "Top": ["ttbar_had", "ttbar_semilep","tbarwplus_had", "twminus_had"],
     "VV":  ["ww", "wz", "zz"],
     "QCD": ["qcd_ht100to200", "qcd_ht200to400", "qcd_ht400to600","qcd_ht600to800", "qcd_ht800to1000", "qcd_ht1000to1200","qcd_ht1200to1500", "qcd_ht1500to2000", "qcd_ht2000"]
   },
