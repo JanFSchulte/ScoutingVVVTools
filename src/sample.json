@@ -36,7 +36,7 @@
       "has_theory_weights": true,
       "xsection": 232.8,
       "lumi": -1,
-      "raw_entries": 4299284
+      "raw_entries": 1650800
     },
     {
       "name": "wwz",
@@ -47,7 +47,7 @@
       "has_theory_weights": true,
       "xsection": 185.1,
       "lumi": -1,
-      "raw_entries": 11592879
+      "raw_entries": 16197159
     },
     {
       "name": "wzz",
@@ -58,7 +58,7 @@
       "has_theory_weights": true,
       "xsection": 62.06,
       "lumi": -1,
-      "raw_entries": 13429626
+      "raw_entries": 16199286
     },
     {
       "name": "zzz",
@@ -123,7 +123,7 @@
       "is_signal": false,
       "xsection": 312300000000,
       "lumi": -1,
-      "raw_entries": 32627554
+      "raw_entries": 110777315
     },
     {
       "name": "qcd_ht70to100",
@@ -133,7 +133,7 @@
       "is_signal": false,
       "xsection": 58470000000,
       "lumi": -1,
-      "raw_entries": 92924651
+      "raw_entries": 108584880
     },
     {
       "name": "qcd_ht100to200",
@@ -143,7 +143,7 @@
       "is_signal": false,
       "xsection": 25310000000,
       "lumi": -1,
-      "raw_entries": 108242016
+      "raw_entries": 120388125
     },
     {
       "name": "qcd_ht200to400",
@@ -153,7 +153,7 @@
       "is_signal": false,
       "xsection": 1960000000,
       "lumi": -1,
-      "raw_entries": 104348710
+      "raw_entries": 115255250
     },
     {
       "name": "qcd_ht400to600",
@@ -163,7 +163,7 @@
       "is_signal": false,
       "xsection": 97400000,
       "lumi": -1,
-      "raw_entries": 58223954
+      "raw_entries": 101684185
     },
     {
       "name": "qcd_ht600to800",
@@ -173,7 +173,7 @@
       "is_signal": false,
       "xsection": 13540000,
       "lumi": -1,
-      "raw_entries": 105159457
+      "raw_entries": 126705137
     },
     {
       "name": "qcd_ht800to1000",
@@ -183,7 +183,7 @@
       "is_signal": false,
       "xsection": 3010000,
       "lumi": -1,
-      "raw_entries": 103924665
+      "raw_entries": 125433977
     },
     {
       "name": "qcd_ht1000to1200",
@@ -193,7 +193,7 @@
       "is_signal": false,
       "xsection": 890300,
       "lumi": -1,
-      "raw_entries": 79042654
+      "raw_entries": 111425445
     },
     {
       "name": "qcd_ht1200to1500",
@@ -203,7 +203,7 @@
       "is_signal": false,
       "xsection": 384800,
       "lumi": -1,
-      "raw_entries": 57511331
+      "raw_entries": 63709577
     },
     {
       "name": "qcd_ht1500to2000",
@@ -213,7 +213,7 @@
       "is_signal": false,
       "xsection": 127300,
       "lumi": -1,
-      "raw_entries": 110260437
+      "raw_entries": 115738116
     },
     {
       "name": "qcd_ht2000",
@@ -223,7 +223,7 @@
       "is_signal": false,
       "xsection": 26260,
       "lumi": -1,
-      "raw_entries": 92439825
+      "raw_entries": 97803060
     },
     {
       "name": "ttbar_had",
@@ -234,7 +234,7 @@
       "has_theory_weights": true,
       "xsection": 419657,
       "lumi": -1,
-      "raw_entries": 380577994
+      "raw_entries": 468776258
     },
     {
       "name": "ttbar_semilep",
@@ -245,7 +245,7 @@
       "has_theory_weights": true,
       "xsection": 405702,
       "lumi": -1,
-      "raw_entries": 450672552
+      "raw_entries": 484298177
     },
     {
       "name": "ww",
@@ -256,7 +256,7 @@
       "has_theory_weights": true,
       "xsection": 80230,
       "lumi": -1,
-      "raw_entries": 53998664
+      "raw_entries": 63994208
     },
     {
       "name": "wz",
@@ -267,7 +267,7 @@
       "has_theory_weights": true,
       "xsection": 29100,
       "lumi": -1,
-      "raw_entries": 23903975
+      "raw_entries": 30260725
     },
     {
       "name": "zz",
@@ -289,7 +289,7 @@
       "has_theory_weights": true,
       "xsection": 19971,
       "lumi": -1,
-      "raw_entries": 16189000
+      "raw_entries": 24000000
     },
     {
       "name": "twminus_had",
@@ -311,7 +311,7 @@
       "has_theory_weights": true,
       "xsection": 16120000,
       "lumi": -1,
-      "raw_entries": 347866933
+      "raw_entries": 384703157
     },
     {
       "name": "wjets_h400to800",
@@ -322,7 +322,7 @@
       "has_theory_weights": true,
       "xsection": 356900,
       "lumi": -1,
-      "raw_entries": 251836216
+      "raw_entries": 274734538
     },
     {
       "name": "wjets_h800to1500",
@@ -333,7 +333,7 @@
       "has_theory_weights": true,
       "xsection": 29520,
       "lumi": -1,
-      "raw_entries": 42141952
+      "raw_entries": 53389988
     },
     {
       "name": "wjets_h1500to2500",
@@ -344,7 +344,7 @@
       "has_theory_weights": true,
       "xsection": 1825,
       "lumi": -1,
-      "raw_entries": 39186182
+      "raw_entries": 48297099
     },
     {
       "name": "wjets_h2500",
@@ -355,7 +355,7 @@
       "has_theory_weights": true,
       "xsection": 115.8,
       "lumi": -1,
-      "raw_entries": 42421941
+      "raw_entries": 52106542
     },
     {
       "name": "zjets_h100to400",
@@ -366,7 +366,7 @@
       "has_theory_weights": true,
       "xsection": 6328000,
       "lumi": -1,
-      "raw_entries": 405940713
+      "raw_entries": 451843653
     },
     {
       "name": "zjets_h400to800",
@@ -377,7 +377,7 @@
       "has_theory_weights": true,
       "xsection": 145100,
       "lumi": -1,
-      "raw_entries": 168978854
+      "raw_entries": 181646889
     },
     {
       "name": "zjets_h800to1500",
@@ -388,7 +388,7 @@
       "has_theory_weights": true,
       "xsection": 12900,
       "lumi": -1,
-      "raw_entries": 49056270
+      "raw_entries": 51519410
     },
     {
       "name": "zjets_h1500to2500",
@@ -399,7 +399,7 @@
       "has_theory_weights": true,
       "xsection": 854.1,
       "lumi": -1,
-      "raw_entries": 61628059
+      "raw_entries": 67209394
     },
     {
       "name": "zjets_h2500",
@@ -410,7 +410,7 @@
       "has_theory_weights": true,
       "xsection": 56.84,
       "lumi": -1,
-      "raw_entries": 40262400
+      "raw_entries": 42051768
     },
     {
       "name": "dytoll_ht400to800_mll120",
@@ -601,7 +601,7 @@
       "has_theory_weights": true,
       "xsection": 450.3,
       "lumi": -1,
-      "raw_entries": 14855542
+      "raw_entries": 15095554
     },
     {
       "name": "wlnu_h1500to2500_m120",
@@ -623,7 +623,7 @@
       "has_theory_weights": true,
       "xsection": 30.85,
       "lumi": -1,
-      "raw_entries": 12348254
+      "raw_entries": 12543917
     },
     {
       "name": "wlnu_h2500_m120",
@@ -645,7 +645,7 @@
       "has_theory_weights": true,
       "xsection": 59860.0,
       "lumi": -1,
-      "raw_entries": 102946426
+      "raw_entries": 120437765
     },
     {
       "name": "wlnu_h400to800_m120",
@@ -667,7 +667,7 @@
       "has_theory_weights": true,
       "xsection": 4259000.0,
       "lumi": -1,
-      "raw_entries": 338752436
+      "raw_entries": 362564818
     },
     {
       "name": "wlnu_h800to1500_m0to120",
@@ -678,7 +678,7 @@
       "has_theory_weights": true,
       "xsection": 6226.0,
       "lumi": -1,
-      "raw_entries": 14469387
+      "raw_entries": 14874196
     },
     {
       "name": "wlnu_h800to1500_m120",
