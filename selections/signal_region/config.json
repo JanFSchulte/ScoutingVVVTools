@@ -1,8 +1,8 @@
 {
   "lumi": 255.8,
   "n_signal_regions": 4,
-  "bdt_root": "../BDT/fat2_UParTv2_v2_wloose",
-  "output_dir": "./output/fat2_UParTv2_v2_wloose",
+  "bdt_root": "../BDT//fat3_vjets_full",
+  "output_dir": "./output//fa32_vjets_full",
   "score_axes": "all",
   "min_bkg_weight": 5.0,
   "min_signal_weight": 0.0,

@@ -43,9 +43,11 @@ MODES = {
             script="theory_syst.py", config_env="THEORY_CONFIG_PATH"),
     9: dict(label="pileup_syst", subdir="selections/pileup_syst",
             script="pileup_syst.py", config_env="PILEUP_SYST_CONFIG_PATH"),
+    10: dict(label="class_shapes", subdir="plotting",
+             script="class_shapes.py", config_env="PLOT_CONFIG_PATH"),
 }
 
-PYTHON_MODES = frozenset({2, 3, 4, 5, 8, 9})
+PYTHON_MODES = frozenset({2, 3, 4, 5, 8, 9, 10})
 SAMPLE_MODES = frozenset({0, 1, 6})
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -83,6 +85,8 @@ Modes:
   6  selections/mix/mix.C               (per-sample)
   7  combine/combine.C                  (no samples)
   8  selections/theory_weights/theory_syst.py  (no samples)
+  9  selections/pileup_syst/pileup_syst.py  (no samples)
+  10 plotting/class_shapes.py            (no samples)
 
 Sample selection for modes 0, 1, 6:
   1. CLI sample names (highest priority)
@@ -91,7 +95,7 @@ Sample selection for modes 0, 1, 6:
 """,
     )
     p.add_argument("mode", type=int, choices=MODES, metavar="MODE",
-                   help="Execution mode 0-8")
+                   help="Execution mode 0-10")
     p.add_argument("rest", nargs="*", metavar="ARG",
                    help="Optional: [config.json] [sample1 sample2 ...]")
     p.add_argument("--slurm", action="store_true",
@@ -108,12 +112,25 @@ Sample selection for modes 0, 1, 6:
                    help="Max concurrent local jobs (default: 1)")
 
     args, passthrough = p.parse_known_args()
-    args.passthrough = passthrough  # forwarded verbatim to python-script modes (e.g. --no-selection)
 
     rest = list(args.rest)
+    # argparse closes the nargs="*" positional as soon as an optional (e.g. --slurm)
+    # is seen, so positionals given AFTER an optional land in parse_known_args'
+    # leftovers instead of args.rest. For the sample-taking modes, recover any
+    # non-flag leftovers as positionals so argument order does not matter
+    # (`0 --slurm www` == `0 www --slurm`). Real flags stay in passthrough, which
+    # is forwarded verbatim to python-script modes (e.g. --no-selection).
+    if args.mode in SAMPLE_MODES:
+        rest += [tok for tok in passthrough if not tok.startswith("-")]
+        passthrough = [tok for tok in passthrough if tok.startswith("-")]
+    args.passthrough = passthrough
+
+    # config.json may appear in any position; pull it out, the rest are sample names.
     args.config_input = None
-    if rest and rest[0].endswith(".json"):
-        args.config_input = rest.pop(0)
+    json_tokens = [tok for tok in rest if tok.endswith(".json")]
+    if json_tokens:
+        args.config_input = json_tokens[0]
+        rest = [tok for tok in rest if tok != args.config_input]
     args.samples = rest
     return args
 
