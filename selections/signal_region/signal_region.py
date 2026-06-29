@@ -1047,25 +1047,19 @@ def find_signal_regions(proba, y, w, forbidden_regions=None, target_regions=None
             return None
         if _overlaps_forbidden(lo, hi):
             return None
-        entries_check = (MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0)
-        # Early reject using provided yields (cheap, no extra masking).
-        if S_v is not None and B_v is not None:
+        if S_v is None or B_v is None:
+            S_v, B_v = _rect_SB(lo, hi)
+        else:
             S_v, B_v = float(S_v), float(B_v)
-            if B_v < MIN_BKG_WEIGHT or S_v <= MIN_SIGNAL_WEIGHT:
-                return None
-        if entries_check:
-            # _rect_stats and _rect_SB both sum over the exact _rect_mask, so the
-            # weights returned here are identical to _rect_SB's; compute once.
-            S_v, B_v, S_entries, B_entries = _rect_stats(lo, hi)
+        if B_v < MIN_BKG_WEIGHT or S_v <= MIN_SIGNAL_WEIGHT:
+            return None
+        if MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0:
+            S_check, B_check, S_entries, B_entries = _rect_stats(lo, hi)
+            S_v, B_v = S_check, B_check
             if S_entries < MIN_SIGNAL_ENTRIES or B_entries < MIN_BKG_ENTRIES:
                 return None
             if B_v < MIN_BKG_WEIGHT or S_v <= MIN_SIGNAL_WEIGHT:
                 return None
-        else:
-            if S_v is None or B_v is None:
-                S_v, B_v = _rect_SB(lo, hi)
-                if B_v < MIN_BKG_WEIGHT or S_v <= MIN_SIGNAL_WEIGHT:
-                    return None
         Z = _calc_Z_val(S_v, B_v)
         if Z <= 0.0:
             return None
@@ -1595,26 +1589,11 @@ def find_signal_regions(proba, y, w, forbidden_regions=None, target_regions=None
                     prev_Z = refined["Z"]
                 if not changed:
                     break
-            # Evaluate candidate updates inside the worker so the expensive exact
-            # _rect_stats masking is parallelized instead of being serialized in
-            # the main insert loop. Dedupe by region key (first occurrence wins,
-            # matching _add_to_pool semantics).
-            evaluated = []
-            seen = set()
-            for lo_u, hi_u, S_u, B_u in updates:
-                key = _region_key(lo_u, hi_u)
-                if key in seen:
-                    continue
-                seen.add(key)
-                it = _evaluate_region(lo_u, hi_u, S_u, B_u)
-                if it is not None:
-                    evaluated.append((key, it))
-            return ic, evaluated
+            return ic, updates
 
-        for ic, evaluated in _parallel_map_ordered(_refine_task, enumerate(refine_items)):
-            for key, it in evaluated:
-                if key not in pool:
-                    pool[key] = it
+        for ic, updates in _parallel_map_ordered(_refine_task, enumerate(refine_items)):
+            for lo, hi, S_v, B_v in updates:
+                _add_to_pool(lo, hi, S_v, B_v)
             _progress(
                 f"Local refinement: processed {ic + 1}/{len(refine_items)}, "
                 f"pool={len(pool)}"

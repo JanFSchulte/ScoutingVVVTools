@@ -5,8 +5,6 @@
   "bdt_root": "../selections/BDT/{tree_name}_UParTv2_v2_wloose/",
   "output_root": "./pre-selection/{tree_name}",
   "output_root_nosel": "./no-selection_btagged/{tree_name}",
-  "output_shapes": "./class-shapes/{tree_name}",
-  "output_shapes_nosel": "./class-shapes_nosel/{tree_name}",
   "data_samples": ["data_2024"],
   "default_bins": 50,
   "event_reweight_branches": {
