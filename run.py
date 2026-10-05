@@ -327,13 +327,16 @@ def compile_binary(work_dir, source, bin_path, omp_cflags, omp_ldflags):
     root_cflags  = subprocess.check_output(["root-config", "--cflags"],  text=True).strip()
     root_libs    = subprocess.check_output(["root-config", "--libs"],    text=True).strip()
     root_libdir  = subprocess.check_output(["root-config", "--libdir"],  text=True).strip()
+    corrlib_cflags, corrlib_ldflags, corrlib_libdir = detect_correctionlib()
 
     cmd = (
         ["c++", "-O3", "-DNDEBUG", "-std=c++17"]
         + root_cflags.split()
+        + (corrlib_cflags.split() if corrlib_cflags else [])
         + (omp_cflags.split() if omp_cflags else [])
         + [f"./{source}", "-o", str(bin_path)]
         + root_libs.split()
+        + (corrlib_ldflags.split() if corrlib_ldflags else [])
         + (omp_ldflags.split() if omp_ldflags else [])
     )
     log(f"compile: {' '.join(cmd)}")
@@ -341,7 +344,8 @@ def compile_binary(work_dir, source, bin_path, omp_cflags, omp_ldflags):
     if r.returncode != 0:
         sys.exit(f"compilation failed (status {r.returncode})")
     log("compile finished")
-    return root_libdir
+    libdir = f"{root_libdir}:{corrlib_libdir}" if corrlib_libdir else root_libdir
+    return libdir
 
 
 # ---------------------------------------------------------------------------
@@ -873,12 +877,13 @@ def main():
     reuse_binary = False
     if args.slurm:
         # Queued SLURM jobs run long after submission: give every distinct build (source,
-        # shared JSON header, compiler flags) its own binary, so a later run.py invocation
-        # can neither overwrite nor delete the binary those jobs will execute.
+        # shared JSON header, compiler and correctionlib flags) its own binary, so a later
+        # run.py invocation can neither overwrite nor delete the binary those jobs will execute.
         digest = hashlib.sha256()
         digest.update((work_dir / mode_cfg["source"]).read_bytes())
         digest.update((ROOT_DIR / "src" / "simple_json.h").read_bytes())
         digest.update(f"{omp_cflags}|{omp_ldflags}".encode())
+        digest.update("|".join(detect_correctionlib()).encode())
         digest.update(subprocess.check_output(["root-config", "--cflags", "--libs"]))
         bin_path = work_dir / f"{mode_cfg['bin_name']}_{digest.hexdigest()[:12]}"
         reuse_binary = bin_path.exists()
@@ -895,6 +900,9 @@ def main():
 
     if reuse_binary:
         root_libdir = subprocess.check_output(["root-config", "--libdir"], text=True).strip()
+        corrlib_libdir = detect_correctionlib()[2]
+        if corrlib_libdir:
+            root_libdir = f"{root_libdir}:{corrlib_libdir}"
         log(f"reusing binary {bin_path} (same source and build flags)")
     else:
         root_libdir = compile_binary(work_dir, mode_cfg["source"], bin_path, omp_cflags, omp_ldflags)
