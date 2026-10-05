@@ -998,7 +998,7 @@
               "type": "F",
               "collection": "ak8",
               "slots": 3,
-              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
+              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
               "onlyMC": false
             },
             {
@@ -1931,7 +1931,7 @@
               "type": "F",
               "collection": "ak8_kept2",
               "slots": 2,
-              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
+              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
               "onlyMC": false
             },
             {
@@ -3052,7 +3052,7 @@
               "type": "F",
               "collection": "ak8_kept2",
               "slots": 2,
-              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
+              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
               "onlyMC": false
             },
             {
@@ -4155,7 +4155,7 @@
               "type": "F",
               "collection": "ak8_kept2",
               "slots": 2,
-              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
+              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
               "onlyMC": false
             },
             {
@@ -5288,7 +5288,7 @@
               "type": "F",
               "collection": "ak8_kept2",
               "slots": 2,
-              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
+              "formula": "safe_div(ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq, ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xbb + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xcc + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xss + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_Xqq + ScoutingFatPFJetRecluster_scoutGlobalParT_prob_QCD, 0)",
               "onlyMC": false
             },
             {
