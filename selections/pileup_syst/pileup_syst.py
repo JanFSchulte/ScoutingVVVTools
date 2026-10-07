@@ -12,8 +12,12 @@ For each (sample, tree) reports:
   - per-signal-region ratios in a ``regions`` sub-dict (when bdt_root and
     signal_region_csv are configured for the tree)
 
-  pu_up   = sum(weight_pu_up)   / sum(weight_pu)
-  pu_down = sum(weight_pu_down) / sum(weight_pu)
+  pu_up   = [sum(g * weight_pu_up)   / sum(g * weight_pu)] * <weight_pu>_all / <weight_pu_up>_all
+  pu_down = [sum(g * weight_pu_down) / sum(g * weight_pu)] * <weight_pu>_all / <weight_pu_down>_all
+
+with g = genWeight / genweight_mean the signed generator-weight factor and <...>_all the
+all-generated-event means stored in sample.json by convert_branch, i.e. every variation is
+normalised like the nominal analysis weights (selections/BDT/gen_weight.py).
 
 Region assignment uses the same BDT model + per-class rectangle definition
 as qcd_est.py (via selections/BDT/model_io.py), so the SR bins match the
@@ -29,6 +33,7 @@ Outputs (written to output_dir):
 
 import csv
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -45,6 +50,7 @@ _BDT_TOOLS_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "BDT"))
 if _BDT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _BDT_TOOLS_DIR)
 import model_io  # noqa: E402
+from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean, reweight_mean  # noqa: E402
 
 
 def log(msg):
@@ -269,6 +275,8 @@ def _build_tree_context(tree):
         clip_ranges=clip_ranges, log_transform=log_transform,
         decorrelate=decorrelate, sr_df=sr_df, axes=axes, bin_ids=bin_ids,
         sr_csv=sr_csv,
+        # SR provenance for combine: first 13 hex digits of the SHA-256 of the SR CSV bytes.
+        sr_csv_hash=hashlib.sha256(open(sr_csv, "rb").read()).hexdigest()[:13],
     )
     log(f"  [{tree}] regions enabled: {len(bin_ids)} SRs from {os.path.basename(sr_csv)}, "
         f"axes={axes}")
@@ -337,8 +345,15 @@ def _compute_ratios(sample_name, ctx):
     thresholds = ctx["thresholds"]
     enabled    = ctx["regions_enabled"]
     n_slots    = 1 + (len(ctx["bin_ids"]) if enabled else 0)
+    genweight_mean = require_genweight_mean(SAMPLE_INFO[sample_name].get("genweight_mean"), sample_name)
+    # Absolute normalisation: each variation is normalised by its own all-generated-event mean
+    # (sample.json, written by convert_branch), as the nominal analysis weights are.
+    info = SAMPLE_INFO[sample_name]
+    mean_nom = reweight_mean(info, ["weight_pu"], sample_name)
+    up_norm = mean_nom / reweight_mean(info, ["weight_pu_up"], sample_name)
+    down_norm = mean_nom / reweight_mean(info, ["weight_pu_down"], sample_name)
 
-    load_set = {"weight_pu", "weight_pu_up", "weight_pu_down", *thresholds.keys()}
+    load_set = {"weight_pu", "weight_pu_up", "weight_pu_down", GEN_WEIGHT_BRANCH, *thresholds.keys()}
     if enabled:
         load_set.update(ctx["feature_cols"])
     load_list = list(load_set)
@@ -356,7 +371,7 @@ def _compute_ratios(sample_name, ctx):
                     continue
                 tree = uf[ctx["_tree"]]
                 avail = set(tree.keys())
-                missing = [b for b in ("weight_pu", "weight_pu_up", "weight_pu_down")
+                missing = [b for b in ("weight_pu", "weight_pu_up", "weight_pu_down", GEN_WEIGHT_BRANCH)
                            if b not in avail]
                 if missing:
                     log(f"    WARNING: {os.path.basename(fpath)} missing {missing} "
@@ -371,9 +386,12 @@ def _compute_ratios(sample_name, ctx):
                     if not mask.any():
                         continue
 
-                    w    = np.asarray(chunk["weight_pu"],      dtype=np.float64)[mask]
-                    w_up = np.asarray(chunk["weight_pu_up"],   dtype=np.float64)[mask]
-                    w_dn = np.asarray(chunk["weight_pu_down"], dtype=np.float64)[mask]
+                    # Signed generator-weight factor applied to nominal and varied sums.
+                    g    = gen_weight_factor(np.asarray(chunk[GEN_WEIGHT_BRANCH])[mask], genweight_mean,
+                                             sample_name)
+                    w    = np.asarray(chunk["weight_pu"],      dtype=np.float64)[mask] * g
+                    w_up = np.asarray(chunk["weight_pu_up"],   dtype=np.float64)[mask] * g
+                    w_dn = np.asarray(chunk["weight_pu_down"], dtype=np.float64)[mask] * g
 
                     sum_w[0]    += float(w.sum())
                     sum_w_up[0] += float(w_up.sum())
@@ -393,8 +411,8 @@ def _compute_ratios(sample_name, ctx):
                                 sum_w_dn[j + 1] += float(w_dn[rmask].sum())
                                 n_events[j + 1] += int(rmask.sum())
         except Exception as exc:
-            log(f"    error reading {fpath}: {exc}")
-            continue
+            # A read error would silently bias the ratio sums, so it is fatal.
+            raise RuntimeError(f"error reading {fpath}: {exc}") from exc
 
     if not found_pu:
         log(f"    [{sample_name}] PU branches missing in all files")
@@ -408,8 +426,8 @@ def _compute_ratios(sample_name, ctx):
         return {
             "nom_sum":  float(w),
             "n_events": n,
-            "pu_up":    float(sum_w_up[slot] / w),
-            "pu_down":  float(sum_w_dn[slot] / w),
+            "pu_up":    float(sum_w_up[slot] / w * up_norm),
+            "pu_down":  float(sum_w_dn[slot] / w * down_norm),
         }
 
     inclusive = _slot_ratios(0)
@@ -474,6 +492,7 @@ def main():
                         log(f"    SR{bid}: n={rr['n_events']}"
                             f"  pu_up={_pct(rr['pu_up'])}  pu_down={_pct(rr['pu_down'])}")
                 entry["regions"] = region_out
+                entry["sr_csv_hash"] = ctx["sr_csv_hash"]
 
             all_results[(sample_name, tree_name)] = entry
 

@@ -78,9 +78,12 @@ def _sample_ratios(sample_name, tree_name, ctx):
         log(f"    missing nominal/up/down files for {sample_name}, skipping")
         return None
 
-    nominal = jvc.accumulate_weighted_sr_yields(nominal_files, tree_name, ctx, WEIGHT_BRANCH, CHUNK_SIZE)
-    up = jvc.accumulate_weighted_sr_yields(up_files, tree_name, ctx, WEIGHT_BRANCH, CHUNK_SIZE)
-    down = jvc.accumulate_weighted_sr_yields(down_files, tree_name, ctx, WEIGHT_BRANCH, CHUNK_SIZE)
+    genweight_mean = jvc.require_genweight_mean(SAMPLE_INFO[sample_name].get("genweight_mean"), sample_name)
+    nominal = jvc.accumulate_weighted_sr_yields(nominal_files, tree_name, ctx, WEIGHT_BRANCH, CHUNK_SIZE,
+                                                genweight_mean)
+    up = jvc.accumulate_weighted_sr_yields(up_files, tree_name, ctx, WEIGHT_BRANCH, CHUNK_SIZE, genweight_mean)
+    down = jvc.accumulate_weighted_sr_yields(down_files, tree_name, ctx, WEIGHT_BRANCH, CHUNK_SIZE,
+                                             genweight_mean)
     if nominal is None or up is None or down is None:
         log(f"    [{sample_name}/{tree_name}] weight branch missing in nominal/up/down, skipping")
         return None
@@ -146,6 +149,7 @@ def main():
                         log(f"    SR{bid}: n={rr['n_events']}"
                             f"  jes_up={_pct(rr['jes_up'])}  jes_down={_pct(rr['jes_down'])}")
                 entry["regions"] = region_out
+                entry["sr_csv_hash"] = ctx["sr_csv_hash"]
 
             all_results[(sample_name, tree_name)] = entry
 

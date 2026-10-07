@@ -15,6 +15,7 @@ accumulator that each of nominal/up/down is run through independently.
 """
 
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -28,6 +29,7 @@ _BDT_TOOLS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "BDT"))
 if _BDT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _BDT_TOOLS_DIR)
 import model_io  # noqa: E402
+from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean  # noqa: E402,F401
 
 
 def log(msg):
@@ -208,6 +210,8 @@ def build_tree_context(script_dir, bdt_root_cfg, sr_csv_cfg, tree):
         clip_ranges=clip_ranges, log_transform=log_transform,
         decorrelate=decorrelate, sr_df=sr_df, axes=axes, bin_ids=bin_ids,
         sr_csv=sr_csv,
+        # SR provenance for combine: first 13 hex digits of the SHA-256 of the SR CSV bytes.
+        sr_csv_hash=hashlib.sha256(open(sr_csv, "rb").read()).hexdigest()[:13],
     )
     log(f"  [{tree}] regions enabled: {len(bin_ids)} SRs from {os.path.basename(sr_csv)}, "
         f"axes={axes}")
@@ -236,13 +240,14 @@ def infer_proba(chunk, mask, ctx):
 # Single-dataset-root weighted SR yield accumulation
 # ---------------------------------------------------------------------------
 
-def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size):
+def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size, genweight_mean):
     """Sum `weight_branch` inclusive (slot 0) and per-SR (slots 1..N) over one
     independent set of converted-ntuple files (nominal, or a JES/JER-shifted
     variant) -- unlike pileup_syst.py's _compute_ratios, up/down live in
     SEPARATE files here, not separate columns of the same file, so this only
     ever accumulates ONE dataset root per call; the caller computes ratios
-    across three separate calls (nominal, up, down)."""
+    across three separate calls (nominal, up, down). Each event weight carries
+    the signed generator-weight factor genWeight / genweight_mean."""
     if not files:
         return None
 
@@ -250,7 +255,7 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
     enabled = ctx["regions_enabled"]
     n_slots = 1 + (len(ctx["bin_ids"]) if enabled else 0)
 
-    load_set = {weight_branch, *thresholds.keys()}
+    load_set = {weight_branch, GEN_WEIGHT_BRANCH, *thresholds.keys()}
     if enabled:
         load_set.update(ctx["feature_cols"])
     load_list = list(load_set)
@@ -266,8 +271,9 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
                     continue
                 tree = uf[tree_name]
                 avail = set(tree.keys())
-                if weight_branch not in avail:
-                    log(f"    WARNING: {os.path.basename(fpath)} missing {weight_branch!r}")
+                if weight_branch not in avail or GEN_WEIGHT_BRANCH not in avail:
+                    log(f"    WARNING: {os.path.basename(fpath)} missing {weight_branch!r} or "
+                        f"{GEN_WEIGHT_BRANCH!r}")
                     continue
                 found_weight = True
                 actual = [b for b in load_list if b in avail]
@@ -277,7 +283,8 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
                     if not mask.any():
                         continue
 
-                    w = np.asarray(chunk[weight_branch], dtype=np.float64)[mask]
+                    w = (np.asarray(chunk[weight_branch], dtype=np.float64)[mask]
+                         * gen_weight_factor(np.asarray(chunk[GEN_WEIGHT_BRANCH])[mask], genweight_mean))
                     sum_w[0] += float(w.sum())
                     n_events[0] += int(mask.sum())
 
@@ -291,8 +298,8 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
                                 sum_w[j + 1] += float(w[rmask].sum())
                                 n_events[j + 1] += int(rmask.sum())
         except Exception as exc:
-            log(f"    error reading {fpath}: {exc}")
-            continue
+            # A read error would silently bias the ratio sums, so it is fatal.
+            raise RuntimeError(f"error reading {fpath}: {exc}") from exc
 
     if not found_weight:
         return None
