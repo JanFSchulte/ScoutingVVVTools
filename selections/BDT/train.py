@@ -11,17 +11,18 @@ import matplotlib.pyplot as plt
 import mplhep as hep
 import xgboost as xgb
 import gc
+import zlib
 
 from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.metrics import roc_auc_score, roc_curve
 from typing import List
 
+from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean, reweight_mean
 from model_io import (
     TorchModelHandle,
     build_torch_mlp,
     import_torch,
     model_type_from_config,
-    predict_model_logits as _shared_predict_model_logits,
     predict_model_proba as _shared_predict_model_proba,
 )
 
@@ -84,6 +85,29 @@ TEST_ENTRIES_PER_SAMPLE = cfg.get("test_entries_per_sample", ENTRIES_PER_SAMPLE)
 # Early-stopping / lr-schedule patience is interpreted in actual rounds (scaled internally).
 METRIC_EVAL_EVERY = max(1, int(cfg.get("metric_eval_every", 1)))
 TRAIN_FRACTION     = float(cfg.get("train_fraction", 0.7))
+# Optional evaluation split between the training and the test range of every sample
+# (entries [train_fraction, train_fraction + eval_fraction) of the concatenated sample).
+# When > 0 it is the monitoring set for early stopping and the learning-rate schedule, and
+# the split signal_region*.py optimise the SRs on; the test split is then left for the
+# final yields (qcd_est, combine) and the diagnostic plots. 0 keeps the old two-way split
+# (monitoring on the test split).
+EVAL_FRACTION      = float(cfg.get("eval_fraction", 0.0))
+EVAL_ENTRIES_PER_SAMPLE = cfg.get("eval_entries_per_sample", TEST_ENTRIES_PER_SAMPLE)
+# Per-class event budget for the training split (entries before any threshold). When > 0 it
+# replaces the per-sample entries_per_sample cap for training: each class's budget is shared among
+# its samples in proportion to their physics totals (xsec x N_tree / raw_entries x training weight
+# scale), limited to each sample's training range and at least one block, so the per-event weights
+# inside a class come out roughly equal; every sample reads random blocks of
+# _BUDGET_BLOCK_ENTRIES entries of its training range. The usual target_total / N_loaded
+# normalisation keeps every sample's total weight.
+TRAIN_EVENTS_PER_CLASS = int(cfg.get("train_events_per_class", 0))
+# The same for the eval and test splits (replacing eval/test_entries_per_sample), shared in
+# proportion to the physics totals without training-weight scales, so the eval/test events do not
+# depend on the training weights. test_ranges.json stores the selected blocks.
+TEST_EVENTS_PER_CLASS = int(cfg.get("test_events_per_class", 0))
+EVAL_EVENTS_PER_CLASS = int(cfg.get("eval_events_per_class", TEST_EVENTS_PER_CLASS))
+_BUDGET_BLOCK_ENTRIES = 8192
+MONITOR_LABEL      = "Eval" if EVAL_FRACTION > 0.0 else "Test"
 DECOR_LAMBDA       = cfg.get("decor_lambda", 30)
 DECOR_LOSS_MODE    = str(cfg.get("decor_loss_mode", "smooth_cvm")).strip().lower()
 DECOR_N_BINS       = int(cfg.get("decor_n_bins", 5))
@@ -96,7 +120,20 @@ DECOR_MSOFTDROP_TRAINING_MAX = float(cfg.get("decor_msoftdrop_training_max", 200
 DECOR_TAIL_AWARE    = bool(cfg.get("decor_tail_aware", False))
 DECOR_TAIL_MIN_PROB = float(cfg.get("decor_tail_min_prob", 0.002))
 DECOR_TAIL_N        = int(cfg.get("decor_tail_n", 8))
-SUBMIT_TREES       = cfg.get("submit_trees", ["fat2"])
+# Efficiency-normalised smooth-CvM (optional): divide every threshold's term by the binomial
+# variance g(1 - g) of its global QCD efficiency g (floored at decor_eff_norm_floor), so a relative
+# deviation in the score tail counts as much as one in the bulk (default off => unchanged).
+DECOR_EFF_NORMALIZE  = bool(cfg.get("decor_eff_normalize", False))
+DECOR_EFF_NORM_FLOOR = float(cfg.get("decor_eff_norm_floor", 1e-3))
+SUBMIT_TREES      = cfg.get("submit_trees", ["fat2"])
+# BDT_TREES (comma-separated) restricts this run to some of the configured submit_trees;
+# run.py mode 2 --slurm sets it to train every tree in its own job.
+_REQUESTED_TREES = [t.strip() for t in os.environ.get("BDT_TREES", "").split(",") if t.strip()]
+if _REQUESTED_TREES:
+    _unknown_trees = [t for t in _REQUESTED_TREES if t not in SUBMIT_TREES]
+    if _unknown_trees:
+        raise ValueError(f"BDT_TREES names trees not in submit_trees: {', '.join(_unknown_trees)}")
+    SUBMIT_TREES = [t for t in SUBMIT_TREES if t in _REQUESTED_TREES]
 INPUT_ROOT         = os.path.normpath(os.path.join(_SCRIPT_DIR, cfg["input_root"]))
 INPUT_PATTERN      = cfg["input_pattern"]
 OUTPUT_ROOT_PATTERN = cfg.get("output_root", ".")
@@ -105,6 +142,11 @@ MODEL_TYPE         = model_type_from_config(cfg)
 
 if not 0.0 < TRAIN_FRACTION < 1.0:
     raise ValueError(f"train_fraction must be in (0, 1), got {TRAIN_FRACTION}")
+if EVAL_FRACTION < 0.0 or TRAIN_FRACTION + EVAL_FRACTION >= 1.0:
+    raise ValueError(
+        f"eval_fraction must be >= 0 with train_fraction + eval_fraction < 1, "
+        f"got train_fraction={TRAIN_FRACTION}, eval_fraction={EVAL_FRACTION}"
+    )
 if not np.isfinite(DECOR_MSOFTDROP_TRAINING_MAX) or DECOR_MSOFTDROP_TRAINING_MAX <= 0.0:
     raise ValueError(
         "decor_msoftdrop_training_max must be a positive finite number, "
@@ -126,6 +168,11 @@ if DECOR_LOSS_MODE not in {"smooth_cvm", "cvm"}:
     raise ValueError(
         f"decor_loss_mode must be one of ['smooth_cvm', 'cvm'], got {DECOR_LOSS_MODE!r}"
     )
+if DECOR_EFF_NORMALIZE:
+    if DECOR_LOSS_MODE != "smooth_cvm":
+        raise ValueError("decor_eff_normalize requires decor_loss_mode 'smooth_cvm'")
+    if not (0.0 < DECOR_EFF_NORM_FLOOR <= 0.25):
+        raise ValueError(f"decor_eff_norm_floor must be in (0, 0.25], got {DECOR_EFF_NORM_FLOOR}")
 
 # -------------------- Sample registry --------------------
 SAMPLE_INFO = {}
@@ -133,6 +180,9 @@ for _rule in sample_cfg["sample"]:
     SAMPLE_INFO[_rule["name"]] = {
         "xsection":    _rule["xsection"],
         "raw_entries": _rule.get("raw_entries", -1),
+        "genweight_mean": _rule.get("genweight_mean"),
+        # all-event means of the reweight branches (weight_pu*_mean), absolute normalisation
+        **{key: value for key, value in _rule.items() if key.startswith("weight_") and key.endswith("_mean")},
         "is_MC":       _rule["is_MC"],
         "is_signal":   _rule["is_signal"],
         "sample_ID":   _rule["sample_ID"],
@@ -154,6 +204,9 @@ for _idx, (_cls, _members) in enumerate(CLASS_GROUPS.items()):
         SIGNAL_CLASS_INDICES.append(_idx)
     else:
         BACKGROUND_CLASS_INDICES.append(_idx)
+# QCD classes (names containing "qcd", as in qcd_est.py): the smooth-CvM decorrelation acts on
+# their events, for which the ABCD estimate needs scores independent of the decorrelate variables.
+QCD_CLASS_INDICES = [_idx for _idx, _cls in enumerate(CLASS_NAMES) if "qcd" in _cls.lower()]
 
 SAMPLE_TO_CLASS = {}
 for _idx, (_cls, _members) in enumerate(CLASS_GROUPS.items()):
@@ -224,6 +277,29 @@ def _qcd_ht_training_weight_scales(tree_name):
         sample_name: 1.0 + step * rank
         for rank, (_low, _high, sample_name) in enumerate(qcd_ht_samples)
     }
+
+
+def _training_weight_scales(tree_name):
+    """Per-sample factors on the internal training weights: the qcd_ht_training_weight_step
+    scales times the per-tree `training_sample_weight_scales` {sample: factor}. A factor 0
+    removes the sample from the training and monitoring objective while its physics weights
+    (prediction references, SR optimisation, yields) are unchanged."""
+    scales = dict(_qcd_ht_training_weight_scales(tree_name))
+    explicit = cfg.get(tree_name, {}).get("training_sample_weight_scales", {}) or {}
+    known = {sample for members in CLASS_GROUPS.values() for sample in members}
+    for sample_name, factor in explicit.items():
+        factor = float(factor)
+        if sample_name not in known:
+            raise ValueError(
+                f"training_sample_weight_scales for tree '{tree_name}': sample '{sample_name}' is in no class"
+            )
+        if not np.isfinite(factor) or factor < 0.0:
+            raise ValueError(
+                f"training_sample_weight_scales for tree '{tree_name}': factor for '{sample_name}' "
+                f"must be finite and >= 0, got {factor}"
+            )
+        scales[sample_name] = scales.get(sample_name, 1.0) * factor
+    return scales
 
 
 # -------------------- File discovery --------------------
@@ -311,49 +387,116 @@ def _validate_sample_weight_totals(df_all, sample_target_totals):
             )
 
 
-def _validate_class_weight_totals(df_all):
-    positive_totals = []
+def _validate_class_weight_totals(df_all, targets):
+    n_positive = 0
     for cls_idx in range(NUM_CLASSES):
         total_w = float(df_all.loc[df_all["class_idx"] == cls_idx, "weight"].sum())
         if total_w > 0.0:
-            positive_totals.append(total_w)
-    if not positive_totals:
+            n_positive += 1
+            rel = abs(total_w - targets[cls_idx]) / max(abs(targets[cls_idx]), _EPS)
+            if rel > 1e-6:
+                raise RuntimeError("Class totals do not match their targets after class normalisation.")
+    if n_positive == 0:
         raise RuntimeError("No positive class weights after normalisation.")
-    ref = positive_totals[0]
-    for total_w in positive_totals[1:]:
-        rel = abs(total_w - ref) / max(abs(ref), _EPS)
-        if rel > 1e-6:
-            raise RuntimeError("Class totals are not equal after class normalisation.")
 
 
-def _rebalance_class_weights(df_all):
+def _class_balance_power(tree_name):
+    power = float(cfg.get(tree_name, {}).get("class_balance_power", 1.0))
+    if not np.isfinite(power) or not 0.0 <= power <= 1.0:
+        raise ValueError(f"class_balance_power for tree '{tree_name}' must be in [0, 1], got {power}")
+    return power
+
+
+def _rebalance_class_weights(df_all, balance_power=1.0):
+    """Scale every class to its target total: N / N_classes each for balance_power 1 (full
+    balancing), otherwise proportional to (class weight total)^(1 - balance_power), normalised to
+    N in total (0 keeps the physics class composition)."""
     df_all = df_all.copy()
-    target_total_per_class = float(len(df_all)) / float(NUM_CLASSES) if len(df_all) > 0 else 0.0
+    w_sums = [float(df_all.loc[df_all["class_idx"] == c, "weight"].sum()) for c in range(NUM_CLASSES)]
+    if balance_power == 1.0:
+        target_total_per_class = float(len(df_all)) / float(NUM_CLASSES) if len(df_all) > 0 else 0.0
+        targets = [target_total_per_class] * NUM_CLASSES
+    else:
+        raw = [w_sum ** (1.0 - balance_power) if w_sum > 0.0 else 0.0 for w_sum in w_sums]
+        norm = sum(raw)
+        targets = [float(len(df_all)) * r / norm if norm > 0.0 else 0.0 for r in raw]
     for cls_idx, cls_name in enumerate(CLASS_NAMES):
         mask = df_all["class_idx"] == cls_idx
-        w_sum = float(df_all.loc[mask, "weight"].sum())
+        w_sum = w_sums[cls_idx]
         if w_sum > 0.0:
-            scale = target_total_per_class / w_sum
+            scale = targets[cls_idx] / w_sum
             df_all.loc[mask, "weight"] *= scale
             log_message(
-                f"  {cls_name}: total_w={w_sum:.4g}, target_total={target_total_per_class:.4g}, scale={scale:.4g}"
+                f"  {cls_name}: total_w={w_sum:.4g}, target_total={targets[cls_idx]:.4g}, scale={scale:.4g}"
             )
-    _validate_class_weight_totals(df_all)
+    _validate_class_weight_totals(df_all, targets)
     return df_all
 
 
-def _rebalance_filtered_weights(split_name, y, w, sample_labels):
+def _rebalance_filtered_weights(split_name, y, w, sample_labels, balance_power=1.0):
     balance_df = pd.DataFrame({
         "weight": np.asarray(w, dtype=float),
         "class_idx": np.asarray(y, dtype=int),
         "sample_name": np.asarray(sample_labels),
     })
-    balance_df = _rebalance_class_weights(balance_df)
+    balance_df = _rebalance_class_weights(balance_df, balance_power)
     _report_sample_weights(
         balance_df,
         f"Sample totals after thresholding and class balancing ({split_name})",
     )
     return balance_df["weight"].to_numpy(dtype=float, copy=True)
+
+
+def _training_weight_cap(tree_name):
+    cap = float(cfg.get(tree_name, {}).get("training_weight_cap", 0.0))
+    if not np.isfinite(cap) or (cap != 0.0 and cap < 1.0):
+        raise ValueError(f"training_weight_cap for tree '{tree_name}' must be 0 (off) or >= 1, got {cap}")
+    return cap
+
+
+def _cap_training_weights(split_name, y, w, sample_labels, cap):
+    """Limit every event's training weight to `cap` x the mean training weight of its class
+    while keeping the class total: the weights become min(s * w, limit) with limit = cap x mean
+    and s >= 1 chosen so that the class total is unchanged (the weight cut from the heavy events
+    goes to the others in proportion). A few very heavy events then no longer carry a large part
+    of their class; sample shares inside the class change accordingly. Used only for the weights
+    the model is fitted and monitored with (diagnostics keep the uncapped ones)."""
+    w = np.asarray(w, dtype=float).copy()
+    y = np.asarray(y, dtype=int)
+    for cls_idx in np.unique(y):
+        in_cls = (y == cls_idx) & (w > 0.0)
+        if not in_cls.any():
+            continue
+        wc = w[in_cls]
+        total = float(wc.sum())
+        limit = cap * total / float(wc.size)
+        n_capped = int((wc > limit).sum())
+        if n_capped == 0:
+            continue
+        # sum(min(s * wc, limit)) rises monotonically with s, from <= total at s = 1 to
+        # wc.size * limit >= total once every event is capped: bisect for the total.
+        lo, hi = 1.0, limit / float(wc.min())
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if float(np.minimum(mid * wc, limit).sum()) < total:
+                lo = mid
+            else:
+                hi = mid
+        new = np.minimum(hi * wc, limit)
+        new *= total / float(new.sum())
+        n_capped = int((hi * wc >= limit).sum())
+        moved = float((wc - new).clip(min=0.0).sum()) / total
+        w[in_cls] = new
+        log_message(
+            f"Training weight cap ({split_name}): class {CLASS_NAMES[cls_idx]}: {n_capped} of "
+            f"{int(in_cls.sum())} events capped at {cap:g} x the class mean, {moved:.2%} of the class "
+            "weight redistributed"
+        )
+    _report_sample_weights(
+        pd.DataFrame({"weight": w, "class_idx": y, "sample_name": np.asarray(sample_labels)}),
+        f"Sample totals after the training weight cap ({split_name})",
+    )
+    return w
 
 
 def _segment_length(segment):
@@ -421,15 +564,19 @@ def _inspect_sample_tree(sample_name, tree_name):
         raise RuntimeError(f"Zero entries found for sample '{sample_name}' in tree '{tree_name}'")
 
     train_stop = int(total_entries * TRAIN_FRACTION)
+    eval_stop = int(total_entries * (TRAIN_FRACTION + EVAL_FRACTION))
     return {
         "sample_name": sample_name,
         "file_infos": file_infos,
         "total_entries": total_entries,
         "train_stop": train_stop,
-        "test_start": train_stop,
+        "eval_start": train_stop,
+        "eval_stop": eval_stop,
+        "test_start": eval_stop,
         "train_segments_full": _build_segments(file_infos, 0, train_stop),
         "train_segments_read": _build_segments(file_infos, 0, train_stop, max_entries=ENTRIES_PER_SAMPLE),
-        "test_segments": _build_segments(file_infos, train_stop, total_entries, max_entries=TEST_ENTRIES_PER_SAMPLE),
+        "eval_segments": _build_segments(file_infos, train_stop, eval_stop, max_entries=EVAL_ENTRIES_PER_SAMPLE),
+        "test_segments": _build_segments(file_infos, eval_stop, total_entries, max_entries=TEST_ENTRIES_PER_SAMPLE),
     }
 
 
@@ -467,6 +614,97 @@ def _load_segments(tree_name, branches, segments):
     return df, n_read
 
 
+def _water_fill(budget, caps, weights):
+    """Share `budget` among samples in proportion to `weights`, no sample above its cap; what a
+    capped sample cannot take goes to the others in proportion."""
+    alloc = {name: 0 for name in caps}
+    active = {name for name in caps if weights[name] > 0.0 and caps[name] > 0}
+    remaining = float(budget)
+    while active and remaining > 0.0:
+        total = sum(weights[name] for name in active)
+        share = {name: remaining * weights[name] / total for name in active}
+        full = {name for name in active if share[name] >= caps[name]}
+        if not full:
+            for name in active:
+                alloc[name] = int(share[name])
+            break
+        for name in full:
+            alloc[name] = caps[name]
+            remaining -= caps[name]
+        active -= full
+    return alloc
+
+
+def _random_block_segments(file_infos, range_start, range_stop, n_entries, seed):
+    """Random whole _BUDGET_BLOCK_ENTRIES-entry blocks (counted from range_start) of the global
+    range [range_start, range_stop) adding up to at least n_entries entries (all of it if
+    n_entries >= its length), as segments in entry order with adjacent blocks merged.
+    signal_region.py repeats this selection when it rebuilds a stale split."""
+    n_range = range_stop - range_start
+    if n_entries >= n_range:
+        return _build_segments(file_infos, range_start, range_stop)
+    block = _BUDGET_BLOCK_ENTRIES
+    n_blocks = (n_range + block - 1) // block
+    k = min(n_blocks, (n_entries + block - 1) // block)
+    chosen = np.sort(np.random.default_rng(seed).choice(n_blocks, size=k, replace=False))
+    segments = []
+    for b in chosen:
+        block_start = range_start + int(b) * block
+        for seg in _build_segments(file_infos, block_start, min(block_start + block, range_stop)):
+            last = segments[-1] if segments else None
+            if last is not None and last["path"] == seg["path"] and last["entry_stop"] == seg["entry_start"]:
+                last["entry_stop"] = seg["entry_stop"]
+                last["global_stop"] = seg["global_stop"]
+            else:
+                segments.append(dict(seg))
+    return segments
+
+
+_BUDGET_SEGMENT_KEYS = {"train": "train_segments_read", "eval": "eval_segments", "test": "test_segments"}
+
+
+def _split_range(plan, split):
+    if split == "train":
+        return 0, int(plan["train_stop"])
+    if split == "eval":
+        return int(plan["eval_start"]), int(plan["eval_stop"])
+    return int(plan["test_start"]), int(plan["total_entries"])
+
+
+def _apply_class_budget(split_plans, tree_name, split, budget):
+    """Replace each sample's read segments of `split` by random blocks within a per-class budget
+    (see TRAIN_EVENTS_PER_CLASS / TEST_EVENTS_PER_CLASS)."""
+    scales = _training_weight_scales(tree_name) if split == "train" else {}
+    for cls_name, members in CLASS_GROUPS.items():
+        names = [name for name in members if name in split_plans]
+        ranges = {name: _split_range(split_plans[name], split) for name in names}
+        caps = {name: stop - start for name, (start, stop) in ranges.items()}
+        weights = {}
+        for name in names:
+            info = SAMPLE_INFO[name]
+            raw_entries = float(info["raw_entries"])
+            weights[name] = (
+                float(info["xsection"]) * float(split_plans[name]["total_entries"]) / raw_entries
+                * float(scales.get(name, 1.0))
+                if raw_entries > 0.0 and float(info["xsection"]) > 0.0 else 0.0
+            )
+        alloc = _water_fill(budget, caps, weights)
+        for name in names:
+            n_entries = min(caps[name], max(alloc[name], _BUDGET_BLOCK_ENTRIES))
+            seed_key = f"{tree_name}/{name}" if split == "train" else f"{tree_name}/{name}/{split}"
+            seed = [int(RANDOM_STATE), zlib.crc32(seed_key.encode())]
+            plan = split_plans[name]
+            segments = _random_block_segments(plan["file_infos"], *ranges[name], n_entries, seed)
+            plan[_BUDGET_SEGMENT_KEYS[split]] = segments
+            plan[f"{split}_random_blocks"] = {
+                "n_entries": int(n_entries), "block_entries": _BUDGET_BLOCK_ENTRIES, "seed": seed,
+            }
+            log_message(
+                f"  {split} budget {cls_name}/{name}: {_sum_segment_lengths(segments)} "
+                f"of {caps[name]} {split}-range entries"
+            )
+
+
 def build_split_plans(tree_name):
     split_plans = {}
     for sample_name in TRAINING_SAMPLES:
@@ -475,6 +713,18 @@ def build_split_plans(tree_name):
             split_plans[sample_name] = plan
     if not split_plans:
         raise RuntimeError(f"No data available for tree '{tree_name}'")
+    budgets = (
+        ("train", TRAIN_EVENTS_PER_CLASS),
+        ("eval", EVAL_EVENTS_PER_CLASS if EVAL_FRACTION > 0.0 else 0),
+        ("test", TEST_EVENTS_PER_CLASS),
+    )
+    for split, budget in budgets:
+        if budget > 0:
+            log_message(
+                f"{split} split of tree = {tree_name}: random blocks within a budget of "
+                f"{budget} entries per class (per-sample entry cap not used)"
+            )
+            _apply_class_budget(split_plans, tree_name, split, budget)
     return split_plans
 
 
@@ -482,11 +732,11 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, tr
     dfs = []
     sample_target_totals = {}
     if training_weight_scales is None:
-        training_weight_scales = _qcd_ht_training_weight_scales(tree_name)
+        training_weight_scales = _training_weight_scales(tree_name)
 
     reweight_branches = list(cfg.get(tree_name, {}).get("event_reweight_branches", []))
     load_branches = list(branches)
-    for rb in reweight_branches:
+    for rb in reweight_branches + [GEN_WEIGHT_BRANCH]:
         if rb not in load_branches:
             load_branches.append(rb)
 
@@ -504,10 +754,15 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, tr
                 f"Sample '{sample_name}' has raw_entries={raw_entries}; "
                 "fill src/sample.json before training."
             )
+        genweight_mean = require_genweight_mean(info["genweight_mean"], sample_name)
+        raw_w_mean = reweight_mean(info, reweight_branches, sample_name)
 
         if split_name == "train":
             full_segments = plan["train_segments_full"]
             read_segments = plan["train_segments_read"]
+        elif split_name == "eval":
+            full_segments = plan["eval_segments"]
+            read_segments = plan["eval_segments"]
         elif split_name == "test":
             full_segments = plan["test_segments"]
             read_segments = plan["test_segments"]
@@ -521,10 +776,9 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, tr
                 f"Zero entries read for sample '{sample_name}' in split '{split_name}' of tree '{tree_name}'"
             )
 
-        # Raw per-event weight: product of the configured reweight branches.
-        # Computed on raw values before any clip/log/threshold so ratios between
-        # events within the sample follow raw_w. The sample is then renormalised
-        # so sum(weight) equals target_total, independent of raw_w's magnitude.
+        # Raw per-event weight: product of the configured reweight branches, computed on raw
+        # values before any clip/log/threshold. It is normalised by its all-generated-event
+        # mean (absolute normalisation), so its effect on the selection efficiency is kept.
         if reweight_branches:
             raw_w = np.ones(n_read, dtype=float)
             for rb in reweight_branches:
@@ -532,13 +786,16 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, tr
             df = df.drop(columns=reweight_branches)
         else:
             raw_w = np.ones(n_read, dtype=float)
+        # Signed generator-weight factor; the sample total becomes target_total * <raw_w g>/mean.
+        gen_w = gen_weight_factor(df[GEN_WEIGHT_BRANCH].to_numpy(dtype=float, copy=False),
+                                  genweight_mean, sample_name)
+        df = df.drop(columns=[GEN_WEIGHT_BRANCH])
 
         total_tree_entries = int(plan["total_entries"])
         if xsec <= 0.0 or raw_entries <= 0:
             target_total = 0.0
         else:
             target_total = xsec * (float(total_tree_entries) / float(raw_entries))
-        training_target_total = target_total * training_weight_scale
 
         if target_total <= 0.0:
             df["weight_physics"] = 0.0
@@ -547,20 +804,27 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, tr
                     f"sample '{sample_name}' has non-positive xsection={xsec:.6g}; assigning zero weight"
                 )
         else:
-            raw_w_sum = float(raw_w.sum())
-            if raw_w_sum <= 0.0:
-                raise RuntimeError(
-                    f"Sample '{sample_name}' has non-positive raw weight sum "
-                    f"{raw_w_sum:.6g} in split '{split_name}' of tree '{tree_name}'"
-                )
-            df["weight_physics"] = raw_w * (target_total / raw_w_sum)
+            raw_w_norm = float(n_read) * raw_w_mean
+            df["weight_physics"] = raw_w * gen_w * (target_total / raw_w_norm)
         if "weight_physics" not in df.columns:
             df["weight_physics"] = 0.0
-        del raw_w
+        del raw_w, gen_w
+
+        # Training weights are |weight_physics| rescaled so the sample keeps its signed
+        # physical total: XGBoost/NN never see negative weights, sample proportions stay.
+        physics_total = float(df["weight_physics"].sum())
+        abs_total = float(df["weight_physics"].abs().sum())
+        if target_total > 0.0 and physics_total <= 0.0:
+            raise RuntimeError(
+                f"Sample '{sample_name}' has non-positive signed weight sum {physics_total:.6g} "
+                f"in split '{split_name}' of tree '{tree_name}'"
+            )
+        abs_scale = physics_total / abs_total if abs_total > 0.0 else 0.0
+        training_target_total = physics_total * training_weight_scale
 
         df["class_idx"] = SAMPLE_TO_CLASS[sample_name]
         df["sample_name"] = sample_name
-        df["weight"] = df["weight_physics"] * training_weight_scale
+        df["weight"] = df["weight_physics"].abs() * (abs_scale * training_weight_scale)
         sample_target_totals[sample_name] = training_target_total
         dfs.append(df)
 
@@ -609,7 +873,8 @@ def write_split_metadata(output_root, tree_name, split_plans):
     metadata = {
         "tree_name": tree_name,
         "train_fraction": TRAIN_FRACTION,
-        "test_fraction": 1.0 - TRAIN_FRACTION,
+        "eval_fraction": EVAL_FRACTION,
+        "test_fraction": 1.0 - TRAIN_FRACTION - EVAL_FRACTION,
         "samples": {},
     }
 
@@ -618,6 +883,23 @@ def write_split_metadata(output_root, tree_name, split_plans):
             "total_entries": int(plan["total_entries"]),
             "train_entries_total": _sum_segment_lengths(plan["train_segments_full"]),
             "train_entries_used": _sum_segment_lengths(plan["train_segments_read"]),
+        }
+        if EVAL_FRACTION > 0.0:
+            metadata["samples"][sample_name].update({
+                "eval_entries_total": _sum_segment_lengths(plan["eval_segments"]),
+                "eval_global_range": [int(plan["eval_start"]), int(plan["eval_stop"])],
+                "eval_segments": [
+                    {
+                        "file": segment["path"],
+                        "entry_start": int(segment["entry_start"]),
+                        "entry_stop": int(segment["entry_stop"]),
+                    }
+                    for segment in plan["eval_segments"]
+                ],
+            })
+            if "eval_random_blocks" in plan:
+                metadata["samples"][sample_name]["eval_random_blocks"] = plan["eval_random_blocks"]
+        metadata["samples"][sample_name].update({
             "test_entries_total": _sum_segment_lengths(plan["test_segments"]),
             "test_global_range": [
                 int(plan["test_start"]),
@@ -631,7 +913,9 @@ def write_split_metadata(output_root, tree_name, split_plans):
                 }
                 for segment in plan["test_segments"]
             ],
-        }
+        })
+        if "test_random_blocks" in plan:
+            metadata["samples"][sample_name]["test_random_blocks"] = plan["test_random_blocks"]
 
     metadata_path = os.path.join(output_root, "test_ranges.json")
     with open(metadata_path, "w", encoding="utf-8") as fout:
@@ -1149,6 +1433,11 @@ def _build_decor_state(Z: np.ndarray, mode: str):
                 f"prob in [{prob_grid.min():.4g}, {prob_grid.max():.4g}] "
                 f"(+{DECOR_TAIL_N} log-spaced per tail down to {DECOR_TAIL_MIN_PROB:g})"
             )
+        if DECOR_EFF_NORMALIZE:
+            log_message(
+                f"Efficiency-normalised decorrelation ON: every threshold weighted by "
+                f"1 / max(g(1 - g), {DECOR_EFF_NORM_FLOOR:g}) of its global QCD efficiency g"
+            )
         return {
             "mode": "smooth_cvm",
             "memberships": _build_smooth_cvm_memberships(Z),
@@ -1173,8 +1462,9 @@ def _prepare_decor_state_for_labels(decor_state, labels, weights, num_class):
         state = {"indices": idx, "weights": cls_weights}
 
         if mode == "smooth_cvm":
+            # Only QCD events enter the smooth-CvM term (see _decorrelation_loss_components).
             feature_states = []
-            for memberships in decor_state.get("memberships", []):
+            for memberships in (decor_state.get("memberships", []) if cls_idx in QCD_CLASS_INDICES else []):
                 feature_memberships = memberships[idx, :] if memberships is not None else None
                 feature_states.append(
                     _prepare_smooth_cvm_feature_state(feature_memberships, cls_weights)
@@ -1235,8 +1525,45 @@ def _prepare_smooth_cvm_feature_state(memberships, weights):
     }
 
 
+def _softmax_log_odds(logits, axis):
+    """Log-odds s = log(p / (1 - p)) of the softmax probability p of class `axis` for rows of
+    margins `logits`, computed stably as z_axis - logsumexp(z_others), and q_j = p_j / (1 - p)
+    for the other classes (0 at `axis`), so that ds/dz_axis = 1 and ds/dz_j = -q_j. A threshold
+    on s is a threshold on p."""
+    others = np.delete(logits, axis, axis=1)
+    m = np.max(others, axis=1, keepdims=True)
+    e = np.exp(others - m)
+    e_sum = np.sum(e, axis=1, keepdims=True)
+    score = logits[:, axis] - (m[:, 0] + np.log(e_sum[:, 0]))
+    q = np.insert(e / e_sum, axis, 0.0, axis=1)
+    return score, q
+
+
+def _smooth_cvm_shared_terms(score, feature_state, thresholds, score_tau, need_derivatives=True):
+    """Terms of _smooth_cvm_value_and_grad_1d that depend only on the class's scores and weights,
+    not on the decorrelation feature: computed once per class and reused for every feature
+    (identical arithmetic, so results are unchanged)."""
+    score = np.asarray(score, dtype=float).ravel()
+    weights = feature_state["weights"]
+    thresholds = np.asarray(thresholds, dtype=float).ravel()
+    sig = _sigmoid((score[:, None] - thresholds[None, :]) / score_tau)
+    shared = {"sig": sig, "global_eff": np.sum(weights[:, None] * sig, axis=0) / float(feature_state["total_w"])}
+    if DECOR_EFF_NORMALIZE:
+        # Threshold weights a = 1 / max(g(1 - g), floor) and da/dg (0 where floored).
+        g = shared["global_eff"]
+        var = g * (1.0 - g)
+        shared["eff_norm"] = 1.0 / np.maximum(var, DECOR_EFF_NORM_FLOOR)
+        shared["eff_norm_deriv"] = np.where(var > DECOR_EFF_NORM_FLOOR,
+                                            -(1.0 - 2.0 * g) * shared["eff_norm"] ** 2, 0.0)
+    if need_derivatives:
+        dsig = sig * (1.0 - sig) / score_tau
+        shared["two_w_dsig"] = 2.0 * weights[:, None] * dsig
+        shared["w_dsig"] = weights[:, None] * dsig
+    return shared
+
+
 def _smooth_cvm_value_and_grad_1d(score, feature_state, thresholds, score_tau,
-                                  need_derivatives=True):
+                                  need_derivatives=True, shared=None):
     score = np.asarray(score, dtype=float).ravel()
     n = score.size
     grad = np.zeros(n, dtype=float)
@@ -1251,26 +1578,34 @@ def _smooth_cvm_value_and_grad_1d(score, feature_state, thresholds, score_tau,
     if total_w <= _EPS:
         return 0.0, grad, hess
 
-    thresholds = np.asarray(thresholds, dtype=float).ravel()
-    sig = _sigmoid((score[:, None] - thresholds[None, :]) / score_tau)
-
-    global_eff = np.sum(weights[:, None] * sig, axis=0) / total_w
-    local_eff = (feature_state["weighted_memberships_t"] @ sig) / feature_state["bin_totals"][:, None]
+    if shared is None:
+        shared = _smooth_cvm_shared_terms(score, feature_state, thresholds, score_tau, need_derivatives)
+    sig = shared["sig"]
+    global_eff = shared["global_eff"]
+    # einsum instead of @: NumPy here has no optimized BLAS, and its fallback matmul is ~10x slower
+    # for these shapes; einsum accumulates over the events in the same order (bitwise identical).
+    local_eff = np.einsum("bn,nt->bt", feature_state["weighted_memberships_t"], sig) / feature_state["bin_totals"][:, None]
     delta = local_eff - global_eff[None, :]
     n_thr = float(sig.shape[1])
 
     weighted_delta = feature_state["rho"][:, None] * delta
+    if DECOR_EFF_NORMALIZE:
+        weighted_delta = weighted_delta * shared["eff_norm"][None, :]
     loss = float(np.sum(weighted_delta * delta) / n_thr)
     if not need_derivatives:
         return loss, grad, hess
 
-    dsig = sig * (1.0 - sig) / score_tau
-    local_term = feature_state["membership_over_bin_total"] @ weighted_delta
+    local_term = np.einsum("nb,bt->nt", feature_state["membership_over_bin_total"], weighted_delta)
     global_term = np.sum(weighted_delta, axis=0) / total_w
+    if DECOR_EFF_NORMALIZE:
+        # The threshold weights depend on the scores through g: d/ds_i adds
+        # sum_b rho_b delta_bt^2 * da/dg * w_i dsig_it / total_w.
+        rho_delta2 = np.sum(feature_state["rho"][:, None] * delta * delta, axis=0)
+        global_term = global_term - shared["eff_norm_deriv"] * rho_delta2 / (2.0 * total_w)
     coeff = local_term - global_term[None, :]
-    grad = (2.0 * weights[:, None] * dsig * coeff).sum(axis=1) / n_thr
+    grad = (shared["two_w_dsig"] * coeff).sum(axis=1) / n_thr
     # Positive Gauss-Newton-style diagonal surrogate for the coupled decorrelation term.
-    hess = (2.0 * (weights[:, None] * dsig * coeff) ** 2).sum(axis=1) / n_thr
+    hess = (2.0 * (shared["w_dsig"] * coeff) ** 2).sum(axis=1) / n_thr
     return loss, grad, hess
 
 
@@ -1412,6 +1747,9 @@ def _decorrelation_loss_components(logits, labels, weights, decor_state, num_cla
         return loss, grad, hess
 
     class_states = decor_state.get("class_states")
+    if class_states is None and mode == "smooth_cvm":
+        decor_state = _prepare_decor_state_for_labels(decor_state, labels, weights, num_class)
+        class_states = decor_state["class_states"]
     if class_states is not None:
         for cls_idx in range(num_class):
             state = class_states[cls_idx]
@@ -1419,9 +1757,9 @@ def _decorrelation_loss_components(logits, labels, weights, decor_state, num_cla
             if idx.size == 0:
                 continue
             cls_weights = state["weights"]
-            score = logits[idx, cls_idx]
 
             if mode == "cvm":
+                score = logits[idx, cls_idx]
                 groups_by_feature = state.get("groups", [])
                 cls_loss = _cvm_flatness_value_from_groups(score, groups_by_feature, cls_weights, power=2.0)
                 cls_grad = np.zeros_like(score)
@@ -1434,31 +1772,55 @@ def _decorrelation_loss_components(logits, labels, weights, decor_state, num_cla
                         # make it consistent with the loss recorded below.
                         cls_grad += -_cvm_flatness_neg_grad_wrt_y(score, groups, cls_weights, power=2.0)
                     cls_hess = np.maximum(np.abs(cls_grad), 1e-6)
-            elif mode == "smooth_cvm":
-                cls_loss = 0.0
-                cls_grad = np.zeros_like(score)
-                cls_hess = np.zeros_like(score)
-                for feature_state in state.get("features", []):
-                    part_loss, part_grad, part_hess = _smooth_cvm_value_and_grad_1d(
-                        score,
-                        feature_state,
-                        decor_state["score_thresholds"],
-                        decor_state["score_tau"],
-                        need_derivatives=need_derivatives,
-                    )
-                    cls_loss += part_loss
-                    if need_derivatives:
-                        cls_grad += part_grad
-                        cls_hess += part_hess
+                loss += float(decor_scale * cls_loss)
                 if need_derivatives:
-                    cls_hess = np.maximum(cls_hess, 1e-6)
+                    grad[idx, cls_idx] = decor_scale * cls_grad
+                    hess[idx, cls_idx] = decor_scale * cls_hess
+            elif mode == "smooth_cvm":
+                # The ABCD estimate needs every class probability of QCD events (the SR boxes cut on
+                # all of them) to be independent of the decorrelate variables: for every axis k,
+                # penalise the log-odds s_k = log(p_k / (1 - p_k)) of the softmax on the QCD events
+                # (thresholds on s_k are probability thresholds). Other classes have no features.
+                feature_states = state.get("features", [])
+                first_valid = next((fs for fs in feature_states if fs is not None), None)
+                if first_valid is None or first_valid["total_w"] <= _EPS:
+                    continue
+                cls_logits = logits[idx, :]
+                cls_loss = 0.0
+                cls_grad = np.zeros_like(cls_logits)
+                cls_hess = np.zeros_like(cls_logits)
+                for axis in range(num_class):
+                    score, q = _softmax_log_odds(cls_logits, axis)
+                    shared = _smooth_cvm_shared_terms(score, first_valid, decor_state["score_thresholds"],
+                                                      decor_state["score_tau"], need_derivatives)
+                    score_grad = np.zeros_like(score)
+                    score_hess = np.zeros_like(score)
+                    for feature_state in feature_states:
+                        part_loss, part_grad, part_hess = _smooth_cvm_value_and_grad_1d(
+                            score,
+                            feature_state,
+                            decor_state["score_thresholds"],
+                            decor_state["score_tau"],
+                            need_derivatives=need_derivatives,
+                            shared=shared,
+                        )
+                        cls_loss += part_loss
+                        if need_derivatives:
+                            score_grad += part_grad
+                            score_hess += part_hess
+                    if need_derivatives:
+                        # Through the softmax (ds_k/dz_k = 1, ds_k/dz_j = -q_j), with the
+                        # Gauss-Newton diagonal for the Hessian.
+                        cls_grad -= score_grad[:, None] * q
+                        cls_grad[:, axis] += score_grad
+                        cls_hess += score_hess[:, None] * q * q
+                        cls_hess[:, axis] += score_hess
+                loss += float(decor_scale * cls_loss)
+                if need_derivatives:
+                    grad[idx, :] = decor_scale * cls_grad
+                    hess[idx, :] = decor_scale * np.maximum(cls_hess, 1e-6)
             else:
                 raise ValueError(f"Unsupported decorrelation loss mode: {mode}")
-
-            loss += float(decor_scale * cls_loss)
-            if need_derivatives:
-                grad[idx, cls_idx] = decor_scale * cls_grad
-                hess[idx, cls_idx] = decor_scale * cls_hess
 
         return float(loss), grad, hess
 
@@ -1481,25 +1843,6 @@ def _decorrelation_loss_components(logits, labels, weights, decor_state, num_cla
                 # make it consistent with the loss recorded below.
                 cls_grad += -_cvm_flatness_neg_grad_wrt_y(score, groups, cls_weights, power=2.0)
             cls_hess = np.maximum(np.abs(cls_grad), 1e-6)
-        elif mode == "smooth_cvm":
-            cls_loss = 0.0
-            cls_grad = np.zeros_like(score)
-            cls_hess = np.zeros_like(score)
-            for memberships in decor_state.get("memberships", []):
-                feature_state = _prepare_smooth_cvm_feature_state(memberships, cls_weights)
-                part_loss, part_grad, part_hess = _smooth_cvm_value_and_grad_1d(
-                    score,
-                    feature_state,
-                    decor_state["score_thresholds"],
-                    decor_state["score_tau"],
-                    need_derivatives=need_derivatives,
-                )
-                cls_loss += part_loss
-                if need_derivatives:
-                    cls_grad += part_grad
-                    cls_hess += part_hess
-            if need_derivatives:
-                cls_hess = np.maximum(cls_hess, 1e-6)
         else:
             raise ValueError(f"Unsupported decorrelation loss mode: {mode}")
 
@@ -1906,7 +2249,8 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     )
 
     hp = cfg.get(tree_name, {})
-    n_threads = max(1, min(32, os.cpu_count() or 1))
+    # CPUs this process may use (the SLURM allocation), not the node's total; capped at 32.
+    n_threads = max(1, min(32, len(os.sched_getaffinity(0))))
     n_estimators = int(hp.get("n_estimators", 200))
     n_estimators_decorr = int(hp.get("n_estimators_decorr", 1000))
     early_stopping_rounds = int(hp.get("early_stopping_rounds", 10))
@@ -1921,6 +2265,8 @@ def train_multi_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     log_message(f"Thread mode: XGBoost, threads = {n_threads}")
 
     use_decor = Z_train.shape[1] > 0 and DECOR_LAMBDA > 0.0
+    if use_decor and DECOR_LOSS_MODE == "smooth_cvm" and not QCD_CLASS_INDICES:
+        raise RuntimeError("smooth-CvM decorrelation acts on QCD events, but no class name contains 'qcd'")
     splits = (X_train_all, X_test_all, y_train, y_test, w_train, w_test)
 
     # Plot-only regeneration: load the already-trained models and skip the fit,
@@ -2248,21 +2594,18 @@ def _torch_smooth_decor_loss(torch, logits, labels, weights, Z, decor_edges,
     eps = logits.new_tensor(_EPS)
     score_tau_t = logits.new_tensor(max(float(score_tau), _EPS))
 
-    for cls_idx in range(NUM_CLASSES):
+    # As in _decorrelation_loss_components: on QCD events, the log-odds of every class probability.
+    for cls_idx in QCD_CLASS_INDICES:
         cls_mask = labels == int(cls_idx)
         if int(cls_mask.sum().item()) < 3:
             continue
-        score = logits[cls_mask, cls_idx]
+        cls_logits = logits[cls_mask]
         cls_weights = weights[cls_mask]
         total_w = torch.sum(cls_weights)
         if not bool((total_w > eps).item()):
             continue
 
-        sig = torch.sigmoid(
-            (score[:, None] - score_thresholds[None, :]) / score_tau_t
-        )
-        global_eff = torch.sum(cls_weights[:, None] * sig, dim=0) / torch.clamp(total_w, min=eps)
-
+        features = []
         for feat_idx, edges in enumerate(decor_edges):
             if edges is None:
                 continue
@@ -2282,14 +2625,27 @@ def _torch_smooth_decor_loss(torch, logits, labels, weights, Z, decor_edges,
             valid_bins = bin_totals > eps
             if not bool(torch.any(valid_bins).item()):
                 continue
-            weighted_memberships = weighted_memberships[:, valid_bins]
-            bin_totals = bin_totals[valid_bins]
-            local_eff = weighted_memberships.transpose(0, 1).matmul(sig) / torch.clamp(
-                bin_totals[:, None], min=eps
+            features.append((weighted_memberships[:, valid_bins], bin_totals[valid_bins]))
+
+        for axis in range(NUM_CLASSES):
+            others = torch.cat([cls_logits[:, :axis], cls_logits[:, axis + 1:]], dim=1)
+            score = cls_logits[:, axis] - torch.logsumexp(others, dim=1)
+            sig = torch.sigmoid(
+                (score[:, None] - score_thresholds[None, :]) / score_tau_t
             )
-            rho = bin_totals / torch.clamp(total_w, min=eps)
-            delta = local_eff - global_eff[None, :]
-            total_loss = total_loss + torch.sum(rho[:, None] * delta * delta) / float(sig.shape[1])
+            global_eff = torch.sum(cls_weights[:, None] * sig, dim=0) / torch.clamp(total_w, min=eps)
+            if DECOR_EFF_NORMALIZE:
+                eff_norm = 1.0 / torch.clamp(global_eff * (1.0 - global_eff), min=float(DECOR_EFF_NORM_FLOOR))
+            for weighted_memberships, bin_totals in features:
+                local_eff = weighted_memberships.transpose(0, 1).matmul(sig) / torch.clamp(
+                    bin_totals[:, None], min=eps
+                )
+                rho = bin_totals / torch.clamp(total_w, min=eps)
+                delta = local_eff - global_eff[None, :]
+                if DECOR_EFF_NORMALIZE:
+                    total_loss = total_loss + torch.sum(rho[:, None] * delta * delta * eff_norm[None, :]) / float(sig.shape[1])
+                else:
+                    total_loss = total_loss + torch.sum(rho[:, None] * delta * delta) / float(sig.shape[1])
 
     return total_loss
 
@@ -2390,6 +2746,8 @@ def train_nn_model(X_train_all, y_train, w_train, X_test_all, y_test, w_test,
     Z_train_t = torch.as_tensor(Z_train, dtype=torch.float32, device=device)
 
     use_decor = Z_train.shape[1] > 0 and DECOR_LAMBDA > 0.0
+    if use_decor and not QCD_CLASS_INDICES:
+        raise RuntimeError("smooth-CvM decorrelation acts on QCD events, but no class name contains 'qcd'")
     if use_decor:
         decor_edges = _nn_build_decor_edges(torch, Z_train, device)
         prob_grid = np.linspace(0.02, 0.98, max(3, DECOR_N_THRESHOLDS))
@@ -2842,10 +3200,6 @@ def _booster_from_model(model):
     return model.get_booster() if hasattr(model, "get_booster") else model
 
 
-def _predict_margins(model, Xlike):
-    return _shared_predict_model_logits(model, Xlike, NUM_CLASSES)
-
-
 def _predict_proba(model, Xlike):
     return _shared_predict_model_proba(model, Xlike, NUM_CLASSES)
 
@@ -3158,49 +3512,51 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             class_mask = y_true == cls_idx
             if not np.any(class_mask):
                 continue
-            for branch_name in decor_plot_names:
-                x = decor_plot_df[branch_name].to_numpy(dtype=float, copy=False)
-                s = scores[:, cls_idx]
-                mask = (
-                    class_mask
-                    & np.isfinite(x)
-                    & (x > -990.0)
-                    & np.isfinite(s)
-                    & np.isfinite(wv_all)
-                    & (wv_all > 0.0)
-                )
-                if not np.any(mask):
-                    raise RuntimeError(
-                        f"{tree_name} [{stage_tag}] no valid test events for "
-                        f"class '{cls_name}' and decorrelate branch '{branch_name}'"
+            # QCD events: every class probability (the decorrelated quantities); others: their own.
+            for axis in (range(n_classes) if cls_idx in QCD_CLASS_INDICES else [cls_idx]):
+                for branch_name in decor_plot_names:
+                    x = decor_plot_df[branch_name].to_numpy(dtype=float, copy=False)
+                    s = scores[:, axis]
+                    mask = (
+                        class_mask
+                        & np.isfinite(x)
+                        & (x > -990.0)
+                        & np.isfinite(s)
+                        & np.isfinite(wv_all)
+                        & (wv_all > 0.0)
                     )
-                fig, ax = plt.subplots(figsize=(8.5, 6.2))
-                ax.scatter(
-                    x[mask],
-                    s[mask],
-                    s=2.0,
-                    alpha=0.12,
-                    color=palette[cls_idx],
-                    edgecolors="none",
-                    rasterized=True,
-                    label=f"Test {cls_name}",
-                )
-                centers, avg = _weighted_bin_average(x[mask], s[mask], wv_all[mask])
-                if centers.size > 0:
-                    ax.plot(
-                        centers,
-                        avg,
-                        color="black",
-                        linewidth=1.8,
-                        label="weighted average",
+                    if not np.any(mask):
+                        raise RuntimeError(
+                            f"{tree_name} [{stage_tag}] no valid test events for "
+                            f"class '{cls_name}' and decorrelate branch '{branch_name}'"
+                        )
+                    fig, ax = plt.subplots(figsize=(8.5, 6.2))
+                    ax.scatter(
+                        x[mask],
+                        s[mask],
+                        s=2.0,
+                        alpha=0.12,
+                        color=palette[cls_idx],
+                        edgecolors="none",
+                        rasterized=True,
+                        label=f"Test {cls_name}",
                     )
-                ax.set_title(f"{tree_name} {stage_tag}: {cls_name}", fontsize=15)
-                ax.set_xlabel(branch_name)
-                ax.set_ylabel(f"p({cls_name})")
-                ax.set_ylim(0.0, 1.0)
-                ax.grid(True, linestyle="--", alpha=0.35)
-                ax.legend(loc="best", fontsize=10)
-                _save_pdf_page(pdf_state, path, fig)
+                    centers, avg = _weighted_bin_average(x[mask], s[mask], wv_all[mask])
+                    if centers.size > 0:
+                        ax.plot(
+                            centers,
+                            avg,
+                            color="black",
+                            linewidth=1.8,
+                            label="weighted average",
+                        )
+                    ax.set_title(f"{tree_name} {stage_tag}: {cls_name}", fontsize=15)
+                    ax.set_xlabel(branch_name)
+                    ax.set_ylabel(f"p({class_names[axis]})")
+                    ax.set_ylim(0.0, 1.0)
+                    ax.grid(True, linestyle="--", alpha=0.35)
+                    ax.legend(loc="best", fontsize=10)
+                    _save_pdf_page(pdf_state, path, fig)
         if pdf_state["pages"] == 0:
             raise RuntimeError(f"{tree_name} [{stage_tag}] no pages written for score-vs-branch PDF")
         _close_pdf(pdf_state, path)
@@ -3370,10 +3726,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
             _predict_proba(model, X_test_decor_used)
             if decorrelate_feature_names else None
         )
-        margins_train_decor = margins_test_decor = None
-        if decor_idx_full:
-            margins_train_decor = _predict_margins(model, X_train_decor_used)
-            margins_test_decor = _predict_margins(model, X_test_decor_used)
+        probs_train_decor = _predict_proba(model, X_train_decor_used) if decor_idx_full else None
         booster = _booster_from_model(model)
 
         # ROC plots
@@ -3525,40 +3878,50 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         for sig_idx, bkg_idx in roc_pairs:
             _plot_score_dist(sig_idx, bkg_idx)
 
-        # Decorrelation correlation matrices (one per split), save under suffix.
+        # Decorrelation correlation matrices (one per split), save under suffix. Rows: every
+        # class's own probability on its events, and on QCD events every other class probability
+        # (with the own one, the quantities the decorrelation penalises).
         if decor_idx_full:
+            corr_rows = [(ci, ci) for ci in range(n_classes)] + [
+                (qi, ai) for qi in QCD_CLASS_INDICES for ai in range(n_classes) if ai != qi
+            ]
+            corr_row_labels = [
+                class_names[ci] if ai == ci else f"{class_names[ci]}: p({class_names[ai]})"
+                for ci, ai in corr_rows
+            ]
+
             def _build_corr_matrix(scores, Xfull, y_true, wv):
                 Xarr = _as_array(Xfull)
                 wv_abs = _safe_w(wv)
-                R = np.zeros((n_classes, len(decor_idx_full)))
-                for r, ci in enumerate(range(n_classes)):
+                R = np.zeros((len(corr_rows), len(decor_idx_full)))
+                for r, (ci, ai) in enumerate(corr_rows):
                     class_mask = np.asarray(y_true) == ci
                     if not np.any(class_mask):
                         continue
-                    s = scores[class_mask, ci]
+                    s = scores[class_mask, ai]
                     for c, j in enumerate(decor_idx_full):
                         R[r, c] = _weighted_pearson(Xarr[class_mask, j], s, wv_abs[class_mask])
                 return R
 
             for tag, scores, Xfull, y_true, wv in [
-                ("train", margins_train_decor, X_train_decor_full, y_train_decor, w_train_decor),
-                ("test", margins_test_decor, X_test_decor_full, y_test_decor, w_test_decor),
+                ("train", probs_train_decor, X_train_decor_full, y_train_decor, w_train_decor),
+                ("test", probs_test_decor, X_test_decor_full, y_test_decor, w_test_decor),
             ]:
                 R = _build_corr_matrix(scores, Xfull, y_true, wv)
                 _plot_matrix_heatmap(
                     R,
-                    class_names,
+                    corr_row_labels,
                     decor_var_names,
                     f"decor_corr_{tag}{suffix}",
                     aspect="auto",
                     annotate=True,
                     cbar_label="weighted Pearson r",
                 )
-                for i, cls_name in enumerate(class_names):
+                for i, row_label in enumerate(corr_row_labels):
                     stats = ", ".join(
                         f"{decor_var_names[j]}={R[i, j]:+.3f}" for j in range(len(decor_var_names))
                     )
-                    log_message(f"{tree_name} [{stage_tag}] {tag} decor corr [{cls_name}] {stats}")
+                    log_message(f"{tree_name} [{stage_tag}] {tag} decor corr [{row_label}] {stats}")
 
         _plot_score_vs_decor_pdf(probs_test_decor, suffix, stage_tag)
         _plot_decor_shape_by_score_pdf(probs_test_decor, suffix, stage_tag)
@@ -3577,7 +3940,7 @@ def plot_results(stage1_model, stage2_model, splits, tree_name, output_root,
         if tr_loss:
             ax.plot(range(1, len(tr_loss) + 1), tr_loss, label="Train")
         if te_loss:
-            ax.plot(range(1, len(te_loss) + 1), te_loss, label="Test")
+            ax.plot(range(1, len(te_loss) + 1), te_loss, label=MONITOR_LABEL)
         if stage_boundary is not None and 0 < int(stage_boundary) < n_rounds:
             ax.axvline(
                 float(stage_boundary) + 0.5,
@@ -3752,7 +4115,7 @@ def main():
             f"Running train.py for tree = {tree_name}, output = {output_root}, "
             f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
         )
-        training_weight_scales = _qcd_ht_training_weight_scales(tree_name)
+        training_weight_scales = _training_weight_scales(tree_name)
         if training_weight_scales:
             formatted_scales = ", ".join(
                 f"{sample_name}={scale:.6g}"
@@ -3762,7 +4125,7 @@ def main():
                 )
             )
             log_message(
-                f"QCD HT training weight scales for tree = {tree_name}: {formatted_scales}"
+                f"Training weight scales for tree = {tree_name}: {formatted_scales}"
             )
         omitted_decor_thresholds = [
             name for name in decor_thresholds.keys()
@@ -3833,12 +4196,20 @@ def main():
             w_train_eval,
             sample_labels_train_eval,
         )
-        w_train = _rebalance_filtered_weights("train", y_train, w_train, sample_labels_train)
+        balance_power = _class_balance_power(tree_name)
+        w_train = _rebalance_filtered_weights("train", y_train, w_train, sample_labels_train, balance_power)
+        # Weights the model is fitted / monitored with (optionally capped, training_weight_cap).
+        weight_cap = _training_weight_cap(tree_name)
+        w_train_fit = (
+            _cap_training_weights("train", y_train, w_train, sample_labels_train, weight_cap)
+            if weight_cap > 0.0 else w_train
+        )
         w_train_eval = _rebalance_filtered_weights(
             "train (full evaluation thresholds)",
             y_train_eval,
             w_train_eval,
             sample_labels_train_eval,
+            balance_power,
         )
         check_weights(w_train, f"{tree_name}_train_weight_after_filter")
         check_weights(w_train_eval, f"{tree_name}_train_eval_weight_after_filter")
@@ -3871,16 +4242,66 @@ def main():
             w_test_eval,
             sample_labels_test_eval,
         )
-        w_test = _rebalance_filtered_weights("test", y_test, w_test, sample_labels_test)
+        w_test = _rebalance_filtered_weights("test", y_test, w_test, sample_labels_test, balance_power)
+        w_test_fit = (
+            _cap_training_weights("test", y_test, w_test, sample_labels_test, weight_cap)
+            if weight_cap > 0.0 and EVAL_FRACTION <= 0.0 else w_test
+        )
         w_test_eval = _rebalance_filtered_weights(
             "test (full evaluation thresholds)",
             y_test_eval,
             w_test_eval,
             sample_labels_test_eval,
+            balance_power,
         )
         check_weights(w_test, f"{tree_name}_test_weight_after_filter")
         check_weights(w_test_eval, f"{tree_name}_test_eval_weight_after_filter")
         check_weights(w_test_ref, f"{tree_name}_test_physics_weight_after_filter")
+
+        # Eval split (eval_fraction > 0): monitoring set for early stopping / the lr schedule
+        # (training-threshold view, class-balanced like the test split) and, through
+        # eval_reference_signal_region.npz, the split the SR optimisation runs on.
+        if EVAL_FRACTION > 0.0:
+            log_message(f"Loading eval split for tree = {tree_name}")
+            X_eval, y_eval, w_eval, sample_labels_eval, w_eval_physics = prepare_split_data(
+                tree_name, load_cols, "eval", split_plans, shuffle=False,
+                training_weight_scales=training_weight_scales,
+            )
+            check_weights(w_eval, f"{tree_name}_eval_weight_before_filter")
+            log_message(f"Applying training thresholds for eval split of tree = {tree_name}")
+            X_eval, y_eval, w_eval, sample_labels_eval = filter_X(
+                X_eval, y_eval, w_eval, load_cols, training_thresholds, apply_to_sentinel=True,
+                sample_labels=sample_labels_eval
+            )
+            # Full evaluation thresholds (as for the test-split signal-region reference); the
+            # stored weights are the physics weights of those rows, by position in the split.
+            X_eval_full, y_eval_ref, _, sample_labels_eval_ref, eval_full_index = filter_X(
+                X_eval, y_eval, w_eval, load_cols, decor_thresholds, apply_to_sentinel=True,
+                sample_labels=sample_labels_eval,
+                return_index=True,
+            )
+            w_eval_ref = w_eval_physics[np.asarray(eval_full_index, dtype=np.int64)].copy()
+            sample_labels_eval_ref = np.asarray(sample_labels_eval_ref).copy()
+            del w_eval_physics
+            _validate_filtered_split(
+                tree_name,
+                "eval (training thresholds)",
+                y_eval,
+                w_eval,
+                sample_labels_eval,
+            )
+            w_eval = _rebalance_filtered_weights("eval", y_eval, w_eval, sample_labels_eval, balance_power)
+            if weight_cap > 0.0:
+                w_eval = _cap_training_weights("eval", y_eval, w_eval, sample_labels_eval, weight_cap)
+            check_weights(w_eval, f"{tree_name}_eval_weight_after_filter")
+            if drop_after_filter:
+                X_eval = X_eval.drop(columns=drop_after_filter, errors="ignore")
+                X_eval_full = X_eval_full.drop(columns=drop_after_filter, errors="ignore")
+            log_message(f"Standardising eval splits for tree = {tree_name}")
+            X_eval_std = standardize_X(X_eval.copy(), clip_ranges, log_tf)
+            X_eval_full_std = standardize_X(X_eval_full.copy(), clip_ranges, log_tf)
+            del X_eval, X_eval_full
+            gc.collect()
 
         decor_plot_cols = [c for c in decorrelate if c in X_test.columns]
         X_test_decor_plot = (
@@ -3912,22 +4333,52 @@ def main():
         del sample_labels_train, sample_labels_test, sample_labels_train_eval, sample_labels_test_eval
         gc.collect()
 
-        log_message(f"Training model for tree = {tree_name}")
+        # The trainers monitor their second split for early stopping and the lr schedule (its
+        # loss history is stored under the key "test"): the eval split when there is one.
+        if EVAL_FRACTION > 0.0:
+            X_monitor_std, y_monitor, w_monitor = X_eval_std, y_eval, w_eval
+        else:
+            X_monitor_std, y_monitor, w_monitor = X_test_std, y_test, w_test_fit
+        log_message(
+            f"Training model for tree = {tree_name} "
+            f"(early-stopping / lr-schedule monitoring split: {MONITOR_LABEL.lower()})"
+        )
         if MODEL_TYPE == "nn":
             stage1_model, stage2_model, splits, loss_history, stage_boundary = train_nn_model(
-                X_train_std, y_train, w_train,
-                X_test_std, y_test, w_test,
+                X_train_std, y_train, w_train_fit,
+                X_monitor_std, y_monitor, w_monitor,
                 model_path, tree_name,
                 decorrelate_feature_names=decorrelate
             )
         else:
             stage1_model, stage2_model, splits, loss_history, stage_boundary = train_multi_model(
-                X_train_std, y_train, w_train,
-                X_test_std, y_test, w_test,
+                X_train_std, y_train, w_train_fit,
+                X_monitor_std, y_monitor, w_monitor,
                 model_path, tree_name,
                 decorrelate_feature_names=decorrelate
             )
         final_model = stage2_model if stage2_model is not None else stage1_model
+        # Diagnostic plots always compare the training split with the test split.
+        splits = (X_train_std, X_test_std, y_train, y_test, w_train, w_test)
+        del X_monitor_std, y_monitor, w_monitor, w_train_fit, w_test_fit
+        if EVAL_FRACTION > 0.0:
+            del X_eval_std, y_eval, w_eval
+            X_eval_signal_model = _drop_decorrelated_features(X_eval_full_std, decorrelate)
+            proba_signal_eval = _predict_proba(final_model, X_eval_signal_model)
+            _write_prediction_reference(
+                output_root,
+                "eval_reference_signal_region",
+                tree_name,
+                "signal_region",
+                X_eval_signal_model.columns,
+                sample_labels_eval_ref,
+                y_eval_ref,
+                w_eval_ref,
+                proba_signal_eval,
+            )
+            del X_eval_full_std, X_eval_signal_model, proba_signal_eval
+            del y_eval_ref, w_eval_ref, sample_labels_eval_ref
+            gc.collect()
 
         X_test_qcd_full_model = standardize_X(X_test_unfiltered[branches].copy(), clip_ranges, log_tf)
         X_test_qcd_full_model = _drop_decorrelated_features(X_test_qcd_full_model, decorrelate)
