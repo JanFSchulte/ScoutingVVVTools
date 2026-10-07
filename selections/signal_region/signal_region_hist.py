@@ -126,6 +126,11 @@ MIN_BKG_WEIGHT     = sr.MIN_BKG_WEIGHT
 MIN_SIGNAL_WEIGHT  = sr.MIN_SIGNAL_WEIGHT
 MIN_SIGNAL_ENTRIES = sr.MIN_SIGNAL_ENTRIES
 MIN_BKG_ENTRIES    = sr.MIN_BKG_ENTRIES
+# Zero-count floor: in a region where a background class has no MC events (or a non-positive
+# weighted sum), its typical event weight alpha is added in quadrature to sigma_B, as combine's
+# `gmN 0 alpha` rows do for an empty process, so regions that are free of a class's MC events
+# only by chance (e.g. heavy QCD events) are not rated as background-free.
+ZERO_COUNT_FLOOR   = bool(sr.scan_cfg.get("zero_count_floor", False))
 EPS = 1e-12
 
 log_message = sr.log_message
@@ -163,7 +168,8 @@ def prepare_inputs():
     load_cols = branches + extra_cols
     drop_after_filter = [c for c in extra_cols if c not in decorrelate]
 
-    df_all = sr.load_test_data(load_cols)
+    log_message(f"SR optimisation split: {sr.OPT_SPLIT}")
+    df_all = sr.load_split_data(load_cols, sr.OPT_SPLIT)
     X             = df_all[load_cols].copy()
     y             = df_all["class_idx"].values.astype(int)
     w             = df_all["weight"].values.astype(float)
@@ -201,9 +207,9 @@ def prepare_inputs():
     log_message(f"Predicted probabilities shape: {proba.shape}")
 
     if VALIDATE_REF:
-        log_message("Validating test-set prediction reference")
+        log_message(f"Validating {sr.OPT_SPLIT}-set prediction reference")
         sr._compare_prediction_reference(
-            sr.TEST_REFERENCE_SIGNAL_REGION,
+            sr.OPT_REFERENCE_SIGNAL_REGION,
             X_model.columns if hasattr(X_model, "columns")
             else [f"f{i}" for i in range(X_model.shape[1])],
             sample_labels, y, w, proba,
@@ -234,6 +240,14 @@ class Ctx:
         self.is_bkg = np.isin(self.y, sr.BACKGROUND_CLASS_INDICES)
         self.w_sig = np.where(self.is_sig, self.w, 0.0)
         self.w_bkg = np.where(self.is_bkg, self.w, 0.0)
+        self.w2_bkg = np.where(self.is_bkg, self.w * self.w, 0.0)  # sigma_B^2 for the Z
+        # Zero-count floor: per background class, its event mask and alpha^2, alpha = the typical
+        # event weight (median |w|) of the class over all scan events, like qcd_est's
+        # mean_event_weight for combine (the mean is dominated by a few very heavy events).
+        self.bkg_class_masks = [self.y == c for c in sr.BACKGROUND_CLASS_INDICES]
+        self.floor_alpha2 = [
+            (float(np.median(np.abs(self.w[mc]))) ** 2) if mc.any() else 0.0 for mc in self.bkg_class_masks
+        ]
         self.S_total = float(self.w_sig.sum())
         self.B_total = float(self.w_bkg.sum())
 
@@ -275,26 +289,26 @@ class Ctx:
             self._last[0] = now
 
 
-# -------------------- Significance (copies of sr closures) --------------------
-def calc_Z_val(S, B):
-    if S <= 0.0 or B <= 0.0:
-        return 0.0
-    f = (S + B) * np.log(1.0 + S / B) - S
-    return float(np.sqrt(2.0 * max(0.0, f)))
+# -------------------- Significance (shared with sr) --------------------
+def calc_Z_val(S, B, B2):
+    """Asimov Z with background MC uncertainty sigma_B^2 = B2 (sr.asimov_z)."""
+    return float(sr.asimov_z(S, B, B2))
 
 
 def calc_Z(S, B, sS, sB):
-    if S <= 0.0 or B <= 0.0:
-        return 0.0, 0.0
-    f = (S + B) * np.log(1.0 + S / B) - S
-    if f <= 0.0:
-        return 0.0, 0.0
-    Z = float(np.sqrt(2.0 * f))
-    ln1sb = np.log(1.0 + S / B)
-    dZ_dS = ln1sb / Z
-    dZ_dB = (ln1sb - S / B) / Z
-    sZ = float(np.sqrt((dZ_dS * sS) ** 2 + (dZ_dB * sB) ** 2))
-    return Z, sZ
+    return sr.asimov_z_with_error(S, B, sS, sB)
+
+
+def floor_variance(ctx, m):
+    """Zero-count floor added to sigma_B^2 for the region of event mask m (0 when disabled)."""
+    if not ZERO_COUNT_FLOOR:
+        return 0.0
+    var = 0.0
+    for mc, alpha2 in zip(ctx.bkg_class_masks, ctx.floor_alpha2):
+        mr = m & mc
+        if not mr.any() or float(ctx.w[mr].sum()) <= 0.0:
+            var += alpha2
+    return var
 
 
 def _qcd_axis(ctx):
@@ -364,7 +378,7 @@ def _parallel_map_ordered(fn, items):
 
 
 # -------------------- Candidate evaluation --------------------
-def evaluate_region(ctx, lo, hi, S_v=None, B_v=None):
+def evaluate_region(ctx, lo, hi, S_v=None, B_v=None, B2_v=None):
     """Build a candidate dict, or None if it fails the acceptance constraints.
 
     Fast path: ``top_intervals_on_axis`` already returns the exact weighted S and
@@ -381,18 +395,19 @@ def evaluate_region(ctx, lo, hi, S_v=None, B_v=None):
         for flo, fhi in ctx.forbidden:
             if overlap(lo, hi, flo, fhi, ctx.D):
                 return None
-    need_stats = (S_v is None or B_v is None) or \
+    need_stats = (S_v is None or B_v is None or B2_v is None) or \
         MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0
     if need_stats:
-        S, _sS, B, _sB, S_e, B_e = rect_stats(ctx, lo, hi)
+        S, _sS, B, sB, S_e, B_e = rect_stats(ctx, lo, hi)
+        B2 = sB * sB + floor_variance(ctx, rect_mask(ctx, lo, hi))
     else:
-        S, B, S_e, B_e = float(S_v), float(B_v), -1, -1
+        S, B, B2, S_e, B_e = float(S_v), float(B_v), float(B2_v), -1, -1
     if B < MIN_BKG_WEIGHT or S <= MIN_SIGNAL_WEIGHT:
         return None
     if (MIN_SIGNAL_ENTRIES > 0 and S_e < MIN_SIGNAL_ENTRIES) or \
        (MIN_BKG_ENTRIES > 0 and B_e < MIN_BKG_ENTRIES):
         return None
-    Z = calc_Z_val(S, B)
+    Z = calc_Z_val(S, B, B2)
     if Z <= 0.0:
         return None
     return {"lo": lo, "hi": hi, "S": S, "B": B, "Z": Z,
@@ -425,22 +440,32 @@ def top_intervals_on_axis(ctx, d, lo, hi, edges, top_n):
     v_d = ctx.score_axes[:, d]
     hS, _ = np.histogram(v_d[m], bins=edges, weights=ctx.w_sig[m])
     hB, _ = np.histogram(v_d[m], bins=edges, weights=ctx.w_bkg[m])
+    hB2, _ = np.histogram(v_d[m], bins=edges, weights=ctx.w2_bkg[m])
     pS = np.r_[0.0, np.cumsum(hS)]
     pB = np.r_[0.0, np.cumsum(hB)]
+    pB2 = np.r_[0.0, np.cumsum(hB2)]
     K = pS.size
     a_idx = np.arange(K).reshape(-1, 1)
     b_idx = np.arange(K).reshape(1, -1)
     tri = b_idx > a_idx
     S_mat = pS[b_idx] - pS[a_idx]
     B_mat = pB[b_idx] - pB[a_idx]
+    B2_mat = pB2[b_idx] - pB2[a_idx]
+    if ZERO_COUNT_FLOOR:
+        for mc, alpha2 in zip(ctx.bkg_class_masks, ctx.floor_alpha2):
+            mm = m & mc
+            hN, _ = np.histogram(v_d[mm], bins=edges)
+            hW, _ = np.histogram(v_d[mm], bins=edges, weights=ctx.w[mm])
+            pN = np.r_[0, np.cumsum(hN)]
+            pW = np.r_[0.0, np.cumsum(hW)]
+            empty = ((pN[b_idx] - pN[a_idx]) == 0) | ((pW[b_idx] - pW[a_idx]) <= 0.0)
+            B2_mat = B2_mat + np.where(empty, alpha2, 0.0)
     valid = tri & (B_mat >= MIN_BKG_WEIGHT) & (S_mat > MIN_SIGNAL_WEIGHT)
     if not valid.any():
         return []
     Bsafe = np.where(valid, B_mat, 1.0)
     Ssafe = np.where(valid, S_mat, 0.0)
-    f = (Ssafe + Bsafe) * np.log1p(Ssafe / Bsafe) - Ssafe
-    f = np.where(valid & (f > 0.0), f, 0.0)
-    Z2 = np.where(valid, 2.0 * f, -np.inf)
+    Z2 = np.where(valid, sr.asimov_z(Ssafe, Bsafe, np.where(valid, B2_mat, 0.0)) ** 2, -np.inf)
     valid_count = int(np.count_nonzero(np.isfinite(Z2) & (Z2 > 0.0)))
     if valid_count == 0:
         return []
@@ -470,6 +495,7 @@ def top_intervals_on_axis(ctx, d, lo, hi, edges, top_n):
             float(edges[b_best]),
             float(S_mat[a_best, b_best]),
             float(B_mat[a_best, b_best]),
+            float(B2_mat[a_best, b_best]),
             float(np.sqrt(Z2[a_best, b_best])),
         ))
         if len(intervals) >= take:
@@ -582,22 +608,22 @@ def coarse_beam_search(ctx, forbidden_boxes=()):
                 ctx, d, item["lo"], item["hi"], axis_edges[d], TOP_K
             )
             children = []
-            for low_d, high_d, S_v, B_v, _Z in intervals:
+            for low_d, high_d, S_v, B_v, B2_v, _Z in intervals:
                 lo = list(item["lo"])
                 hi = list(item["hi"])
                 lo[d] = low_d
                 hi[d] = high_d
-                children.append((lo, hi, S_v, B_v))
+                children.append((lo, hi, S_v, B_v, B2_v))
             return children
 
         produced = []
         for children in _parallel_map_ordered(_task, tasks):
-            for lo, hi, S_v, B_v in children:
+            for lo, hi, S_v, B_v, B2_v in children:
                 key = _region_key(lo, hi)
                 if key in pool:
                     produced.append(pool[key])
                     continue
-                item = evaluate_region(ctx, lo, hi, S_v, B_v)
+                item = evaluate_region(ctx, lo, hi, S_v, B_v, B2_v)
                 if item is not None:
                     pool[key] = item
                     produced.append(item)
@@ -729,13 +755,17 @@ def fine_refine_selected(ctx, sel_los, sel_his):
             for d in range(ctx.D):
                 edges = _local_edges(los[i][d], his[i][d], d)
                 intervals = top_intervals_on_axis(ctx, d, los[i], his[i], edges, TOP_K)
-                for low_d, high_d, S_v, B_v, _Z in intervals:
+                for low_d, high_d, S_v, B_v, _B2_v, _Z in intervals:
                     if B_v < MIN_BKG_WEIGHT or S_v <= MIN_SIGNAL_WEIGHT:
                         continue
                     lo_alt = list(los[i]); hi_alt = list(his[i])
                     lo_alt[d] = low_d; hi_alt[d] = high_d
                     if not _valid_region(lo_alt, hi_alt, ctx.D):
                         continue
+                    if MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0:
+                        _S, _sS, _B, _sB, S_e, B_e = rect_stats(ctx, lo_alt, hi_alt)
+                        if S_e < MIN_SIGNAL_ENTRIES or B_e < MIN_BKG_ENTRIES:
+                            continue
                     if _others_ok(i, lo_alt, hi_alt):
                         if abs(low_d - los[i][d]) > 1e-12 or abs(high_d - his[i][d]) > 1e-12:
                             changed = True
@@ -986,7 +1016,9 @@ def build_top_bins(ctx, sel_los, sel_his):
         sB_bin = float(np.sqrt((wB ** 2).sum()))
         S_e = int((m_bin & ctx.is_sig).sum())
         B_e = int((m_bin & ctx.is_bkg).sum())
-        Z_bin, sZ_bin = calc_Z(S_bin, B_bin, sS_bin, sB_bin)
+        floor_bin = floor_variance(ctx, m_bin)
+        sB_z = float(np.sqrt(sB_bin ** 2 + floor_bin)) if floor_bin > 0.0 else sB_bin
+        Z_bin, sZ_bin = calc_Z(S_bin, B_bin, sS_bin, sB_z)
 
         W_bin = S_bin + B_bin
         w2_bin = sS_bin ** 2 + sB_bin ** 2
@@ -1065,6 +1097,10 @@ def main():
     sr.plot_score_distributions(proba, y, w)
 
     ctx = Ctx(proba, y, w)
+    if ZERO_COUNT_FLOOR:
+        log_message("Zero-count floor ON: alpha (median |event weight|) per background class: " + ", ".join(
+            f"{sr.CLASS_NAMES[c]}={a2 ** 0.5:.4g}"
+            for c, a2 in zip(sr.BACKGROUND_CLASS_INDICES, ctx.floor_alpha2)))
     log_message(f"  S_total={ctx.S_total:.4g}, B_total={ctx.B_total:.4g}")
     log_message(f"  Scan dimensions D={ctx.D}, axes={ctx.axis_names}")
     log_message(
