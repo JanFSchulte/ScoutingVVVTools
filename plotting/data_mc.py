@@ -42,6 +42,7 @@ from model_io import (
     load_model as _shared_load_model,
     predict_model_proba as _shared_predict_model_proba,
 )
+import kfold
 
 # -------------------- Style --------------------
 plt.rcParams["mathtext.fontset"] = "cm"
@@ -238,6 +239,8 @@ def _bdt_root_for_tree(tree_name):
 
 def _bdt_configs_for_tree(tree_name, load_test_meta=True):
     bdt_root = _bdt_root_for_tree(tree_name)
+    if kfold.is_kfold_root(bdt_root):
+        bdt_root = os.path.join(bdt_root, "fold0")   # k-fold rotations share one configuration
     cfg = _load_json(os.path.join(bdt_root, "config.json"))
     br = _load_json(os.path.join(bdt_root, "branch.json"))
     sel = _load_json(os.path.join(bdt_root, "selection.json"))
@@ -1096,6 +1099,18 @@ def _fill_model():
     return _FILL_MODEL[0]
 
 
+def _fill_kfold():
+    """The worker's k-fold models (one XGBoost thread per pool worker)."""
+    if not _FILL_MODEL:
+        kf = kfold.KFoldModels(_FILL_CTX["bdt_root"], log=log_message)
+        for fold in range(kf.k):
+            model = kf.model(fold)
+            if hasattr(model, "set_param"):
+                model.set_param({"nthread": 1})
+        _FILL_MODEL.append(kf)
+    return _FILL_MODEL[0]
+
+
 def _fill_task(task):
     """Histogram one entry range of one input file: returns the summed fine histograms."""
     ctx = _FILL_CTX
@@ -1107,6 +1122,8 @@ def _fill_task(task):
     scalars = list(ctx["columns"])
     if is_mc:
         scalars = sorted(set(scalars) | set(ctx["reweight_branches"]) | {GEN_WEIGHT_BRANCH})
+    if ctx["kfold"]:
+        scalars = sorted(set(scalars) | {"event"})
     with uproot.open(task["file"]) as uf:
         tree = uf[ctx["tree_name"]]
         avail = set(tree.keys())
@@ -1119,8 +1136,9 @@ def _fill_task(task):
             theory = {b: np.zeros((len(e) + 1, _TH_N_MEMBERS)) for b, e in edges.items()}
         else:
             arrays_in = []
-        for chunk in tree.iterate(expressions=scalars + arrays_in, entry_start=task["start"],
-                                  entry_stop=task["stop"], step_size=_CHUNK_SIZE, library="np"):
+        for chunk, report in tree.iterate(expressions=scalars + arrays_in, entry_start=task["start"],
+                                          entry_stop=task["stop"], step_size=_CHUNK_SIZE, library="np",
+                                          report=True):
             df = pd.DataFrame({c: np.asarray(chunk[c]) for c in scalars})
             n = len(df)
             counts["read"] += n
@@ -1136,7 +1154,16 @@ def _fill_task(task):
             if ctx["scoring"]:
                 X = _standardize_model_X(df[ctx["model_branches"]], ctx["clip_ranges"], ctx["log_transform"])
                 X = _drop_decorrelated_features(X, ctx["decorrelate"])
-                proba = _predict_model_proba(_fill_model(), X, ctx["n_classes"])
+                if ctx["kfold"]:
+                    # k-fold: a trained MC event with the model of its block (task offset = global
+                    # index of the file's first entry), data and untrained samples by event number.
+                    kf = _fill_kfold()
+                    folds = (kf.fold_of_index(task["sample"], task["offset"] + report.tree_entry_start
+                                              + np.arange(n))
+                             if task.get("offset") is not None else kf.data_fold(df["event"].to_numpy()))
+                    proba = kf.predict(X, folds)
+                else:
+                    proba = _predict_model_proba(_fill_model(), X, ctx["n_classes"])
             sel = _threshold_mask(df, ctx["plot_thresholds"]).to_numpy(dtype=bool)
             if ctx["blind"] and not is_mc:
                 # Blinding: drop every data event of a signal region (score box and all its
@@ -1220,6 +1247,7 @@ def _fill_tree(tree_name, no_selection=False, unblind=False, n_workers=None):
     model_branches = [item["name"] for item in bdt_br.get(tree_name, [])]
     bdt_root_dir = _bdt_root_for_tree(tree_name)
     scoring = bool(model_branches)
+    kf = kfold.KFoldModels(bdt_root_dir, log=log_message) if scoring and kfold.is_kfold_root(bdt_root_dir) else None
 
     bdt_script_dir = os.path.dirname(bdt_root_dir)
     if no_selection:
@@ -1293,9 +1321,14 @@ def _fill_tree(tree_name, no_selection=False, unblind=False, n_workers=None):
             has_theory = bool(info.get("has_theory_weights", False))
             if has_theory:
                 theory_samples.append(sname)
+            offsets = {}
+            if kf is not None and sname in kf.samples:
+                kf.check_files(sname, files)
+                offsets = kf.file_offsets(sname)
             for fpath, lo, hi in ranges:
                 mc_tasks.append({"kind": "mc", "cls": cls_name, "sample": sname, "file": fpath, "start": lo,
-                                 "stop": hi, "scale": scale, "genweight_mean": gw_mean, "theory": has_theory})
+                                 "stop": hi, "scale": scale, "genweight_mean": gw_mean, "theory": has_theory,
+                                 "offset": offsets.get(fpath)})
             log_message(f"  MC {sname} (class={cls_name}): {n_total} entries in {len(files)} files, "
                         f"target_total={target_total:.6g}")
     data_tasks = []
@@ -1348,6 +1381,7 @@ def _fill_tree(tree_name, no_selection=False, unblind=False, n_workers=None):
                      | (set(model_branches) if scoring else set()) | (set(thresholds) if blind else set()))
     ctx = {
         "tree_name": tree_name, "bdt_root": bdt_root_dir, "bdt_cfg": bdt_cfg, "scoring": scoring,
+        "kfold": kf is not None,
         "columns": columns, "reweight_branches": reweight_branches, "model_branches": model_branches,
         "clip_ranges": clip_ranges, "log_transform": list(log_tf_set), "decorrelate": decorrelate,
         "n_classes": len(model_classes), "plot_thresholds": plot_thresholds,

@@ -426,12 +426,15 @@ def copy_log_to_output_dirs(mode, config_path, work_dir, log_path):
 
 def submit_training_jobs(mode_cfg, config_path, work_dir, args):
     """Mode 2 with --slurm: one SLURM job per tree in the config's submit_trees, each running
-    train.py restricted to that tree (BDT_TREES), so the trees train in parallel."""
-    trees = json.loads(Path(config_path).read_text()).get("submit_trees", [])
+    train.py restricted to that tree (BDT_TREES), so the trees train in parallel; with kfold = K
+    one job per tree and k-fold rotation (BDT_FOLD)."""
+    bdt_cfg = json.loads(Path(config_path).read_text())
+    trees = bdt_cfg.get("submit_trees", [])
     if not trees:
         sys.exit(f"mode=2 --slurm: no submit_trees in {config_path}")
-    for tree in trees:
-        job_name = f"{mode_cfg['label']}_{tree}"
+    kfold = int(bdt_cfg.get("kfold", 0))
+    for tree, fold in [(t, f) for t in trees for f in (range(kfold) if kfold else [None])]:
+        job_name = f"{mode_cfg['label']}_{tree}" + ("" if fold is None else f"_fold{fold}")
         cmd = [
             "sbatch",
             f"--job-name={job_name}",
@@ -452,12 +455,14 @@ def submit_training_jobs(mode_cfg, config_path, work_dir, args):
         script_cmd = " ".join(["python3", f"./{mode_cfg['script']}", *(args.passthrough or [])])
         cmd.append(
             f"--wrap=cd {work_dir} && export OMP_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}}; "
-            f"env {mode_cfg['config_env']}={config_path} BDT_TREES={tree} {script_cmd}"
+            f"env {mode_cfg['config_env']}={config_path} BDT_TREES={tree}"
+            + ("" if fold is None else f" BDT_FOLD={fold}") + f" {script_cmd}"
         )
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=work_dir)
         if r.returncode != 0:
             sys.exit(f"sbatch failed for tree={tree}: {r.stderr.decode().strip()}")
-        log(f"submitted tree={tree} slurm_job_id={r.stdout.decode().strip().split()[-1]}")
+        log(f"submitted tree={tree}" + ("" if fold is None else f" fold={fold}")
+            + f" slurm_job_id={r.stdout.decode().strip().split()[-1]}")
     log("all jobs submitted to SLURM")
     return 0
 

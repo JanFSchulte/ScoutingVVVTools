@@ -169,6 +169,9 @@ def prepare_inputs():
     drop_after_filter = [c for c in extra_cols if c not in decorrelate]
 
     log_message(f"SR optimisation split: {sr.OPT_SPLIT}")
+    if sr.KFOLD:
+        proba, y, w, sample_labels = sr.load_kfold_inputs(thresholds)
+        return proba, y, w, sample_labels, []
     df_all = sr.load_split_data(load_cols, sr.OPT_SPLIT)
     X             = df_all[load_cols].copy()
     y             = df_all["class_idx"].values.astype(int)

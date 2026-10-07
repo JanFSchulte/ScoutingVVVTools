@@ -66,6 +66,7 @@ from model_io import (
     load_model as _shared_load_model,
     predict_model_proba as _shared_predict_model_proba,
 )
+import kfold
 
 
 # -------------------- Logging --------------------
@@ -144,10 +145,15 @@ if not os.path.isabs(OUTPUT_DIR):
 
 
 # -------------------- Trained-model config copies --------------------
-cfg       = _load_json(os.path.join(BDT_ROOT, "config.json"))
-br_cfg    = _load_json(os.path.join(BDT_ROOT, "branch.json"))
-sel_cfg   = _load_json(os.path.join(BDT_ROOT, "selection.json"))
-test_meta = _load_json(os.path.join(BDT_ROOT, "test_ranges.json"))
+# A k-fold training (train.py kfold = K) keeps its rotations in bdt_root/fold0 ... fold<K-1>: the
+# SRs are then optimised on every MC event with its out-of-fold score from the score cache
+# (selections/BDT/score_kfold.py) instead of on the eval split of one model.
+KFOLD = kfold.is_kfold_root(BDT_ROOT)
+_CFG_DIR = os.path.join(BDT_ROOT, "fold0") if KFOLD else BDT_ROOT
+cfg       = _load_json(os.path.join(_CFG_DIR, "config.json"))
+br_cfg    = _load_json(os.path.join(_CFG_DIR, "branch.json"))
+sel_cfg   = _load_json(os.path.join(_CFG_DIR, "selection.json"))
+test_meta = _load_json(os.path.join(_CFG_DIR, "test_ranges.json"))
 
 # sample_config paths in config.json are relative to _BDT_DIR, where train.py runs.
 _sample_cfg_path = cfg["sample_config"]
@@ -160,7 +166,7 @@ MODEL_PATTERN = cfg.get("model_pattern", "{output_root}/{tree_name}_model")
 # The SRs are optimised on the eval split when the model was trained with one (train.py
 # eval_fraction > 0); the test split is then reserved for the final yields (qcd_est, combine).
 # Models trained before the eval split existed fall back to the test split.
-OPT_SPLIT = "eval" if float(test_meta.get("eval_fraction", 0.0)) > 0.0 else "test"
+OPT_SPLIT = "kfold" if KFOLD else ("eval" if float(test_meta.get("eval_fraction", 0.0)) > 0.0 else "test")
 OPT_REFERENCE_SIGNAL_REGION = os.path.join(BDT_ROOT, f"{OPT_SPLIT}_reference_signal_region.npz")
 
 
@@ -294,6 +300,11 @@ def _random_block_ranges(split_start, split_stop, blocks):
 
 
 def _refresh_split_segments(sample_name, split):
+    if "kfold" in test_meta:
+        raise RuntimeError(
+            f"stale {split} split of sample '{sample_name}' in a k-fold rotation: its blocks cannot be "
+            "rebuilt from the fractions; retrain the k-fold models on the current files"
+        )
     files = _current_sample_files(sample_name)
     if not files:
         raise FileNotFoundError(f"No current files found for sample '{sample_name}' under {_INPUT_ROOT}")
@@ -505,6 +516,19 @@ def load_split_data(branches, split):
     del dfs
     gc.collect()
     return df_all
+
+
+def load_kfold_inputs(thresholds):
+    """k-fold models: every MC event of the class_groups samples passing `thresholds`, with its
+    out-of-fold class probabilities and physics weight (x lumi) from the score cache. The scorer
+    validated the probabilities against the fold references. Returns (proba, y, w, sample_labels)."""
+    models = kfold.KFoldModels(BDT_ROOT, log=log_message)
+    samples = [s for members in CLASS_GROUPS.values() for s in members]
+    log_message(f"Loading the k-fold score cache: {models.k} folds, {len(samples)} samples")
+    scores = kfold.load_scores(models, samples, thresholds=thresholds, log=log_message)
+    w = scores["weight"] * LUMI
+    log_message(f"After thresholds: {len(w)} events (all MC entries, k-fold scores)")
+    return scores["proba"], scores["class_idx"].astype(int), w, scores["sample_name"]
 
 
 # -------------------- Feature standardization --------------------
@@ -2562,21 +2586,9 @@ def print_results(result):
 
 
 # -------------------- Main --------------------
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    log_message(
-        f"Running signal_region.py: tree={TREE_NAME}, lumi={LUMI} fb^-1, "
-        f"n_signal_regions={N_SIGNAL_REGIONS}, bdt_root={BDT_ROOT}, output_dir={OUTPUT_DIR}"
-    )
-
-    sel         = sel_cfg[TREE_NAME]
-    branches    = [b["name"] for b in br_cfg[TREE_NAME]]
-    clip_ranges = {k: tuple(v) for k, v in sel.get("clip_ranges", {}).items()}
-    log_tf      = sel.get("log_transform", [])
-    thresholds  = {k: (tuple(v) if isinstance(v, list) else v)
-                   for k, v in sel.get("thresholds", {}).items()}
-    decorrelate = cfg.get(TREE_NAME, {}).get("decorrelate", [])
-
+def _load_and_predict_opt_split(branches, thresholds, decorrelate, clip_ranges, log_tf):
+    """Single model: OPT_SPLIT events, thresholds, model inference and reference validation.
+    Returns (proba, y, w, sample_labels)."""
     # Threshold and decorrelate branches that are NOT declared in branch.json
     # still need to be read from the ROOT files so filter_X can cut on them and
     # the decorrelation step can reference them. They are removed from X before
@@ -2639,6 +2651,31 @@ def main():
         w,
         proba,
     )
+
+    return proba, y, w, sample_labels
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    log_message(
+        f"Running signal_region.py: tree={TREE_NAME}, lumi={LUMI} fb^-1, "
+        f"n_signal_regions={N_SIGNAL_REGIONS}, bdt_root={BDT_ROOT}, output_dir={OUTPUT_DIR}"
+    )
+
+    sel         = sel_cfg[TREE_NAME]
+    branches    = [b["name"] for b in br_cfg[TREE_NAME]]
+    clip_ranges = {k: tuple(v) for k, v in sel.get("clip_ranges", {}).items()}
+    log_tf      = sel.get("log_transform", [])
+    thresholds  = {k: (tuple(v) if isinstance(v, list) else v)
+                   for k, v in sel.get("thresholds", {}).items()}
+    decorrelate = cfg.get(TREE_NAME, {}).get("decorrelate", [])
+
+    if KFOLD:
+        proba, y, w, sample_labels = load_kfold_inputs(thresholds)
+    else:
+        proba, y, w, sample_labels = _load_and_predict_opt_split(
+            branches, thresholds, decorrelate, clip_ranges, log_tf
+        )
 
     # Plot the weighted score distributions.
     log_message("Plotting score distributions")

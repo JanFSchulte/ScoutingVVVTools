@@ -28,9 +28,12 @@ VARIANTS = {
     # 2026-10-06, on the production settings of that day (depth 4, mcw 50, per-sample eval/test caps):
     "shallow_cap20": {"training_weight_cap": 20},
     "shallow_cap20_effnorm": {"training_weight_cap": 20},
+    # 2026-10-07: shallow_cap20 as 5 k-fold rotations (every MC event with an out-of-fold score)
+    "shallow_cap20_kfold": {"training_weight_cap": 20},
 }
 GLOBAL_CHANGES = {
     "shallow_cap20_effnorm": {"decor_eff_normalize": True},
+    "shallow_cap20_kfold": {"kfold": 5},
 }
 
 def main():

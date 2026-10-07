@@ -54,7 +54,7 @@ def write_configs(variant, n, m):
     return d
 
 
-def submit(variant, account, exclude):
+def submit(variant, account, exclude, after=""):
     if not os.path.exists(COMBINE_BIN):
         sys.exit(f"missing {COMBINE_BIN}: build it from combine/combine.C first")
     for n in N_SRS:
@@ -67,6 +67,8 @@ def submit(variant, account, exclude):
                     "--cpus-per-task=8", "--mem=16G", "--time=06:00:00", f"--output={d}/job.log", f"--wrap={cmd}"]
             if exclude:
                 args.insert(-1, f"--exclude={exclude}")
+            if after:
+                args.insert(-1, "--dependency=afterok:" + after.replace(",", ":"))
             job = subprocess.check_output(args, text=True).strip()
             print(f"n={n} min_bkg_entries={m}: job {job} -> {d}")
 
@@ -154,5 +156,6 @@ if __name__ == "__main__":
     parser.add_argument("--variant", default="shallow_cap20")
     parser.add_argument("--account", default="cms-express")
     parser.add_argument("--exclude", default="hammer-f015")
+    parser.add_argument("--after", default="", help="job ids (comma-separated) the grid jobs wait for")
     a = parser.parse_args()
-    submit(a.variant, a.account, a.exclude) if a.action == "submit" else summary(a.variant)
+    submit(a.variant, a.account, a.exclude, a.after) if a.action == "submit" else summary(a.variant)

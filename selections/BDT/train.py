@@ -107,6 +107,13 @@ TRAIN_EVENTS_PER_CLASS = int(cfg.get("train_events_per_class", 0))
 TEST_EVENTS_PER_CLASS = int(cfg.get("test_events_per_class", 0))
 EVAL_EVENTS_PER_CLASS = int(cfg.get("eval_events_per_class", TEST_EVENTS_PER_CLASS))
 _BUDGET_BLOCK_ENTRIES = 8192
+# k-fold scoring (kfold = K > 0): every sample's concatenated entries are cut into K equal blocks
+# (block j = entries [N j / K, N (j + 1) / K)); rotation r scores block r (its test split), monitors
+# on block r - 1 (its eval split) and trains on the other K - 2 blocks, so the K models give every
+# MC event a score from a model that neither trained nor monitored on it (score_kfold.py). The
+# rotation is BDT_FOLD (else all K in turn), each written to <output_root>/fold<r>. Requires
+# train_fraction = (K - 2) / K and eval_fraction = 1 / K; rotation K - 1 is the ordinary split.
+KFOLD = int(cfg.get("kfold", 0))
 MONITOR_LABEL      = "Eval" if EVAL_FRACTION > 0.0 else "Test"
 DECOR_LAMBDA       = cfg.get("decor_lambda", 30)
 DECOR_LOSS_MODE    = str(cfg.get("decor_loss_mode", "smooth_cvm")).strip().lower()
@@ -147,6 +154,20 @@ if EVAL_FRACTION < 0.0 or TRAIN_FRACTION + EVAL_FRACTION >= 1.0:
         f"eval_fraction must be >= 0 with train_fraction + eval_fraction < 1, "
         f"got train_fraction={TRAIN_FRACTION}, eval_fraction={EVAL_FRACTION}"
     )
+if KFOLD:
+    if KFOLD < 3:
+        raise ValueError(f"kfold must be 0 (off) or >= 3, got {KFOLD}")
+    if abs(TRAIN_FRACTION - (KFOLD - 2) / KFOLD) > 1e-9 or abs(EVAL_FRACTION - 1.0 / KFOLD) > 1e-9:
+        raise ValueError(
+            f"kfold = {KFOLD} requires train_fraction = {(KFOLD - 2) / KFOLD:g} and eval_fraction = "
+            f"{1.0 / KFOLD:g}, got {TRAIN_FRACTION:g} and {EVAL_FRACTION:g}"
+        )
+_FOLD_ENV = os.environ.get("BDT_FOLD", "").strip()
+if _FOLD_ENV and not KFOLD:
+    raise ValueError("BDT_FOLD is set but the config has no kfold")
+FOLDS = [None] if not KFOLD else ([int(_FOLD_ENV)] if _FOLD_ENV else list(range(KFOLD)))
+if any(f is not None and not 0 <= f < KFOLD for f in FOLDS):
+    raise ValueError(f"BDT_FOLD must be in [0, {KFOLD}), got {_FOLD_ENV}")
 if not np.isfinite(DECOR_MSOFTDROP_TRAINING_MAX) or DECOR_MSOFTDROP_TRAINING_MAX <= 0.0:
     raise ValueError(
         "decor_msoftdrop_training_max must be a positive finite number, "
@@ -313,11 +334,11 @@ def _input_files(sample_name):
     return sorted(glob.glob(base) + glob.glob(stem + "_*.root"))
 
 
-def _resolve_output_root(tree_name):
+def _resolve_output_root(tree_name, fold=None):
     output_root = OUTPUT_ROOT_PATTERN.format(tree_name=tree_name)
     if not os.path.isabs(output_root):
         output_root = os.path.normpath(os.path.join(_SCRIPT_DIR, output_root))
-    return output_root
+    return output_root if fold is None else os.path.join(output_root, f"fold{fold}")
 
 
 def _slugify(text):
@@ -541,7 +562,33 @@ def _build_segments(file_infos, global_start, global_stop, max_entries=None):
     return segments
 
 
-def _inspect_sample_tree(sample_name, tree_name):
+def _build_segments_multi(file_infos, intervals, max_entries=None):
+    """_build_segments over several global intervals in order, max_entries counted over all."""
+    segments = []
+    for start, stop in intervals:
+        remain = None if max_entries is None else max_entries - _sum_segment_lengths(segments)
+        if remain is not None and remain <= 0:
+            break
+        segments.extend(_build_segments(file_infos, start, stop, max_entries=remain))
+    return segments
+
+
+def _kfold_bounds(total_entries):
+    """Block boundaries of the k-fold scheme: block j = [bounds[j], bounds[j + 1])."""
+    return [total_entries * j // KFOLD for j in range(KFOLD + 1)]
+
+
+def _merge_intervals(intervals):
+    merged = []
+    for start, stop in sorted(intervals):
+        if merged and merged[-1][1] == start:
+            merged[-1] = (merged[-1][0], stop)
+        elif stop > start:
+            merged.append((start, stop))
+    return merged
+
+
+def _inspect_sample_tree(sample_name, tree_name, fold=None):
     files = _input_files(sample_name)
     if not files:
         raise RuntimeError(f"No ROOT files found for sample '{sample_name}' in tree '{tree_name}'")
@@ -563,20 +610,34 @@ def _inspect_sample_tree(sample_name, tree_name):
     if total_entries <= 0:
         raise RuntimeError(f"Zero entries found for sample '{sample_name}' in tree '{tree_name}'")
 
-    train_stop = int(total_entries * TRAIN_FRACTION)
-    eval_stop = int(total_entries * (TRAIN_FRACTION + EVAL_FRACTION))
+    if fold is None:
+        train_stop = int(total_entries * TRAIN_FRACTION)
+        eval_stop = int(total_entries * (TRAIN_FRACTION + EVAL_FRACTION))
+        train_intervals = [(0, train_stop)]
+        eval_start, test_start, test_stop = train_stop, eval_stop, total_entries
+        block_bounds = None
+    else:
+        block_bounds = _kfold_bounds(total_entries)
+        monitor = (fold - 1) % KFOLD
+        test_start, test_stop = block_bounds[fold], block_bounds[fold + 1]
+        eval_start, eval_stop = block_bounds[monitor], block_bounds[monitor + 1]
+        train_intervals = _merge_intervals([
+            (block_bounds[j], block_bounds[j + 1]) for j in range(KFOLD) if j not in (fold, monitor)
+        ])
     return {
         "sample_name": sample_name,
         "file_infos": file_infos,
         "total_entries": total_entries,
-        "train_stop": train_stop,
-        "eval_start": train_stop,
+        "train_intervals": train_intervals,
+        "eval_start": eval_start,
         "eval_stop": eval_stop,
-        "test_start": eval_stop,
-        "train_segments_full": _build_segments(file_infos, 0, train_stop),
-        "train_segments_read": _build_segments(file_infos, 0, train_stop, max_entries=ENTRIES_PER_SAMPLE),
-        "eval_segments": _build_segments(file_infos, train_stop, eval_stop, max_entries=EVAL_ENTRIES_PER_SAMPLE),
-        "test_segments": _build_segments(file_infos, eval_stop, total_entries, max_entries=TEST_ENTRIES_PER_SAMPLE),
+        "test_start": test_start,
+        "test_stop": test_stop,
+        "block_bounds": block_bounds,
+        "train_segments_full": _build_segments_multi(file_infos, train_intervals),
+        "train_segments_read": _build_segments_multi(file_infos, train_intervals, max_entries=ENTRIES_PER_SAMPLE),
+        "eval_segments": _build_segments(file_infos, eval_start, eval_stop, max_entries=EVAL_ENTRIES_PER_SAMPLE),
+        "test_segments": _build_segments(file_infos, test_start, test_stop, max_entries=TEST_ENTRIES_PER_SAMPLE),
     }
 
 
@@ -660,15 +721,48 @@ def _random_block_segments(file_infos, range_start, range_stop, n_entries, seed)
     return segments
 
 
+def _random_block_segments_multi(file_infos, intervals, n_entries, seed):
+    """_random_block_segments over the union of global intervals (the k-fold training blocks):
+    the blocks are drawn in the concatenated interval space and mapped back. One interval gives
+    exactly _random_block_segments."""
+    if len(intervals) == 1:
+        return _random_block_segments(file_infos, intervals[0][0], intervals[0][1], n_entries, seed)
+    lengths = [stop - start for start, stop in intervals]
+    n_range = sum(lengths)
+    if n_entries >= n_range:
+        return _build_segments_multi(file_infos, intervals)
+    block = _BUDGET_BLOCK_ENTRIES
+    n_blocks = (n_range + block - 1) // block
+    k = min(n_blocks, (n_entries + block - 1) // block)
+    chosen = np.sort(np.random.default_rng(seed).choice(n_blocks, size=k, replace=False))
+    offsets = np.cumsum([0] + lengths)
+    segments = []
+    for b in chosen:
+        v_start, v_stop = int(b) * block, min(int(b) * block + block, n_range)
+        for i, (start, _stop) in enumerate(intervals):
+            lo, hi = max(v_start, offsets[i]), min(v_stop, offsets[i + 1])
+            if hi <= lo:
+                continue
+            g_start = start + (lo - offsets[i])
+            for seg in _build_segments(file_infos, g_start, g_start + (hi - lo)):
+                last = segments[-1] if segments else None
+                if last is not None and last["path"] == seg["path"] and last["entry_stop"] == seg["entry_start"]:
+                    last["entry_stop"] = seg["entry_stop"]
+                    last["global_stop"] = seg["global_stop"]
+                else:
+                    segments.append(dict(seg))
+    return segments
+
+
 _BUDGET_SEGMENT_KEYS = {"train": "train_segments_read", "eval": "eval_segments", "test": "test_segments"}
 
 
-def _split_range(plan, split):
+def _split_intervals(plan, split):
     if split == "train":
-        return 0, int(plan["train_stop"])
+        return list(plan["train_intervals"])
     if split == "eval":
-        return int(plan["eval_start"]), int(plan["eval_stop"])
-    return int(plan["test_start"]), int(plan["total_entries"])
+        return [(int(plan["eval_start"]), int(plan["eval_stop"]))]
+    return [(int(plan["test_start"]), int(plan["test_stop"]))]
 
 
 def _apply_class_budget(split_plans, tree_name, split, budget):
@@ -677,8 +771,8 @@ def _apply_class_budget(split_plans, tree_name, split, budget):
     scales = _training_weight_scales(tree_name) if split == "train" else {}
     for cls_name, members in CLASS_GROUPS.items():
         names = [name for name in members if name in split_plans]
-        ranges = {name: _split_range(split_plans[name], split) for name in names}
-        caps = {name: stop - start for name, (start, stop) in ranges.items()}
+        ranges = {name: _split_intervals(split_plans[name], split) for name in names}
+        caps = {name: sum(stop - start for start, stop in ivs) for name, ivs in ranges.items()}
         weights = {}
         for name in names:
             info = SAMPLE_INFO[name]
@@ -694,7 +788,7 @@ def _apply_class_budget(split_plans, tree_name, split, budget):
             seed_key = f"{tree_name}/{name}" if split == "train" else f"{tree_name}/{name}/{split}"
             seed = [int(RANDOM_STATE), zlib.crc32(seed_key.encode())]
             plan = split_plans[name]
-            segments = _random_block_segments(plan["file_infos"], *ranges[name], n_entries, seed)
+            segments = _random_block_segments_multi(plan["file_infos"], ranges[name], n_entries, seed)
             plan[_BUDGET_SEGMENT_KEYS[split]] = segments
             plan[f"{split}_random_blocks"] = {
                 "n_entries": int(n_entries), "block_entries": _BUDGET_BLOCK_ENTRIES, "seed": seed,
@@ -705,10 +799,10 @@ def _apply_class_budget(split_plans, tree_name, split, budget):
             )
 
 
-def build_split_plans(tree_name):
+def build_split_plans(tree_name, fold=None):
     split_plans = {}
     for sample_name in TRAINING_SAMPLES:
-        plan = _inspect_sample_tree(sample_name, tree_name)
+        plan = _inspect_sample_tree(sample_name, tree_name, fold)
         if plan is not None:
             split_plans[sample_name] = plan
     if not split_plans:
@@ -869,7 +963,7 @@ def prepare_split_data(tree_name, branches, split_name, split_plans, shuffle, tr
     return X, y, w, sample_labels, w_physics
 
 
-def write_split_metadata(output_root, tree_name, split_plans):
+def write_split_metadata(output_root, tree_name, split_plans, fold=None):
     metadata = {
         "tree_name": tree_name,
         "train_fraction": TRAIN_FRACTION,
@@ -877,6 +971,10 @@ def write_split_metadata(output_root, tree_name, split_plans):
         "test_fraction": 1.0 - TRAIN_FRACTION - EVAL_FRACTION,
         "samples": {},
     }
+    if fold is not None:
+        # k-fold rotation: the scorer (score_kfold.py) reads every block of every sample from the
+        # file list and block boundaries stored per sample.
+        metadata.update({"kfold": KFOLD, "fold": int(fold), "monitor_fold": int((fold - 1) % KFOLD)})
 
     for sample_name, plan in split_plans.items():
         metadata["samples"][sample_name] = {
@@ -903,7 +1001,7 @@ def write_split_metadata(output_root, tree_name, split_plans):
             "test_entries_total": _sum_segment_lengths(plan["test_segments"]),
             "test_global_range": [
                 int(plan["test_start"]),
-                int(plan["total_entries"]),
+                int(plan["test_stop"]),
             ],
             "test_segments": [
                 {
@@ -916,11 +1014,29 @@ def write_split_metadata(output_root, tree_name, split_plans):
         })
         if "test_random_blocks" in plan:
             metadata["samples"][sample_name]["test_random_blocks"] = plan["test_random_blocks"]
+        if fold is not None:
+            metadata["samples"][sample_name].update({
+                "train_intervals": [[int(a), int(b)] for a, b in plan["train_intervals"]],
+                "block_bounds": [int(b) for b in plan["block_bounds"]],
+                "files": [{"path": info["path"], "entries": int(info["entries"])} for info in plan["file_infos"]],
+            })
 
     metadata_path = os.path.join(output_root, "test_ranges.json")
     with open(metadata_path, "w", encoding="utf-8") as fout:
         json.dump(metadata, fout, indent=2, ensure_ascii=False)
     log_message(f"Wrote split file: {metadata_path}")
+
+
+def _split_entry_index(split_plans, split_name):
+    """Global entry index (position in the sample's concatenated entries) of every row that
+    prepare_split_data loads for an unshuffled eval/test split, in its row order."""
+    key = {"eval": "eval_segments", "test": "test_segments"}[split_name]
+    parts = [
+        np.arange(int(seg["global_start"]), int(seg["global_stop"]), dtype=np.int64)
+        for sample_name in TRAINING_SAMPLES if sample_name in split_plans
+        for seg in split_plans[sample_name][key]
+    ]
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
 
 
 def write_config_copy(output_root):
@@ -4064,10 +4180,13 @@ def _write_prediction_reference(
     weight_atol=1e-12,
     proba_rtol=1e-6,
     proba_atol=1e-9,
+    entry_index=None,
 ):
     path = _reference_path(output_root, stem)
+    extra = {} if entry_index is None else {"entry_index": np.asarray(entry_index, dtype=np.int64)}
     np.savez_compressed(
         path,
+        **extra,
         tree_name=np.asarray(str(tree_name)),
         pipeline_name=np.asarray(str(pipeline_name)),
         feature_names=np.asarray(list(feature_names), dtype=str),
@@ -4084,8 +4203,8 @@ def _write_prediction_reference(
 
 
 def main():
-    for tree_name in SUBMIT_TREES:
-        output_root = _resolve_output_root(tree_name)
+    for tree_name, fold in [(tree, fold) for tree in SUBMIT_TREES for fold in FOLDS]:
+        output_root = _resolve_output_root(tree_name, fold)
         os.makedirs(output_root, exist_ok=True)
         branches = [b["name"] for b in br_cfg[tree_name]]
         sel = sel_cfg[tree_name]
@@ -4114,6 +4233,8 @@ def main():
         log_message(
             f"Running train.py for tree = {tree_name}, output = {output_root}, "
             f"classes = {NUM_CLASSES}, model_type = {MODEL_TYPE}"
+            + ("" if fold is None else
+               f", k-fold rotation {fold} of {KFOLD} (test block {fold}, eval block {(fold - 1) % KFOLD})")
         )
         training_weight_scales = _training_weight_scales(tree_name)
         if training_weight_scales:
@@ -4146,11 +4267,11 @@ def main():
                 f"decorrelate msoftdrop threshold(s) in training/eval loss only: "
                 f"{', '.join(formatted_overrides)}"
             )
-        split_plans = build_split_plans(tree_name)
+        split_plans = build_split_plans(tree_name, fold)
         write_config_copy(output_root)
         write_branch_copy(output_root)
         write_selection_copy(output_root)
-        write_split_metadata(output_root, tree_name, split_plans)
+        write_split_metadata(output_root, tree_name, split_plans, fold)
 
         log_message(f"Loading training split for tree = {tree_name}")
         X_train, y_train, w_train, sample_labels_train, _ = prepare_split_data(
@@ -4167,6 +4288,11 @@ def main():
         check_weights(w_test, f"{tree_name}_test_weight_before_filter")
         check_weights(w_test_physics, f"{tree_name}_test_physics_weight_before_filter")
         X_test_unfiltered = X_test
+        test_entry_index = _split_entry_index(split_plans, "test")
+        if len(test_entry_index) != len(X_test_unfiltered):
+            raise RuntimeError(
+                f"test entry index has {len(test_entry_index)} rows, the test split {len(X_test_unfiltered)}"
+            )
         y_test_unfiltered = y_test
         w_test_physics_unfiltered = w_test_physics
         sample_labels_test_unfiltered = np.asarray(sample_labels_test)
@@ -4393,8 +4519,9 @@ def main():
             y_test_unfiltered,
             w_test_physics_unfiltered,
             proba_qcd_full_test,
+            entry_index=test_entry_index,
         )
-        del X_test_qcd_full_model, proba_qcd_full_test
+        del X_test_qcd_full_model, proba_qcd_full_test, test_entry_index
         gc.collect()
 
         X_test_signal_model = _drop_decorrelated_features(X_test_eval_std, decorrelate)

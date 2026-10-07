@@ -43,6 +43,7 @@ _BDT_TOOLS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "BDT"))
 if _BDT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _BDT_TOOLS_DIR)
 import model_io  # noqa: E402
+import kfold  # noqa: E402
 from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean  # noqa: E402
 
 # Keys of the removed one-dataset-per-variation scheme.
@@ -205,7 +206,12 @@ def build_tree_context(script_dir, bdt_root_cfg, sr_csv_cfg, tree):
     """Return the context of one tree: always 'thresholds'; the model and the
     signal regions when bdt_root and signal_region_csv are configured."""
     bdt_dir = resolve_path(script_dir, per_tree(bdt_root_cfg, tree))
-    ctx = {"thresholds": load_thresholds(bdt_dir, tree), "regions_enabled": False}
+    # k-fold models (train.py kfold = K): configs from fold0, every MC event scored with the model
+    # of the k-fold block holding it (selections/BDT/kfold.py).
+    kf = kfold.KFoldModels(bdt_dir, log=log) if bdt_dir is not None and kfold.is_kfold_root(bdt_dir) else None
+    if kf is not None:
+        bdt_dir = kf.fold_dirs[0]
+    ctx = {"thresholds": load_thresholds(bdt_dir, tree), "regions_enabled": False, "kfold": kf}
 
     sr_csv_raw = per_tree(sr_csv_cfg, tree)
     if bdt_dir is None or sr_csv_raw is None:
@@ -230,7 +236,7 @@ def build_tree_context(script_dir, bdt_root_cfg, sr_csv_cfg, tree):
 
     model_pattern = bcfg.get("model_pattern", "{output_root}/{tree_name}_model")
     model_base = model_pattern.format(output_root=bdt_dir, tree_name=tree)
-    model = model_io.load_model(model_base, bcfg, len(class_names), log_message=log)
+    model = None if kf is not None else model_io.load_model(model_base, bcfg, len(class_names), log_message=log)
 
     sr_df = pd.read_csv(sr_csv)
     if sr_df.empty:
@@ -254,7 +260,7 @@ def build_tree_context(script_dir, bdt_root_cfg, sr_csv_cfg, tree):
     return ctx
 
 
-def infer_proba(chunk, mask, ctx):
+def infer_proba(chunk, mask, ctx, folds=None):
     cols = {}
     for name in ctx["feature_cols"]:
         if name not in chunk:
@@ -269,14 +275,40 @@ def infer_proba(chunk, mask, ctx):
         drop = [c for c in ctx["decorrelate"] if c in X.columns]
         if drop:
             X = X.drop(columns=drop)
+    if ctx.get("kfold") is not None:
+        return ctx["kfold"].predict(X, folds)
     return model_io.predict_model_proba(ctx["model"], X, ctx["num_classes"])
+
+
+_EVENT_KEY_BRANCHES = ["run", "luminosityBlock", "event"]
+
+
+def _nominal_entry_of_key(fpath, nominal_tree):
+    """{(run, lumi, event): entry} of the nominal tree of one converted file."""
+    with uproot.open(fpath) as uf:
+        arr = uf[nominal_tree].arrays(_EVENT_KEY_BRANCHES, library="np")
+    keys = zip(arr["run"].tolist(), arr["luminosityBlock"].tolist(), arr["event"].tolist())
+    return {key: i for i, key in enumerate(keys)}
+
+
+def _variation_folds(kf, sample_name, offset, entry_of_key, chunk, mask):
+    """k-fold folds of variation-tree events: the fold of the same event in the nominal tree of the
+    file (its training membership); an event without a nominal entry was never trained on and gets
+    the data assignment (event number modulo K)."""
+    keys = zip(*(np.asarray(chunk[b])[mask].tolist() for b in _EVENT_KEY_BRANCHES))
+    local = np.fromiter((entry_of_key.get(k, -1) for k in keys), dtype=np.int64, count=int(mask.sum()))
+    folds = kf.data_fold(np.asarray(chunk["event"])[mask])
+    found = local >= 0
+    folds[found] = kf.fold_of_index(sample_name, offset + local[found])
+    return folds
 
 
 # ---------------------------------------------------------------------------
 # Weighted SR yield accumulation of one tree
 # ---------------------------------------------------------------------------
 
-def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size, genweight_mean):
+def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size, genweight_mean,
+                                  sample_name=None, nominal_tree=None):
     """Sum `weight_branch` x genWeight / genweight_mean inclusive (slot 0) and per SR
     (slots 1..N) over one tree (nominal or variation) of the converted files. Returns
     {"inclusive": slot, "regions": {bin_id: slot} or None} with
@@ -288,6 +320,13 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
     load_set = {weight_branch, GEN_WEIGHT_BRANCH, *thresholds.keys()}
     if enabled:
         load_set.update(ctx["feature_cols"])
+    kf = ctx.get("kfold") if enabled else None
+    variation = kf is not None and tree_name != nominal_tree
+    if kf is not None:
+        kf.check_files(sample_name, files)
+        offsets = kf.file_offsets(sample_name)
+        if variation:
+            load_set.update(_EVENT_KEY_BRANCHES)
     load_list = sorted(load_set)
 
     sum_w = np.zeros(n_slots, dtype=np.float64)
@@ -304,7 +343,9 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
             missing = [b for b in load_list if b not in set(tree.keys())]
             if missing:
                 raise KeyError(f"{fpath}:{tree_name} lacks the branches {missing}")
-            for chunk in tree.iterate(expressions=load_list, step_size=chunk_size, library="np"):
+            entry_of_key = _nominal_entry_of_key(fpath, nominal_tree) if variation else None
+            for chunk, report in tree.iterate(expressions=load_list, step_size=chunk_size, library="np",
+                                              report=True):
                 mask = threshold_mask(chunk, thresholds)
                 if not mask.any():
                     continue
@@ -315,7 +356,14 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
                 n_events[0] += int(mask.sum())
 
                 if enabled:
-                    proba = infer_proba(chunk, mask, ctx)
+                    if kf is None:
+                        folds = None
+                    elif variation:
+                        folds = _variation_folds(kf, sample_name, offsets[fpath], entry_of_key, chunk, mask)
+                    else:
+                        folds = kf.fold_of_index(sample_name, offsets[fpath] + report.tree_entry_start
+                                                 + np.flatnonzero(mask))
+                    proba = infer_proba(chunk, mask, ctx, folds)
                     for j in range(len(ctx["bin_ids"])):
                         rmask = region_mask(
                             proba, ctx["sr_df"].iloc[j], ctx["axes"], ctx["class_names"]
@@ -430,11 +478,11 @@ def run(syst, script_dir, config_env):
                 )
             genweight_mean = require_genweight_mean(sample_info[sample_name].get("genweight_mean"), sample_name)
             nominal = accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size,
-                                                    genweight_mean)
+                                                    genweight_mean, sample_name, tree_name)
             up = accumulate_weighted_sr_yields(files, f"{tree_name}__{up_key}", ctx, weight_branch,
-                                               chunk_size, genweight_mean)
+                                               chunk_size, genweight_mean, sample_name, tree_name)
             down = accumulate_weighted_sr_yields(files, f"{tree_name}__{down_key}", ctx, weight_branch,
-                                                 chunk_size, genweight_mean)
+                                                 chunk_size, genweight_mean, sample_name, tree_name)
 
             if nominal["inclusive"]["n_events"] < 1 or nominal["inclusive"]["sum"] <= 0.0:
                 log(f"    [{sample_name}/{tree_name}] no nominal events after the thresholds -> no entry")

@@ -72,6 +72,7 @@ _BDT_TOOLS_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "BDT"))
 if _BDT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _BDT_TOOLS_DIR)
 import model_io  # noqa: E402
+import kfold  # noqa: E402
 from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean  # noqa: E402
 
 
@@ -272,7 +273,12 @@ def _load_thresholds(bdt_dir, tree_name):
 def _build_tree_context(tree):
     """Return a dict: always has 'thresholds'; has model/region info if enabled."""
     bdt_dir = _bdt_dir_for(tree)
-    ctx = {"thresholds": _load_thresholds(bdt_dir, tree), "regions_enabled": False}
+    # k-fold models (train.py kfold = K): configs from fold0, every MC event scored with the model
+    # of the k-fold block holding it (selections/BDT/kfold.py).
+    kf = kfold.KFoldModels(bdt_dir, log=log) if bdt_dir is not None and kfold.is_kfold_root(bdt_dir) else None
+    if kf is not None:
+        bdt_dir = kf.fold_dirs[0]
+    ctx = {"thresholds": _load_thresholds(bdt_dir, tree), "regions_enabled": False, "kfold": kf}
 
     sr_csv = _sr_csv_for(tree)
     if bdt_dir is None or sr_csv is None:
@@ -298,7 +304,7 @@ def _build_tree_context(tree):
 
     model_pattern = bcfg.get("model_pattern", "{output_root}/{tree_name}_model")
     model_base = model_pattern.format(output_root=bdt_dir, tree_name=tree)
-    model = model_io.load_model(model_base, bcfg, len(class_names), log_message=log)
+    model = None if kf is not None else model_io.load_model(model_base, bcfg, len(class_names), log_message=log)
 
     sr_df = pd.read_csv(sr_csv)
     if sr_df.empty:
@@ -374,7 +380,7 @@ def _threshold_mask(data_np, thresholds):
     return mask
 
 
-def _infer_proba(chunk, mask, ctx):
+def _infer_proba(chunk, mask, ctx, folds=None):
     cols = {}
     for name in ctx["feature_cols"]:
         if name not in chunk:
@@ -389,6 +395,8 @@ def _infer_proba(chunk, mask, ctx):
         drop = [c for c in ctx["decorrelate"] if c in X.columns]
         if drop:
             X = X.drop(columns=drop)
+    if ctx.get("kfold") is not None:
+        return ctx["kfold"].predict(X, folds)
     return model_io.predict_model_proba(ctx["model"], X, ctx["num_classes"])
 
 
@@ -484,6 +492,10 @@ def _compute_ratios(sample_name, ctx):
     ps_sums     = np.zeros((n_slots, N_PS),        dtype=np.float64)
     n_events    = np.zeros(n_slots, dtype=np.int64)
     has_alphas = [False]
+    kf = ctx.get("kfold") if enabled else None
+    if kf is not None:
+        kf.check_files(sample_name, files)
+        offsets = kf.file_offsets(sample_name)
 
     def _accumulate(slot, w, pdf_w, scale_w, ps_w, as_w):
         nom_sum[slot]    += float(w.sum())
@@ -507,7 +519,8 @@ def _compute_ratios(sample_name, ctx):
             # LHEPdfWeightAlphaS and nLHEPdfWeight are optional (files converted before
             # these branches existed); alpha_s is folded into the PDF uncertainty when available.
             actual = load_list + [b for b in ("LHEPdfWeightAlphaS", "nLHEPdfWeight") if b in avail]
-            for chunk in tree.iterate(expressions=actual, step_size=CHUNK_SIZE, library="np"):
+            for chunk, report in tree.iterate(expressions=actual, step_size=CHUNK_SIZE, library="np",
+                                              report=True):
                 mask = _threshold_mask(chunk, thresholds)
                 if not mask.any():
                     continue
@@ -535,7 +548,9 @@ def _compute_ratios(sample_name, ctx):
                 _accumulate(0, w_pu, pdf_w, scale_w, ps_w, as_w)  # inclusive
 
                 if enabled:
-                    proba = _infer_proba(chunk, mask, ctx)
+                    folds = (kf.fold_of_index(sample_name, offsets[fpath] + report.tree_entry_start
+                                              + np.flatnonzero(mask)) if kf is not None else None)
+                    proba = _infer_proba(chunk, mask, ctx, folds)
                     for j in range(len(ctx["bin_ids"])):
                         rmask = _region_mask(
                             proba, ctx["sr_df"].iloc[j], ctx["axes"], ctx["class_names"]

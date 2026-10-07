@@ -23,6 +23,7 @@ import sys
 import matplotlib.pyplot as plt
 import mplhep as hep
 import numpy as np
+import pandas as pd
 import uproot
 
 plt.rcParams["mathtext.fontset"] = "cm"
@@ -32,6 +33,8 @@ plt.style.use(hep.style.CMS)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(_SCRIPT_DIR)
 _QCD_EST_PATH = os.path.join(_ROOT_DIR, "background_estimation", "qcd_est.py")
+sys.path.insert(0, os.path.join(_ROOT_DIR, "selections", "BDT"))
+import kfold  # noqa: E402
 
 
 def log_message(message: str) -> None:
@@ -143,6 +146,24 @@ def _predict(q, X_raw, model_branches, clip_ranges, log_transform, decorrelate, 
     return q._predict_model_proba(model, X_model, context="sr_sensitivity")
 
 
+def _load_kfold_events(q, branches, thresholds):
+    """k-fold models: every MC event of the class_groups samples passing `thresholds`, each with
+    its out-of-fold class probabilities (all entries read, kfold.KFoldModels.read_sample).
+    Returns (the DataFrame of qcd_est.load_test_data with `branches`, the probabilities)."""
+    models = kfold.KFoldModels(q.BDT_ROOT, log=log_message)
+    frames, probas = [], []
+    for name in [s for members in q.CLASS_GROUPS.values() for s in members]:
+        r = models.read_sample(name, q.SAMPLE_INFO[name], branches, thresholds)
+        df = pd.DataFrame(r["columns"])
+        df["weight"] = r["weight"] * q.LUMI
+        df["sample_name"] = name
+        df["group_name"] = q.SAMPLE_TO_GROUP[name]
+        frames.append(df)
+        probas.append(r["proba"])
+        log_message(f"  {name}: {len(df)} events (all entries, k-fold scores)")
+    return pd.concat(frames, ignore_index=True), np.concatenate(probas)
+
+
 def _build_cut_masks(q, X_raw, proba, thresholds, row, axis_names):
     """One boolean mask per threshold cut and per SR score axis, so any cut can be dropped."""
     cut_masks = {
@@ -228,14 +249,16 @@ def fill_data_hists(target: dict, cfg: dict, output_root: str, file_index: int) 
     }
     decorrelate = q.cfg.get(tree, {}).get("decorrelate", [])
     blind_vars = {b for p in plots.values() for b in p["blind"]}
-    load_branches = sorted(set(model_branches) | set(thresholds) | set(decorrelate) | set(plots) | blind_vars)
+    load_branches = sorted(set(model_branches) | set(thresholds) | set(decorrelate) | set(plots) | blind_vars
+                           | ({"event"} if q.KFOLD else set()))
     # Cuts that every data plot keeps can be applied before the (expensive) BDT inference.
     dropped = {c for p in plots.values() for c in p["drop_cuts"]}
     prefilter = {k: v for k, v in thresholds.items() if k not in dropped}
 
     signal_regions, axis_names = q._load_signal_regions()
     row = signal_regions[signal_regions["bin_index"] == bin_index].iloc[0]
-    model = q._load_model()
+    # k-fold models: data events (never trained on) are scored by event number (kfold.data_fold).
+    model = kfold.KFoldModels(q.BDT_ROOT, log=log_message) if q.KFOLD else q._load_model()
     counts = {v: np.zeros(int(cfg["variables"][v]["bins"])) for v in plots}
     n_read = n_pre = 0
     with uproot.open(path) as f:
@@ -245,7 +268,10 @@ def fill_data_hists(target: dict, cfg: dict, output_root: str, file_index: int) 
             n_pre += len(chunk)
             if chunk.empty:
                 continue
-            proba = _predict(q, chunk, model_branches, clip_ranges, log_transform, decorrelate, model)
+            if q.KFOLD:
+                proba = model.predict(model.model_inputs(chunk), model.data_fold(chunk["event"].to_numpy()))
+            else:
+                proba = _predict(q, chunk, model_branches, clip_ranges, log_transform, decorrelate, model)
             cut_masks, _ = _build_cut_masks(q, chunk, proba, thresholds, row, axis_names)
             for var, plot_cfg in plots.items():
                 mask = _data_plot_mask(cut_masks, chunk, var, plot_cfg, overlay["blind_window"], is_data=True)
@@ -307,13 +333,22 @@ def plot_target(target: dict, var_cfg: dict, output_root: str, overlay: dict | N
         raise RuntimeError(f"SR{bin_index} not found in {q.SIGNAL_REGION_CSV_PATH}")
     row = rows.iloc[0]
 
-    df = q.load_test_data(load_branches)
+    if q.KFOLD:
+        # k-fold models: every MC event with its out-of-fold score, as in qcd_est.py. Only the cuts
+        # on variables that are not plotted are applied while reading (the N-1 plots need the events
+        # failing a plotted variable's cut).
+        load_branches = sorted(set(thresholds) | set(decorrelate) | set(raw_vars))
+        prefilter = {k: c for k, c in thresholds.items() if k not in variables}
+        df, proba = _load_kfold_events(q, load_branches, prefilter)
+    else:
+        df = q.load_test_data(load_branches)
     group_labels = df["group_name"].astype(str).to_numpy()
     w = df["weight"].to_numpy(dtype=float)
     X_raw = df[load_branches]
 
-    log_message("Running model prediction")
-    proba = _predict(q, X_raw, model_branches, clip_ranges, log_transform, decorrelate, q._load_model())
+    if not q.KFOLD:
+        log_message("Running model prediction")
+        proba = _predict(q, X_raw, model_branches, clip_ranges, log_transform, decorrelate, q._load_model())
     cut_masks, score_cuts = _build_cut_masks(q, X_raw, proba, thresholds, row, axis_names)
 
     def selection_mask(exclude: str | None = None) -> np.ndarray:

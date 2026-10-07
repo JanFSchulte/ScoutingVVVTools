@@ -82,6 +82,7 @@ from model_io import (
     load_model as _shared_load_model,
     predict_model_proba as _shared_predict_model_proba,
 )
+import kfold
 
 
 # -------------------- Logging --------------------
@@ -174,10 +175,14 @@ TEST_REFERENCE_QCD_EST_FULL = os.path.join(BDT_ROOT, "test_reference_qcd_est_ful
 
 
 # -------------------- Trained-model config copies --------------------
-cfg = _load_json(os.path.join(BDT_ROOT, "config.json"))
-br_cfg = _load_json(os.path.join(BDT_ROOT, "branch.json"))
-sel_cfg = _load_json(os.path.join(BDT_ROOT, "selection.json"))
-test_meta = _load_json(os.path.join(BDT_ROOT, "test_ranges.json"))
+# A k-fold training (train.py kfold = K; rotations in bdt_root/fold0 ... fold<K-1>): the yields come
+# from every MC event with its out-of-fold score from the score cache (score_kfold.py).
+KFOLD = kfold.is_kfold_root(BDT_ROOT)
+_CFG_DIR = os.path.join(BDT_ROOT, "fold0") if KFOLD else BDT_ROOT
+cfg = _load_json(os.path.join(_CFG_DIR, "config.json"))
+br_cfg = _load_json(os.path.join(_CFG_DIR, "branch.json"))
+sel_cfg = _load_json(os.path.join(_CFG_DIR, "selection.json"))
+test_meta = _load_json(os.path.join(_CFG_DIR, "test_ranges.json"))
 
 _sample_cfg_path = cfg["sample_config"]
 if not os.path.isabs(_sample_cfg_path):
@@ -828,6 +833,25 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
     del dfs
     gc.collect()
     return df_all
+
+
+def load_kfold_test_data(branches: list[str], thresholds: dict):
+    """k-fold models: every MC event of the class_groups samples from the score cache that passes
+    `thresholds` (the non-ABCD thresholds, applied while loading to keep the memory down; the
+    cache holds the events passing the non-mass thresholds, each with its out-of-fold
+    probabilities validated against the fold references by score_kfold.py). Returns (the
+    DataFrame of load_test_data with the given branches, the class probabilities)."""
+    models = kfold.KFoldModels(BDT_ROOT, log=log_message)
+    samples = [s for members in CLASS_GROUPS.values() for s in members]
+    log_message(f"Loading the k-fold score cache: {models.k} folds, {len(samples)} samples")
+    scores = kfold.load_scores(models, samples, branches=branches, thresholds=thresholds, log=log_message)
+    df = pd.DataFrame(scores["columns"])
+    df["class_idx"] = scores["class_idx"].astype(int)
+    df["weight"] = scores["weight"] * LUMI
+    df["sample_name"] = scores["sample_name"].astype(str)
+    df["group_name"] = [SAMPLE_TO_GROUP[name] for name in df["sample_name"]]
+    log_message(f"Loaded MC events (all entries, k-fold scores): {len(df)}")
+    return df, scores["proba"]
 
 
 # -------------------- Model loading --------------------
@@ -1560,7 +1584,7 @@ def main() -> None:
     # branch.json), and the optional A-region shape branches. Model inference
     # still uses only model_branches.
     load_branches = sorted(
-        set(model_branches)
+        (set() if KFOLD else set(model_branches))  # k-fold: the cached scores replace inference
         | set(thresholds.keys())
         | set(decorrelate)
         | set(A_REGION_SHAPE_BRANCHES)
@@ -1583,7 +1607,11 @@ def main() -> None:
     log_message(f"Output directory: {OUTPUT_DIR}")
 
     step_start = time.perf_counter()
-    df_all = load_test_data(load_branches)
+    proba_all = None
+    if KFOLD:
+        df_all, proba_all = load_kfold_test_data(load_branches, bdt_thresholds)
+    else:
+        df_all = load_test_data(load_branches)
     log_message(
         f"Finished loading MC test data: events={len(df_all)}, columns={len(df_all.columns)}, "
         f"dataframe_size={_dataframe_size_text(df_all)}, elapsed={_format_seconds(step_start)}"
@@ -1602,8 +1630,8 @@ def main() -> None:
     del df_all
     gc.collect()
 
-    clf = _load_model()
-    have_full_reference = os.path.exists(TEST_REFERENCE_QCD_EST_FULL)
+    clf = None if KFOLD else _load_model()
+    have_full_reference = not KFOLD and os.path.exists(TEST_REFERENCE_QCD_EST_FULL)
     log_message(
         f"Prediction reference availability: full_reference={have_full_reference}, "
         f"full_path={TEST_REFERENCE_QCD_EST_FULL}, "
@@ -1620,7 +1648,10 @@ def main() -> None:
         f"Non-ABCD threshold mask: pass={n_pass} of {events_before_filter}, "
         f"elapsed={_format_seconds(step_start)}"
     )
-    if have_full_reference:
+    if KFOLD:
+        proba = proba_all[mask_values]
+        del proba_all
+    elif have_full_reference:
         # Only the events passing the non-ABCD thresholds enter the ABCD regions, so only they are
         # predicted (until 2026-10-07 every test event was, ~5x more in boosted3); the validation
         # compares their probabilities with the same rows of the full reference, and the sample

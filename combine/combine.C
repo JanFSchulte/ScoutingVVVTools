@@ -369,8 +369,13 @@ ClassRegistry loadRegistryFromBdtRoot(const std::string& bdt_root,
                                       const std::string& label) {
     ClassRegistry reg;
 
+    // A k-fold training (train.py kfold) keeps its config copies in the rotation directories,
+    // which share one configuration: read fold0's.
+    const fs::path cfg_dir = (!fs::exists(fs::path(bdt_root) / "config.json") &&
+                              fs::exists(fs::path(bdt_root) / "fold0" / "config.json"))
+                                 ? fs::path(bdt_root) / "fold0" : fs::path(bdt_root);
     const std::string bdt_config_path =
-        fs::weakly_canonical(fs::path(bdt_root) / "config.json").string();
+        fs::weakly_canonical(cfg_dir / "config.json").string();
     JsonValue bdtJson = simple_json::parseFile(bdt_config_path);
 
     // sample_config is relative to selections/BDT, as in train.py and qcd_est.py: the nearest
