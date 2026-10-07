@@ -378,13 +378,14 @@ def _parallel_map_ordered(fn, items):
 
 
 # -------------------- Candidate evaluation --------------------
-def evaluate_region(ctx, lo, hi, S_v=None, B_v=None, B2_v=None):
+def evaluate_region(ctx, lo, hi, S_v=None, B_v=None, B2_v=None, S_e_v=None, B_e_v=None):
     """Build a candidate dict, or None if it fails the acceptance constraints.
 
     Fast path: ``top_intervals_on_axis`` already returns the exact weighted S and
     B of each child rectangle (the other-axes mask is applied and the interval is
-    half-open identically to ``rect_mask``), so when they are supplied and no
-    entry-count thresholds are active we skip the O(N*D) ``rect_stats`` recompute.
+    half-open identically to ``rect_mask``), and with entry-count thresholds also
+    its signal / background MC event counts, so when they are supplied we skip the
+    O(N*D) ``rect_stats`` recompute.
     Mirrors signal_region.py:_evaluate_region(S_v, B_v) (~1043-1066).
     """
     lo = [float(v) for v in lo]
@@ -395,13 +396,15 @@ def evaluate_region(ctx, lo, hi, S_v=None, B_v=None, B2_v=None):
         for flo, fhi in ctx.forbidden:
             if overlap(lo, hi, flo, fhi, ctx.D):
                 return None
+    need_counts = MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0
     need_stats = (S_v is None or B_v is None or B2_v is None) or \
-        MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0
+        (need_counts and (S_e_v is None or B_e_v is None))
     if need_stats:
         S, _sS, B, sB, S_e, B_e = rect_stats(ctx, lo, hi)
         B2 = sB * sB + floor_variance(ctx, rect_mask(ctx, lo, hi))
     else:
-        S, B, B2, S_e, B_e = float(S_v), float(B_v), float(B2_v), -1, -1
+        S, B, B2 = float(S_v), float(B_v), float(B2_v)
+        S_e, B_e = (int(S_e_v), int(B_e_v)) if need_counts else (-1, -1)
     if B < MIN_BKG_WEIGHT or S <= MIN_SIGNAL_WEIGHT:
         return None
     if (MIN_SIGNAL_ENTRIES > 0 and S_e < MIN_SIGNAL_ENTRIES) or \
@@ -419,7 +422,9 @@ def top_intervals_on_axis(ctx, d, lo, hi, edges, top_n):
 
     Reimplementation of signal_region.py:_top_intervals_on_axis (~1080-1148).
     Cost is O(n_events) for the other-axes mask plus a small K x K vectorised
-    Z^2 grid (K = len(edges)).
+    Z^2 grid (K = len(edges)). Each interval is returned as (low, high, S, B, B2, Z,
+    S_entries, B_entries); the MC event counts are histogrammed only when an
+    entry-count threshold is active (else -1).
     """
     m = np.ones(ctx.n_events, dtype=bool)
     for dd in range(ctx.D):
@@ -451,6 +456,12 @@ def top_intervals_on_axis(ctx, d, lo, hi, edges, top_n):
     S_mat = pS[b_idx] - pS[a_idx]
     B_mat = pB[b_idx] - pB[a_idx]
     B2_mat = pB2[b_idx] - pB2[a_idx]
+    count_entries = MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0
+    if count_entries:
+        hNs, _ = np.histogram(v_d[m & ctx.is_sig], bins=edges)
+        hNb, _ = np.histogram(v_d[m & ctx.is_bkg], bins=edges)
+        pNs = np.r_[0, np.cumsum(hNs)]
+        pNb = np.r_[0, np.cumsum(hNb)]
     if ZERO_COUNT_FLOOR:
         for mc, alpha2 in zip(ctx.bkg_class_masks, ctx.floor_alpha2):
             mm = m & mc
@@ -497,6 +508,8 @@ def top_intervals_on_axis(ctx, d, lo, hi, edges, top_n):
             float(B_mat[a_best, b_best]),
             float(B2_mat[a_best, b_best]),
             float(np.sqrt(Z2[a_best, b_best])),
+            int(pNs[b_best] - pNs[a_best]) if count_entries else -1,
+            int(pNb[b_best] - pNb[a_best]) if count_entries else -1,
         ))
         if len(intervals) >= take:
             break
@@ -608,22 +621,22 @@ def coarse_beam_search(ctx, forbidden_boxes=()):
                 ctx, d, item["lo"], item["hi"], axis_edges[d], TOP_K
             )
             children = []
-            for low_d, high_d, S_v, B_v, B2_v, _Z in intervals:
+            for low_d, high_d, S_v, B_v, B2_v, _Z, S_e, B_e in intervals:
                 lo = list(item["lo"])
                 hi = list(item["hi"])
                 lo[d] = low_d
                 hi[d] = high_d
-                children.append((lo, hi, S_v, B_v, B2_v))
+                children.append((lo, hi, S_v, B_v, B2_v, S_e, B_e))
             return children
 
         produced = []
         for children in _parallel_map_ordered(_task, tasks):
-            for lo, hi, S_v, B_v, B2_v in children:
+            for lo, hi, S_v, B_v, B2_v, S_e, B_e in children:
                 key = _region_key(lo, hi)
                 if key in pool:
                     produced.append(pool[key])
                     continue
-                item = evaluate_region(ctx, lo, hi, S_v, B_v, B2_v)
+                item = evaluate_region(ctx, lo, hi, S_v, B_v, B2_v, S_e, B_e)
                 if item is not None:
                     pool[key] = item
                     produced.append(item)
@@ -755,7 +768,7 @@ def fine_refine_selected(ctx, sel_los, sel_his):
             for d in range(ctx.D):
                 edges = _local_edges(los[i][d], his[i][d], d)
                 intervals = top_intervals_on_axis(ctx, d, los[i], his[i], edges, TOP_K)
-                for low_d, high_d, S_v, B_v, _B2_v, _Z in intervals:
+                for low_d, high_d, S_v, B_v, _B2_v, _Z, S_e, B_e in intervals:
                     if B_v < MIN_BKG_WEIGHT or S_v <= MIN_SIGNAL_WEIGHT:
                         continue
                     lo_alt = list(los[i]); hi_alt = list(his[i])
@@ -763,7 +776,6 @@ def fine_refine_selected(ctx, sel_los, sel_his):
                     if not _valid_region(lo_alt, hi_alt, ctx.D):
                         continue
                     if MIN_SIGNAL_ENTRIES > 0 or MIN_BKG_ENTRIES > 0:
-                        _S, _sS, _B, _sB, S_e, B_e = rect_stats(ctx, lo_alt, hi_alt)
                         if S_e < MIN_SIGNAL_ENTRIES or B_e < MIN_BKG_ENTRIES:
                             continue
                     if _others_ok(i, lo_alt, hi_alt):
@@ -853,14 +865,17 @@ def select_branch_bound(ctx, candidates, target_n, incumbent=None):
                 best_by_size[size] = (score, sub)
 
     def _greedy_from_first(first):
+        # Stop at target_n picks (checked before each addition: with target_n = 1 the old
+        # check after the append never fired, and the greedy set of every compatible region
+        # became the incumbent).
         picks = [first]
         for i in range(n):
+            if len(picks) >= target_n:
+                break
             if i == first:
                 continue
             if _compatible(i, picks):
                 picks.append(i)
-                if len(picks) == target_n:
-                    break
         return picks
 
     M = min(n, max(8 * target_n, 64))

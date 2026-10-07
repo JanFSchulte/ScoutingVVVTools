@@ -190,7 +190,8 @@ CLASS_GROUPS = cfg["class_groups"]
 CLASS_NAMES = list(CLASS_GROUPS.keys())
 NUM_CLASSES = len(CLASS_NAMES)
 DEFAULT_AXIS_NAMES = CLASS_NAMES[: max(1, NUM_CLASSES - 1)]
-INFERENCE_THREADS = max(1, min(32, os.cpu_count() or 1))
+# CPUs actually allocated (a SLURM job's allocation, not the node's core count), as in train.py.
+INFERENCE_THREADS = max(1, min(32, len(os.sched_getaffinity(0))))
 XGB_PREDICT_BATCH_TARGET_BYTES = 512 * 1024 * 1024
 XGB_PREDICT_MIN_BATCH_ROWS = 100_000
 XGB_PREDICT_PROGRESS_SECONDS = 30.0
@@ -577,7 +578,11 @@ def _predict_model_proba(model, X, context: str = "model"):
     return _shared_predict_model_proba(model, X, NUM_CLASSES)
 
 
-def _compare_prediction_reference(path, feature_names, sample_labels, class_idx, weights, proba):
+def _compare_prediction_reference(path, feature_names, sample_labels, class_idx, weights, proba,
+                                  proba_rows=None):
+    """Compare with a stored prediction reference. Sample labels, class labels and weights are
+    compared for every row; proba holds the probabilities of the rows selected by the boolean
+    mask proba_rows (all rows when None) and is compared with the same reference rows."""
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Prediction reference not found: {path}. Re-run train.py before qcd_est.py."
@@ -646,11 +651,32 @@ def _compare_prediction_reference(path, feature_names, sample_labels, class_idx,
     #        "Prediction reference mismatch for qcd_est weights: "
     #        f"max_abs_diff={diff:.6g}, rtol={weight_rtol}, atol={weight_atol}"
     #    )
-    log_message(f"Weight comparison passed: elapsed={_format_seconds(step_start)}")
+    # The weight check above is disabled: report the deviation without enforcing it.
+    if cur_weights.shape != ref_weights.shape:
+        log_warning(
+            f"Weight comparison not enforced: shapes differ, current={cur_weights.shape}, "
+            f"reference={ref_weights.shape}"
+        )
+    else:
+        n_off = int(np.count_nonzero(~np.isclose(cur_weights, ref_weights, rtol=weight_rtol, atol=weight_atol)))
+        max_diff = float(np.max(np.abs(cur_weights - ref_weights))) if cur_weights.size else 0.0
+        log_message(
+            f"Weight comparison not enforced: rows outside tolerance={n_off} of {cur_weights.size}, "
+            f"max_abs_diff={max_diff:.6g}, elapsed={_format_seconds(step_start)}"
+        )
 
     step_start = time.perf_counter()
     log_message("Loading reference probabilities")
     ref_proba = ref["proba"].astype(float)
+    if proba_rows is not None:
+        rows = np.asarray(proba_rows, dtype=bool)
+        if rows.shape[0] != ref_proba.shape[0]:
+            raise RuntimeError(
+                "Prediction reference mismatch for qcd_est rows: "
+                f"current={rows.shape[0]}, reference={ref_proba.shape[0]}"
+            )
+        ref_proba = ref_proba[rows]
+        log_message(f"Comparing the probabilities of {int(rows.sum())} of {rows.shape[0]} rows")
     cur_proba = np.asarray(proba, dtype=float)
     proba_rtol = float(ref["proba_rtol"])
     proba_atol = float(ref["proba_atol"])
@@ -1583,24 +1609,37 @@ def main() -> None:
         f"full_path={TEST_REFERENCE_QCD_EST_FULL}, "
         f"full_size={_file_size_text(TEST_REFERENCE_QCD_EST_FULL) if have_full_reference else 'missing'}"
     )
-    proba_full = None
     proba = None
+    log_message("Applying non-ABCD thresholds")
+    events_before_filter = len(X_raw)
+    step_start = time.perf_counter()
+    filter_mask = _threshold_mask(X_raw, bdt_thresholds, apply_to_sentinel=True)
+    mask_values = filter_mask.values
+    n_pass = int(np.count_nonzero(mask_values))
+    log_message(
+        f"Non-ABCD threshold mask: pass={n_pass} of {events_before_filter}, "
+        f"elapsed={_format_seconds(step_start)}"
+    )
     if have_full_reference:
+        # Only the events passing the non-ABCD thresholds enter the ABCD regions, so only they are
+        # predicted (until 2026-10-07 every test event was, ~5x more in boosted3); the validation
+        # compares their probabilities with the same rows of the full reference, and the sample
+        # labels, class labels and weights on all rows.
         log_message(
-            f"Validating full test-set prediction reference: events={len(X_raw)}, "
-            f"model_branches={len(model_branches)}"
+            f"Validating full test-set prediction reference on the events passing the non-ABCD "
+            f"thresholds: events={n_pass} of {events_before_filter}, model_branches={len(model_branches)}"
         )
         step_start = time.perf_counter()
-        X_model_full = X_raw[model_branches].copy()
+        X_model_full = X_raw.loc[mask_values, model_branches].copy()
         log_message(
-            f"Copied full test-set model features: shape={X_model_full.shape}, "
+            f"Copied filtered test-set model features: shape={X_model_full.shape}, "
             f"size={_dataframe_size_text(X_model_full)}, elapsed={_format_seconds(step_start)}"
         )
 
         step_start = time.perf_counter()
         X_model_full = standardize_X(X_model_full, clip_ranges, log_transform)
         log_message(
-            f"Standardised full test-set model features: shape={X_model_full.shape}, "
+            f"Standardised filtered test-set model features: shape={X_model_full.shape}, "
             f"elapsed={_format_seconds(step_start)}"
         )
 
@@ -1608,24 +1647,24 @@ def main() -> None:
         X_model_full = _drop_decorrelated_features(X_model_full, decorrelate)
         if decorrelate:
             log_message(
-                f"Removed decorrelated full test-set features: {decorrelate}, "
+                f"Removed decorrelated filtered test-set features: {decorrelate}, "
                 f"shape={X_model_full.shape}, elapsed={_format_seconds(step_start)}"
             )
         else:
             log_message(
-                f"No decorrelated full test-set features to remove: shape={X_model_full.shape}, "
+                f"No decorrelated filtered test-set features to remove: shape={X_model_full.shape}, "
                 f"elapsed={_format_seconds(step_start)}"
             )
 
         step_start = time.perf_counter()
         log_message(
-            f"Running full test-set model prediction: X_shape={X_model_full.shape}, "
+            f"Running filtered test-set model prediction: X_shape={X_model_full.shape}, "
             f"model_type={type(clf).__name__}"
         )
-        proba_full = _predict_model_proba(clf, X_model_full, context="full test-set")
+        proba = _predict_model_proba(clf, X_model_full, context="filtered test-set")
         log_message(
-            f"Finished full test-set model prediction: proba_shape={proba_full.shape}, "
-            f"proba_size={_array_size_text(proba_full)}, elapsed={_format_seconds(step_start)}"
+            f"Finished filtered test-set model prediction: proba_shape={proba.shape}, "
+            f"proba_size={_array_size_text(proba)}, elapsed={_format_seconds(step_start)}"
         )
         step_start = time.perf_counter()
         log_message("Comparing full test-set prediction reference")
@@ -1637,35 +1676,15 @@ def main() -> None:
             sample_labels,
             y,
             w,
-            proba_full,
+            proba,
+            proba_rows=mask_values,
         )
         log_message(f"Finished full test-set reference comparison: elapsed={_format_seconds(step_start)}")
         step_start = time.perf_counter()
         del X_model_full
         gc.collect()
-        log_message(
-            "Released full test-set model features; keeping probabilities for filtered reuse: "
-            f"elapsed={_format_seconds(step_start)}"
-        )
+        log_message(f"Released filtered test-set model features: elapsed={_format_seconds(step_start)}")
 
-    log_message("Applying non-ABCD thresholds")
-    events_before_filter = len(X_raw)
-    step_start = time.perf_counter()
-    filter_mask = _threshold_mask(X_raw, bdt_thresholds, apply_to_sentinel=True)
-    if proba_full is not None:
-        mask_values = filter_mask.values
-        if int(np.count_nonzero(mask_values)) == len(mask_values):
-            proba = proba_full
-            proba_full = None
-        else:
-            proba = proba_full[mask_values].copy()
-            del proba_full
-        gc.collect()
-        log_message(
-            f"Reused full test-set probabilities for filtered events: "
-            f"shape={proba.shape}, size={_array_size_text(proba)}, "
-            f"elapsed={_format_seconds(step_start)}"
-        )
     X_raw, y, w, sample_labels = filter_X(
         X_raw,
         y,
