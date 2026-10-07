@@ -1,0 +1,23 @@
+{
+  "lumi": 255.8,
+  "bdt_root": "../selections/BDT/boosted2_leptonic_1lep",
+  "signal_region_csv": "../selections/signal_region/output/boosted2_leptonic_1lep_hist/signal_region.csv",
+  "output_dir": "./output/boosted2_leptonic_1lep",
+  "root_file_name": "qcd_abcd_yields.root",
+  "abcd_branches": {
+    "boosted2_leptonic_1lep": [
+      "ScoutingFatPFJetRecluster_msoftdrop_1"
+    ]
+  },
+  "a_region_shape_branches": {
+    "boosted2_leptonic_1lep": [
+      "ScoutingPFJetRecluster2_scoutUParT_probb_max",
+      "ScoutingFatPFJetRecluster_VvsQCD_1",
+      "ScoutingFatPFJetRecluster_VvsQCD_2",
+      "ScoutingFatPFJetRecluster_WvsQCD_1",
+      "ScoutingFatPFJetRecluster_WvsQCD_2"
+    ]
+  },
+  "abcd_sideband_mode": "annulus",
+  "abcd_sideband_width": 0.05
+}

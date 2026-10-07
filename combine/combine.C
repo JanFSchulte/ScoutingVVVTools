@@ -1,15 +1,16 @@
 // combine.C
 //
 // Build CMS combine datacards from qcd_est.py output and run Significance +
-// AsymptoticLimits on the Asimov data (sum of the process rates). Each input
-// ROOT file is one channel with its matching BDT output directory; channels
-// are concatenated with combineCards.py. Every channel card is a one-bin-per-SR
-// shape card whose histogram errors carry the MC statistics (sum w^2, test
-// split) for autoMCStats. The lnN nuisances are the per-sample-ratio ones
-// (theory, pileup, JES, JER, JMS, JMR), lumi and trigger on the MC processes,
-// and the per-channel ABCD non-closure and B/C/D statistics on the ABCD QCD
-// prediction; see README.md. Stored ROOT covariance blocks can optionally be
-// injected as eigen-decomposed Gaussian shape nuisances instead of autoMCStats.
+// AsymptoticLimits. Each input ROOT file is one channel with its matching
+// BDT output directory; channels are concatenated with combineCards.py.
+// Each SR is a one-bin shape channel. By default the finite MC statistics of
+// every process enter through autoMCStats (template bin errors = sqrt(sum w^2)
+// from qcd_est.py), background classes with zero MC events in an SR get a
+// 'gmN 0 alpha' zero-count floor, and the ABCD QCD prediction carries per-channel
+// stat and non-closure lnN nuisances. The per-sample yield ratios of the systematics
+// scripts (theory, pileup, JES, JER, JMS, JMR) give per-SR lnN rows, and lumi and
+// trigger are flat lnN on the MC processes. Stored ROOT covariance blocks can instead
+// be injected as eigen-decomposed Gaussian shape nuisances (use_root_covariance).
 //
 // Invocation follows the other C++ tools: the binary reads its config from
 // $COMBINE_CONFIG_PATH (or ./config.json). Any command-line arguments are
@@ -125,23 +126,25 @@ std::string shellQuote(const std::string& s) {
     return out;
 }
 
-// -------------------- Systematic ratio inputs --------------------
-// Up/down yield ratios of one MC sample in one channel (tree), inclusive and
-// per signal region (keyed by bin_index), from the *_syst_yields.json outputs
-// of the systematic scripts.
+// -------------------- Systematic ratio nuisances --------------------
+// Up/down yield ratios of one sample in one region (inclusive or one SR).
 struct RatioPair {
     double up = 1.0;
     double down = 1.0;
 };
+
+// Ratios of one sample in one channel: inclusive + per SR (keyed by bin_index).
 struct RatioSet {
     RatioPair inclusive;
     std::map<int, RatioPair> regions;
+    std::string sr_csv_hash;   // SRs the per-SR ratios were computed for (see checkSrProvenance)
 };
+
 // sample -> channel -> ratios of one nuisance.
 using SampleRatios = std::map<std::string, std::map<std::string, RatioSet>>;
 
-// lnN nuisances built from per-sample yield ratios: the process kappa in each
-// SR is the yield-weighted mean of its samples' ratios.
+// lnN nuisances built from per-sample yield ratios (the *_syst_yields.json of the systematics
+// scripts): the process kappa in each SR is the yield-weighted mean of its samples' ratios.
 struct RatioNuisanceSpec {
     const char* nuisance;    // datacard row name (and enabled_nuisances name)
     const char* config_key;  // config.json key of the *_syst_yields.json path
@@ -161,41 +164,16 @@ const RatioNuisanceSpec kRatioNuisances[] = {
     {"jms",           "jms_syst_json",    "mode 13 (jms_syst.py)",    "jms_up",    "jms_down",    false},
     {"jmr",           "jmr_syst_json",    "mode 14 (jmr_syst.py)",    "jmr_up",    "jmr_down",    false},
 };
-// The other nuisances: lumi and trigger (flat lnN on the MC processes), mcstat
-// (autoMCStats), and the per-channel ABCD rows abcd_nonclosure_<channel> and
-// abcd_mcstat_<channel>.
-const char* const kOtherNuisances[] = {"lumi", "trigger", "mcstat", "abcd_nonclosure", "abcd_mcstat"};
-// Process name of the ABCD QCD prediction (distinct from an MC-true QCD class
-// process bkg_<class>).
-const char* kAbcdQcdProcess = "bkg_qcd_abcd";
+// The other nuisances: lumi and trigger (flat lnN on the MC processes), autoMCStats, the
+// zero-count floors, and the ABCD QCD rows.
+const char* const kOtherNuisances[] = {"lumi", "trigger", "autoMCStats", "zero_count_floor",
+                                       "qcd_abcd_stat", "qcd_abcd_nonclosure"};
 
-// -------------------- Config --------------------
-struct ChannelSpec {
-    std::string name;
-    std::string root_file;
-    std::string bdt_root;
-};
-
-struct AppConfig {
-    std::vector<ChannelSpec> channels;
-    std::string output_dir;
-    std::string combine_cmd = "combine";
-    std::string combine_cards_cmd = "combineCards.py";
-    double eigen_rel_cutoff = 1e-10;
-    bool use_root_covariance = false;
-    bool rescale_shape_modes_to_positive = true;
-    bool keep_work = true;
-    std::string work_dir;  // resolved under output_dir
-    // Fractional luminosity and trigger uncertainties, symmetric lnN on every
-    // MC process (not on the ABCD QCD prediction).
-    double lumi_unc = 0.0;
-    double trigger_unc = 0.0;
-    // autoMCStats threshold on the effective number of MC events per bin.
-    int mc_stat_threshold = 10;
-    // Per-sample ratios of each enabled kRatioNuisances nuisance.
-    std::map<std::string, SampleRatios> ratios;
-    // Nuisance names to include in datacards.  Empty set = all enabled (default).
-    std::set<std::string> enabled_nuisances;
+// Kappa of one process in one SR (an asymmetric lnN entry down/up).
+struct Kappa {
+    double up = 1.0;
+    double down = 1.0;
+    bool active = false;
 };
 
 // Returns true when a nuisance should be emitted: always when the enabled set
@@ -230,11 +208,43 @@ SampleRatios loadSampleRatios(const JsonValue& payload, const RatioNuisanceSpec&
             for (const auto& reg_kv : v.at("regions").asObject()) {
                 rs.regions[std::stoi(reg_kv.first)] = readRatioPair(reg_kv.second, spec);
             }
+            rs.sr_csv_hash = v.getStringOr("sr_csv_hash", "");
             out[sample_kv.first][tree_kv.first] = std::move(rs);
         }
     }
     return out;
 }
+
+// -------------------- Config --------------------
+struct ChannelSpec {
+    std::string name;
+    std::string root_file;
+    std::string bdt_root;
+};
+
+struct AppConfig {
+    std::vector<ChannelSpec> channels;
+    std::string output_dir;
+    std::string combine_cmd = "combine";
+    std::string combine_cards_cmd = "combineCards.py";
+    double eigen_rel_cutoff = 1e-10;
+    bool use_root_covariance = false;
+    bool rescale_shape_modes_to_positive = true;
+    bool keep_work = true;
+    std::string work_dir;  // resolved under output_dir
+    // Fractional luminosity and trigger uncertainties, symmetric lnN on every MC process (not on
+    // the data-driven ABCD QCD); each must be positive when its nuisance is enabled.
+    double lumi_unc = 0.0;
+    double trigger_unc = 0.0;
+    // autoMCStats event threshold (combine's default 10).
+    int mc_stat_threshold = 10;
+    // Per-sample ratios of every enabled kRatioNuisances nuisance (nuisance name -> ratios).
+    std::map<std::string, SampleRatios> ratios;
+    // Nuisance names to include in datacards.  Empty set = all enabled (default).
+    std::set<std::string> enabled_nuisances;
+    // Scenario scopes to run (combined / class / sample).  Empty set = all (default).
+    std::set<std::string> scenario_scopes;
+};
 
 AppConfig loadAppConfig() {
     const std::string path = resolveConfigPath(kAppConfigPath, kAppConfigEnvVar);
@@ -282,7 +292,10 @@ AppConfig loadAppConfig() {
         for (const auto& item : payload.at("enabled_nuisances").asArray()) {
             const std::string name = item.asString();
             if (!known.count(name)) {
-                throw std::runtime_error("enabled_nuisances lists unknown nuisance '" + name + "'");
+                std::string list;
+                for (const auto& k : known) list += (list.empty() ? "" : ", ") + k;
+                throw std::runtime_error("config.json enabled_nuisances: unknown nuisance '" + name +
+                                         "' (known: " + list + ")");
             }
             cfg.enabled_nuisances.insert(name);
         }
@@ -315,16 +328,21 @@ AppConfig loadAppConfig() {
     if (nuisanceEnabled(cfg.enabled_nuisances, "trigger") && !(cfg.trigger_unc > 0.0)) {
         throw std::runtime_error("nuisance 'trigger' is enabled but trigger_unc is not positive");
     }
-    if (nuisanceEnabled(cfg.enabled_nuisances, "mcstat")) {
-        if (cfg.mc_stat_threshold < 0) {
-            throw std::runtime_error("mc_stat_threshold must be >= 0");
-        }
-        if (cfg.use_root_covariance) {
-            throw std::runtime_error(
-                "use_root_covariance and the mcstat nuisance (autoMCStats) both model the "
-                "statistical uncertainty of the predictions; disable one of them");
+    if (cfg.mc_stat_threshold < 0) {
+        throw std::runtime_error("mc_stat_threshold must be >= 0");
+    }
+
+    if (payload.contains("scenario_scopes")) {
+        for (const auto& item : payload.at("scenario_scopes").asArray()) {
+            const std::string scope = item.asString();
+            if (scope != "combined" && scope != "class" && scope != "sample") {
+                throw std::runtime_error("config.json scenario_scopes: unknown scope '" + scope +
+                                         "' (known: combined, class, sample)");
+            }
+            cfg.scenario_scopes.insert(scope);
         }
     }
+
     return cfg;
 }
 
@@ -355,8 +373,19 @@ ClassRegistry loadRegistryFromBdtRoot(const std::string& bdt_root,
         fs::weakly_canonical(fs::path(bdt_root) / "config.json").string();
     JsonValue bdtJson = simple_json::parseFile(bdt_config_path);
 
+    // sample_config is relative to selections/BDT, as in train.py and qcd_est.py: the nearest
+    // ancestor of bdt_root that is selections/BDT (also for models in study subdirectories),
+    // else bdt_root's parent.
+    fs::path sample_cfg_base = fs::path(bdt_root).parent_path();
+    for (fs::path dir = fs::weakly_canonical(fs::path(bdt_root)); dir.has_parent_path() && dir != dir.parent_path();
+         dir = dir.parent_path()) {
+        if (dir.filename() == "BDT" && dir.parent_path().filename() == "selections") {
+            sample_cfg_base = dir;
+            break;
+        }
+    }
     const std::string sample_cfg_path = resolveReferencedPathFromDir(
-        fs::path(bdt_root).parent_path().string(),
+        sample_cfg_base.string(),
         bdtJson.at("sample_config").asString());
     JsonValue sampleJson = simple_json::parseFile(sample_cfg_path);
     for (const auto& node : sampleJson.at("sample").asArray()) {
@@ -450,10 +479,12 @@ ClassRegistry loadRegistry(const AppConfig& cfg) {
 // -------------------- ROOT reading --------------------
 struct YieldCov {
     std::vector<double> yields;
-    std::vector<double> mc_stat_vars;  // sum w^2 of the MC per SR (sr<id>/mc_stat_error^2)
+    std::vector<double> stat_errors;  // finite-MC uncertainty sqrt(sum w^2) per SR
+    std::vector<double> n_entries;    // raw MC event count per SR
+    double mean_event_weight = 0.0;   // mean per-event weight over the channel selection
     TMatrixDSym cov;                // n x n
     YieldCov() = default;
-    explicit YieldCov(int n) : yields(n, 0.0), mc_stat_vars(n, 0.0), cov(n) {
+    explicit YieldCov(int n) : yields(n, 0.0), stat_errors(n, 0.0), n_entries(n, 0.0), cov(n) {
         for (int i = 0; i < n; ++i)
             for (int j = 0; j < n; ++j) cov(i, j) = 0.0;
     }
@@ -462,7 +493,9 @@ struct YieldCov {
     YieldCov& operator=(const YieldCov& other) {
         if (this == &other) return *this;
         yields = other.yields;
-        mc_stat_vars = other.mc_stat_vars;
+        stat_errors = other.stat_errors;
+        n_entries = other.n_entries;
+        mean_event_weight = other.mean_event_weight;
         cov.ResizeTo(other.cov);
         cov = other.cov;
         return *this;
@@ -470,19 +503,14 @@ struct YieldCov {
     YieldCov& operator=(YieldCov&& other) noexcept {
         if (this == &other) return *this;
         yields = std::move(other.yields);
-        mc_stat_vars = std::move(other.mc_stat_vars);
+        stat_errors = std::move(other.stat_errors);
+        n_entries = std::move(other.n_entries);
+        mean_event_weight = other.mean_event_weight;
         cov.ResizeTo(other.cov);
         cov = other.cov;
         return *this;
     }
     int n() const { return static_cast<int>(yields.size()); }
-};
-
-// ABCD scale factors of qcd_est.py (metadata/abcd_closure).
-struct AbcdClosure {
-    double final_scale = 1.0;       // k = pred_union / A_union
-    double pred_union = 0.0;
-    double pred_union_error = 0.0;  // MC statistics of the B/C/D regions
 };
 
 struct ChannelData {
@@ -492,7 +520,17 @@ struct ChannelData {
     std::map<std::string, YieldCov> sample;       // per MC sample (MC true)
     std::map<std::string, YieldCov> group;        // per BDT class (MC true)
     YieldCov qcd_predict;                         // merged ABCD QCD prediction
-    AbcdClosure abcd;
+    double qcd_abcd_scale = 0.0;                  // predicted / MC-true QCD (A union) = MC closure
+    double qcd_abcd_scale_error = 0.0;            // B/C/D MC-stat uncertainty of that scale
+    // qcd_est.py abcd_mode 'per_sr': per-SR control regions C_i followed by the B and D
+    // regions (n_sr + 2 bins), fitted with rateParams (see buildAndRun).
+    bool per_sr_abcd = false;
+    double abcd_tf = 0.0;                         // MC transfer factor QCD B/D
+    double abcd_nonclosure = 0.0;                 // non-closure uncertainty of A_i = C_i * B/D
+    std::map<std::string, YieldCov> control_sample;
+    std::map<std::string, YieldCov> control_group;
+    YieldCov control_qcd;                         // MC-true QCD (prefit of the fitted QCD yields)
+    std::string sr_csv_hash;                      // qcd_est metadata/sr_csv_hash (empty if absent)
 };
 
 double readOneBinHist(TFile& f, const std::string& path) {
@@ -564,8 +602,7 @@ std::string formatSignalRegionIds(const std::vector<int>& ids) {
 }
 
 YieldCov readYieldCov(TFile& f, const std::string& prefix,
-                      const std::vector<int>& signal_region_ids,
-                      bool read_mc_stat) {
+                      const std::vector<int>& signal_region_ids) {
     // TFile owns the returned histograms; just copy the contents out.
     TH2* h2 = dynamic_cast<TH2*>(f.Get((prefix + "/covariance_total").c_str()));
     if (h2 == nullptr) {
@@ -588,18 +625,57 @@ YieldCov readYieldCov(TFile& f, const std::string& prefix,
     for (int i = 0; i < n; ++i) {
         const std::string sr_prefix = prefix + "/sr" + std::to_string(sr_ids[i]);
         out.yields[i] = readOneBinHist(f, sr_prefix + "/yield");
-        readOneBinHist(f, sr_prefix + "/stat_error");
+        out.stat_errors[i] = readOneBinHist(f, sr_prefix + "/stat_error");
         readOneBinHist(f, sr_prefix + "/scale_error");
-        if (read_mc_stat) {
-            const double err = readOneBinHist(f, sr_prefix + "/mc_stat_error");
-            out.mc_stat_vars[i] = err * err;
-        }
+        // n_entries / mean_event_weight are written by the current qcd_est.py; a missing
+        // histogram means the ROOT file predates the MC-statistics treatment (rerun qcd_est).
+        out.n_entries[i] = readOneBinHist(f, sr_prefix + "/n_entries");
     }
+    out.mean_event_weight = readOneBinHist(f, prefix + "/mean_event_weight");
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j) {
             out.cov(i, j) = h2->GetBinContent(i + 1, j + 1);
         }
     }
+    return out;
+}
+
+// Like readYieldCov, for bundles whose bins are the named subdirectories (control regions).
+YieldCov readNamedYieldCov(TFile& f, const std::string& prefix,
+                           const std::vector<std::string>& bin_names) {
+    TH2* h2 = dynamic_cast<TH2*>(f.Get((prefix + "/covariance_total").c_str()));
+    if (h2 == nullptr) {
+        throw std::runtime_error("Missing '" + prefix + "/covariance_total' in " + f.GetName());
+    }
+    const int n = static_cast<int>(bin_names.size());
+    if (h2->GetNbinsX() != n || h2->GetNbinsY() != n) {
+        throw std::runtime_error("Covariance size mismatch for " + prefix);
+    }
+    YieldCov out(n);
+    for (int i = 0; i < n; ++i) {
+        const std::string bin_prefix = prefix + "/" + bin_names[i];
+        out.yields[i] = readOneBinHist(f, bin_prefix + "/yield");
+        out.stat_errors[i] = readOneBinHist(f, bin_prefix + "/stat_error");
+        out.n_entries[i] = readOneBinHist(f, bin_prefix + "/n_entries");
+        for (int j = 0; j < n; ++j) out.cov(i, j) = h2->GetBinContent(i + 1, j + 1);
+    }
+    out.mean_event_weight = readOneBinHist(f, prefix + "/mean_event_weight");
+    return out;
+}
+
+// Bins of a followed by those of b (block-diagonal covariance, mean_event_weight of a).
+YieldCov concatYieldCov(const YieldCov& a, const YieldCov& b) {
+    YieldCov out(a.n() + b.n());
+    for (int i = 0; i < out.n(); ++i) {
+        const YieldCov& src = i < a.n() ? a : b;
+        const int k = i < a.n() ? i : i - a.n();
+        out.yields[i] = src.yields[k];
+        out.stat_errors[i] = src.stat_errors[k];
+        out.n_entries[i] = src.n_entries[k];
+        const int offset = i < a.n() ? 0 : a.n();
+        for (int j = 0; j < src.n(); ++j) out.cov(i, offset + j) = src.cov(k, j);
+    }
+    out.mean_event_weight = a.mean_event_weight;
     return out;
 }
 
@@ -620,27 +696,7 @@ std::vector<std::string> listSubdirs(TFile& f, const std::string& prefix) {
     return out;
 }
 
-AbcdClosure readAbcdClosure(TFile& f) {
-    TTree* t = dynamic_cast<TTree*>(f.Get("metadata/abcd_closure"));
-    if (t == nullptr || t->GetEntries() != 1) {
-        throw std::runtime_error(
-            "metadata/abcd_closure (one row) not found in " + std::string(f.GetName()) +
-            "; re-run mode 5 (qcd_est.py) for the ABCD nuisances");
-    }
-    AbcdClosure out;
-    t->SetBranchAddress("final_scale", &out.final_scale);
-    t->SetBranchAddress("pred_union", &out.pred_union);
-    t->SetBranchAddress("pred_union_error", &out.pred_union_error);
-    t->GetEntry(0);
-    t->ResetBranchAddresses();
-    if (!(out.pred_union > 0.0) || !std::isfinite(out.final_scale) || !(out.pred_union_error >= 0.0)) {
-        throw std::runtime_error("Invalid metadata/abcd_closure in " + std::string(f.GetName()));
-    }
-    return out;
-}
-
-// read_mc_stat / read_abcd: the inputs of the mcstat and ABCD nuisances.
-ChannelData loadChannel(const ChannelSpec& spec, bool read_mc_stat, bool read_abcd) {
+ChannelData loadChannel(const ChannelSpec& spec) {
     logMessage("Reading channel '" + spec.name + "' from " + spec.root_file);
     if (!fs::exists(spec.root_file)) {
         throw std::runtime_error("Channel ROOT file not found: " + spec.root_file);
@@ -661,7 +717,7 @@ ChannelData loadChannel(const ChannelSpec& spec, bool read_mc_stat, bool read_ab
     }
     for (const auto& s : sample_names) {
         auto inserted = data.sample.emplace(
-            s, readYieldCov(*f, "samples/" + s, metadata_sr_ids, read_mc_stat));
+            s, readYieldCov(*f, "samples/" + s, metadata_sr_ids));
         if (!inserted.second) {
             throw std::runtime_error("Duplicate sample '" + s + "' in " + spec.root_file);
         }
@@ -682,7 +738,7 @@ ChannelData loadChannel(const ChannelSpec& spec, bool read_mc_stat, bool read_ab
     for (const auto& g : group_names) {
         const std::string key = slugify(g);
         auto inserted = data.group.emplace(
-            key, readYieldCov(*f, "groups/" + g, data.sr_ids, read_mc_stat));
+            key, readYieldCov(*f, "groups/" + g, data.sr_ids));
         if (!inserted.second) {
             throw std::runtime_error(
                 "Duplicate groups/ entries after case-insensitive matching: '" + g +
@@ -695,12 +751,35 @@ ChannelData loadChannel(const ChannelSpec& spec, bool read_mc_stat, bool read_ab
         }
     }
 
-    data.qcd_predict = readYieldCov(*f, "qcd_predict", data.sr_ids, read_mc_stat);
+    data.qcd_predict = readYieldCov(*f, "qcd_predict", data.sr_ids);
     if (data.qcd_predict.n() != data.n_sr) {
         throw std::runtime_error("qcd_predict SR count mismatch for " + spec.name);
     }
-    if (read_abcd) {
-        data.abcd = readAbcdClosure(*f);
+    data.qcd_abcd_scale = readOneBinHist(*f, "qcd_predict/abcd_scale");
+    data.qcd_abcd_scale_error = readOneBinHist(*f, "qcd_predict/abcd_scale_error");
+    if (f->Get("metadata/sr_csv_hash") != nullptr) {
+        std::ostringstream hash;
+        hash << std::hex << std::setw(13) << std::setfill('0')
+             << static_cast<unsigned long long>(readOneBinHist(*f, "metadata/sr_csv_hash"));
+        data.sr_csv_hash = hash.str();
+    }
+
+    if (f->Get("qcd_predict/per_sr_abcd") != nullptr &&
+        readOneBinHist(*f, "qcd_predict/per_sr_abcd") == 1.0) {
+        data.per_sr_abcd = true;
+        data.abcd_tf = readOneBinHist(*f, "qcd_predict/abcd_tf");
+        data.abcd_nonclosure = readOneBinHist(*f, "qcd_predict/abcd_nonclosure");
+        std::vector<std::string> sr_bins;
+        for (int id : data.sr_ids) sr_bins.push_back("sr" + std::to_string(id));
+        auto readControl = [&](const std::string& rel) {
+            return concatYieldCov(readNamedYieldCov(*f, "control/" + rel, sr_bins),
+                                  readNamedYieldCov(*f, "abcd_bd/" + rel, {"b", "d"}));
+        };
+        for (const auto& kv : data.sample) data.control_sample.emplace(kv.first, readControl("samples/" + kv.first));
+        for (const auto& g : group_names) data.control_group.emplace(slugify(g), readControl("groups/" + g));
+        data.control_qcd = readControl("qcd_true");
+        logMessage("  channel '" + data.name + "': per-SR ABCD, TF=" + std::to_string(data.abcd_tf) +
+                   ", non-closure=" + std::to_string(data.abcd_nonclosure));
     }
 
     logMessage("  channel '" + data.name + "': n_sr=" + std::to_string(data.n_sr) +
@@ -750,14 +829,18 @@ std::vector<Scenario> buildScenarios(const ClassRegistry& reg) {
 
 // -------------------- Process construction --------------------
 struct Process {
-    std::string name;            // e.g. "signal", "bkg_vh", "bkg_qcd_abcd"
+    std::string name;            // e.g. "signal", "bkg_vh", "bkg_qcd"
     std::vector<double> yields;
-    std::vector<double> mc_stat_vars;  // sum w^2 per SR (autoMCStats bin errors)
+    std::vector<double> stat_errors;  // autoMCStats template bin errors
+    std::vector<double> n_entries;    // raw MC event counts per SR
+    double floor_alpha = 0.0;         // >0: zero-count floor per-event weight (background classes)
+    // Per-SR ABCD bkg_qcd: fixed template contents (zero error) whose normalisation the
+    // rateParams set; yields then hold the prefit expectation (Asimov data).
+    std::vector<double> template_values;
+    // MC samples of the process (their yield-weighted systematic ratios and lumi); empty for
+    // the data-driven ABCD QCD.
+    std::vector<std::string> member_samples;
     TMatrixDSym cov;
-    // MC samples whose yields make up this process; empty for the ABCD QCD
-    // prediction, which takes the ABCD nuisances instead of the MC-based ones.
-    std::vector<std::string> samples;
-    bool abcd = false;
     Process() : cov(1) {}
 };
 
@@ -768,15 +851,19 @@ bool isQcdClass(const ClassRegistry& reg, const std::string& class_name) {
 void addYieldCov(Process& proc, const YieldCov& src) {
     if (proc.yields.empty()) {
         proc.yields = std::vector<double>(src.n(), 0.0);
-        proc.mc_stat_vars = std::vector<double>(src.n(), 0.0);
+        proc.stat_errors = std::vector<double>(src.n(), 0.0);
+        proc.n_entries = std::vector<double>(src.n(), 0.0);
         proc.cov.ResizeTo(src.n(), src.n());
         for (int i = 0; i < src.n(); ++i)
             for (int j = 0; j < src.n(); ++j) proc.cov(i, j) = 0.0;
     }
     const int n = static_cast<int>(proc.yields.size());
     if (src.n() != n) throw std::runtime_error("SR size mismatch in addYieldCov");
-    for (int i = 0; i < n; ++i) proc.yields[i] += src.yields[i];
-    for (int i = 0; i < n; ++i) proc.mc_stat_vars[i] += src.mc_stat_vars[i];
+    for (int i = 0; i < n; ++i) {
+        proc.yields[i] += src.yields[i];
+        proc.stat_errors[i] = std::hypot(proc.stat_errors[i], src.stat_errors[i]);
+        proc.n_entries[i] += src.n_entries[i];
+    }
     for (int i = 0; i < n; ++i)
         for (int j = 0; j < n; ++j) proc.cov(i, j) += src.cov(i, j);
 }
@@ -834,16 +921,17 @@ const YieldCov& getRequiredGroupYieldCov(const ChannelData& ch,
     return it->second;
 }
 
+// floor_eligible marks background-class processes (and the ABCD QCD prediction)
+// that receive the zero-count floor in SRs where they have no MC events.
 Process makeProcessFromYieldCov(const std::string& name, const YieldCov& yc,
-                                const std::string& label,
-                                std::vector<std::string> samples, bool abcd = false) {
+                                const std::string& label, bool floor_eligible = false) {
     validateYieldCov(yc, label);
     Process out;
     out.name = name;
     out.yields = yc.yields;
-    out.mc_stat_vars = yc.mc_stat_vars;
-    out.samples = std::move(samples);
-    out.abcd = abcd;
+    out.stat_errors = yc.stat_errors;
+    out.n_entries = yc.n_entries;
+    out.floor_alpha = floor_eligible ? std::max(yc.mean_event_weight, 0.0) : 0.0;
     out.cov.ResizeTo(yc.n(), yc.n());
     for (int i = 0; i < yc.n(); ++i) {
         for (int j = 0; j < yc.n(); ++j) {
@@ -876,7 +964,7 @@ std::vector<Process> buildGroupProcesses(const ChannelData& ch, const ClassRegis
             const YieldCov& yc = getRequiredGroupYieldCov(ch, cls);
             addYieldCov(sig, yc);
             const auto& members = reg.class_members.at(cls);
-            sig.samples.insert(sig.samples.end(), members.begin(), members.end());
+            sig.member_samples.insert(sig.member_samples.end(), members.begin(), members.end());
         }
     } else if (sc.scope == "class") {
         if (!reg.signal_classes.count(sc.name)) {
@@ -884,7 +972,7 @@ std::vector<Process> buildGroupProcesses(const ChannelData& ch, const ClassRegis
         }
         const YieldCov& yc = getRequiredGroupYieldCov(ch, sc.name);
         addYieldCov(sig, yc);
-        sig.samples = reg.class_members.at(sc.name);
+        sig.member_samples = reg.class_members.at(sc.name);
     } else {
         throw std::runtime_error("Group-based builder cannot handle scenario scope '" + sc.scope + "'");
     }
@@ -906,10 +994,10 @@ std::vector<Process> buildGroupProcesses(const ChannelData& ch, const ClassRegis
             if (!qcd_predict_added) {
                 appendProcess(out, process_names,
                               makeProcessFromYieldCov(
-                                  kAbcdQcdProcess,
+                                  "bkg_qcd",
                                   ch.qcd_predict,
                                   "qcd_predict in channel '" + ch.name + "'",
-                                  {}, /*abcd=*/true),
+                                  true),
                               "grouped scenario '" + sc.scope + "/" + sc.name +
                               "' in channel '" + ch.name + "'");
                 qcd_predict_added = true;
@@ -918,12 +1006,13 @@ std::vector<Process> buildGroupProcesses(const ChannelData& ch, const ClassRegis
         }
 
         const YieldCov& yc = getRequiredGroupYieldCov(ch, cls);
-        appendProcess(out, process_names,
-                      makeProcessFromYieldCov(
-                          "bkg_" + slugify(cls),
-                          yc,
-                          "group '" + cls + "' in channel '" + ch.name + "'",
-                          reg.class_members.at(cls)),
+        Process bkg = makeProcessFromYieldCov(
+            "bkg_" + slugify(cls),
+            yc,
+            "group '" + cls + "' in channel '" + ch.name + "'",
+            true);
+        bkg.member_samples = reg.class_members.at(cls);
+        appendProcess(out, process_names, std::move(bkg),
                       "grouped scenario '" + sc.scope + "/" + sc.name +
                       "' in channel '" + ch.name + "'");
     }
@@ -941,12 +1030,12 @@ std::vector<Process> buildSampleProcesses(const ChannelData& ch, const ClassRegi
 
     const std::string signal_sample = *sc.signal_samples.begin();
     const YieldCov& sig_yc = getRequiredYieldCov(ch.sample, signal_sample, "sample", ch.name);
-    appendProcess(out, process_names,
-                  makeProcessFromYieldCov(
-                      "signal",
-                      sig_yc,
-                      "signal sample '" + signal_sample + "' in channel '" + ch.name + "'",
-                      {signal_sample}),
+    Process sig = makeProcessFromYieldCov(
+        "signal",
+        sig_yc,
+        "signal sample '" + signal_sample + "' in channel '" + ch.name + "'");
+    sig.member_samples = {signal_sample};
+    appendProcess(out, process_names, std::move(sig),
                   "sample scenario '" + signal_sample + "' in channel '" + ch.name + "'");
 
     bool qcd_predict_added = false;
@@ -955,10 +1044,10 @@ std::vector<Process> buildSampleProcesses(const ChannelData& ch, const ClassRegi
             if (!qcd_predict_added) {
                 appendProcess(out, process_names,
                               makeProcessFromYieldCov(
-                                  kAbcdQcdProcess,
+                                  "bkg_qcd",
                                   ch.qcd_predict,
                                   "qcd_predict in channel '" + ch.name + "'",
-                                  {}, /*abcd=*/true),
+                                  true),
                               "sample scenario '" + signal_sample + "' in channel '" + ch.name + "'");
                 qcd_predict_added = true;
             }
@@ -969,12 +1058,12 @@ std::vector<Process> buildSampleProcesses(const ChannelData& ch, const ClassRegi
             if (sample_name == signal_sample) continue;
             auto it = ch.sample.find(sample_name);
             if (it == ch.sample.end()) continue;
-            appendProcess(out, process_names,
-                          makeProcessFromYieldCov(
-                              "bkg_" + slugify(sample_name),
-                              it->second,
-                              "sample '" + sample_name + "' in channel '" + ch.name + "'",
-                              {sample_name}),
+            Process bkg = makeProcessFromYieldCov(
+                "bkg_" + slugify(sample_name),
+                it->second,
+                "sample '" + sample_name + "' in channel '" + ch.name + "'");
+            bkg.member_samples = {sample_name};
+            appendProcess(out, process_names, std::move(bkg),
                           "sample scenario '" + signal_sample + "' in channel '" + ch.name + "'");
         }
     }
@@ -997,6 +1086,15 @@ void validateChannelAgainstRegistry(const ChannelData& ch, const ClassRegistry& 
         getRequiredYieldCov(ch.sample, sample_name, "signal sample", ch.name);
     }
     validateYieldCov(ch.qcd_predict, "qcd_predict in channel '" + ch.name + "'");
+    if (ch.per_sr_abcd) {
+        for (const auto& cls : reg.class_order) {
+            getRequiredYieldCov(ch.control_group, slugify(cls), "control-region group", ch.name);
+        }
+        for (const auto& sample_name : reg.signal_samples) {
+            getRequiredYieldCov(ch.control_sample, sample_name, "control-region signal sample", ch.name);
+        }
+        validateYieldCov(ch.control_qcd, "control-region qcd_true in channel '" + ch.name + "'");
+    }
 }
 
 // -------------------- Covariance eigen-decomposition --------------------
@@ -1071,6 +1169,36 @@ bool isExactlyZeroProcess(const Process& proc) {
     return true;
 }
 
+// combine initialises a 'gmN N' parameter at N + 1, which would put every zero-count floor at
+// its full alpha in the prefit expectation and in the Asimov dataset of '-t -1', while its
+// constraint (0 observed) pulls it to 0: the fits then attributed the floors to the signal
+// (inflated significance, weaker limits). The floors start at 0 instead; they can still rise
+// in the fits at the cost of their Poisson constraint. A regex matching nothing is harmless.
+const char* kZeroFloorStart = "rgx{zc_.*}=0";
+
+// The autoMCStats mode (default) gives a floor-eligible background process a
+// 'gmN 0 alpha' term in every SR where its yield is zero (no MC events, or a
+// signed-weight sum clamped to 0 by qcd_est). Disabled in covariance mode.
+bool zeroCountFloorActive(const AppConfig& cfg, const Process& proc, int sr) {
+    if (cfg.use_root_covariance || proc.floor_alpha <= 0.0) return false;
+    if (!cfg.enabled_nuisances.empty() && cfg.enabled_nuisances.count("zero_count_floor") == 0u) return false;
+    return proc.yields[sr] <= 0.0;
+}
+
+// Content of the nominal one-bin template of a process in bin sr (see writeChannelShape).
+double nominalTemplateValue(const AppConfig& cfg, const Process& proc, int sr) {
+    if (!proc.template_values.empty()) return proc.template_values[sr];
+    if (zeroCountFloorActive(cfg, proc, sr)) return proc.floor_alpha;
+    return proc.yields[sr];
+}
+
+bool hasZeroCountFloor(const AppConfig& cfg, const Process& proc) {
+    for (int sr = 0; sr < static_cast<int>(proc.yields.size()); ++sr) {
+        if (zeroCountFloorActive(cfg, proc, sr)) return true;
+    }
+    return false;
+}
+
 std::vector<Process> maybeDropZeroBackgroundProcesses(const AppConfig& cfg,
                                                       std::vector<Process> processes,
                                                       const Scenario& sc,
@@ -1080,7 +1208,7 @@ std::vector<Process> maybeDropZeroBackgroundProcesses(const AppConfig& cfg,
     std::vector<Process> kept;
     kept.reserve(processes.size());
     for (auto& proc : processes) {
-        if (proc.name == "signal") {
+        if (proc.name == "signal" || hasZeroCountFloor(cfg, proc) || !proc.template_values.empty()) {
             kept.push_back(std::move(proc));
             continue;
         }
@@ -1204,7 +1332,33 @@ struct PerChannelCard {
     // For each process: eigen modes; nuisance name convention below.
     std::vector<std::vector<EigenMode>> modes;
     std::vector<double> data_obs;
+    // ABCD QCD prediction nuisances (only when bkg_qcd is the ABCD prediction).
+    bool use_abcd = false;
+    double abcd_scale = 0.0;
+    double abcd_scale_error = 0.0;
+    // Per-SR ABCD (qcd_est.py abcd_mode 'per_sr'): the SR card gets the non-closure lnN and the
+    // formula rateParams of the A_i; the control card (C_i, B, D bins named in bin_names) gets
+    // the free rateParams and no per-SR theory/pileup/JES/JER rows.
+    bool per_sr_abcd = false;
+    bool control = false;
+    double abcd_nonclosure = 0.0;
+    std::vector<std::string> bin_names;   // empty: <channel>_sr<id>
+    std::vector<std::string> rate_params; // complete rateParam lines
+    // Per-sample MC yields per SR (the channel's samples/ bundles): weights of the systematic ratios.
+    const std::map<std::string, YieldCov>* sample_yields = nullptr;
+    const std::unordered_map<std::string, SampleInfo>* sample_info = nullptr;  // has_theory_weights
 };
+
+std::string srBinName(const std::string& channel_name, int sr_id);
+
+std::string cardBinName(const PerChannelCard& pc, int i) {
+    return pc.bin_names.empty() ? srBinName(pc.name, pc.sr_ids[i]) : pc.bin_names[i];
+}
+
+bool cardBinCountOk(const PerChannelCard& pc) {
+    const size_t n = pc.bin_names.empty() ? pc.sr_ids.size() : pc.bin_names.size();
+    return static_cast<int>(n) == pc.n_sr;
+}
 
 void validateProcessShapes(const AppConfig& cfg, const Process& proc,
                            const std::vector<EigenMode>& modes,
@@ -1263,7 +1417,7 @@ std::string srBinName(const std::string& channel_name, int sr_id) {
 
 void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
                        const std::string& shape_path) {
-    if (static_cast<int>(pc.sr_ids.size()) != pc.n_sr) {
+    if (!cardBinCountOk(pc)) {
         throw std::runtime_error("Signal-region id count mismatch in channel '" + pc.name + "'");
     }
     TFile* f = TFile::Open(shape_path.c_str(), "RECREATE");
@@ -1272,14 +1426,13 @@ void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
         throw std::runtime_error("Cannot create shape file: " + shape_path);
     }
 
-    // The nominal process histograms carry the MC statistics (sqrt(sum w^2)) as
-    // bin errors for autoMCStats; all other uncertainties live in nuisances.
-    const bool mc_stat = nuisanceEnabled(cfg.enabled_nuisances, "mcstat");
-    auto makeHist = [&](TDirectory* dir, const std::string& hname, double value, double error) {
+    // Bin errors carry the finite-MC uncertainty for autoMCStats; in covariance mode
+    // all uncertainties live in the eigen-mode nuisances instead.
+    auto makeHist = [&](TDirectory* dir, const std::string& hname, double value, double error = 0.0) {
         TH1D* h = new TH1D(hname.c_str(), hname.c_str(), 1, 0.0, 1.0);
         h->SetDirectory(dir);
         h->SetBinContent(1, value);
-        h->SetBinError(1, error);
+        h->SetBinError(1, cfg.use_root_covariance ? 0.0 : error);
         return h;
     };
 
@@ -1293,22 +1446,32 @@ void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
     }
 
     for (int sr = 0; sr < pc.n_sr; ++sr) {
-        TDirectory* sr_dir = f->mkdir(srBinName(pc.name, pc.sr_ids[sr]).c_str());
+        TDirectory* sr_dir = f->mkdir(cardBinName(pc, sr).c_str());
         sr_dir->cd();
-        makeHist(sr_dir, "data_obs", pc.data_obs[sr], 0.0);
+        makeHist(sr_dir, "data_obs", pc.data_obs[sr]);
 
         for (size_t p = 0; p < pc.processes.size(); ++p) {
             const Process& proc = pc.processes[p];
-            makeHist(sr_dir, proc.name, proc.yields[sr],
-                     mc_stat ? std::sqrt(std::max(proc.mc_stat_vars[sr], 0.0)) : 0.0);
+            if (!proc.template_values.empty()) {
+                makeHist(sr_dir, proc.name, proc.template_values[sr], 0.0);
+            } else if (zeroCountFloorActive(cfg, proc, sr)) {
+                // Zero-count floor: autoMCStats channels take the process normalisation
+                // from the template, which the gmN 0 parameter multiplies, so the template
+                // holds the per-event weight alpha (zero error); a zero-content template would
+                // make combine skip the process entirely. combine initialises a gmN N parameter
+                // at N + 1, so the combine calls start the zc_* parameters at 0 (kZeroFloorStart).
+                makeHist(sr_dir, proc.name, proc.floor_alpha, 0.0);
+            } else {
+                makeHist(sr_dir, proc.name, proc.yields[sr], proc.stat_errors[sr]);
+            }
 
             const auto& modes = pc.modes[p];
             for (size_t k = 0; k < modes.size(); ++k) {
                 const double d = modes[k].scale * modes[k].template_scale * modes[k].v[sr];
                 const std::string nuis = "cov_" + pc.name + "_" + proc.name +
                                          "_eig" + std::to_string(k);
-                makeHist(sr_dir, proc.name + "_" + nuis + "Up", proc.yields[sr] + d, 0.0);
-                makeHist(sr_dir, proc.name + "_" + nuis + "Down", proc.yields[sr] - d, 0.0);
+                makeHist(sr_dir, proc.name + "_" + nuis + "Up", proc.yields[sr] + d);
+                makeHist(sr_dir, proc.name + "_" + nuis + "Down", proc.yields[sr] - d);
             }
         }
     }
@@ -1317,46 +1480,35 @@ void writeChannelShape(const AppConfig& cfg, const PerChannelCard& pc,
     delete f;
 }
 
-// -------------------- lnN nuisance rows --------------------
+// -------------------- Systematic ratio lnN rows --------------------
 
-// Effect of one lnN nuisance on one process in one SR.
-struct Kappa {
-    double down = 1.0;
-    double up = 1.0;
-    bool active = false;
-    bool symmetric = false;  // written as the single value up
-};
-
-// Yield of one MC sample in one SR (0 when qcd_est.py wrote no entry: the
-// sample has no test-split event in the channel).
-double sampleYield(const ChannelData& ch, const std::string& sample, int sr) {
-    auto it = ch.sample.find(sample);
-    return it == ch.sample.end() ? 0.0 : it->second.yields[sr];
-}
-
-// Kappa of one process in one SR for a per-sample-ratio nuisance: the mean of
-// its samples' ratios weighted by their SR yields (the process yield is their
-// sum). Under the theory nuisances a sample without theory weights has ratio 1.
-// Inactive for a process without MC yield in the SR.
-Kappa ratioKappa(const RatioNuisanceSpec& spec, const SampleRatios& ratios,
-                 const Process& proc, const ChannelData& ch, int sr,
-                 const ClassRegistry& reg) {
-    Kappa k;
-    const int sr_id = ch.sr_ids[sr];
-    double total = 0.0, up = 0.0, down = 0.0;
-    for (const auto& sample : proc.samples) {
-        const double y = sampleYield(ch, sample, sr);
-        if (y <= 0.0) continue;
+// Kappa of one process in SR sr for a per-sample-ratio nuisance: the mean of its member samples'
+// per-SR ratios weighted by their MC yields in that SR (the channel's samples/ bundles), so every
+// sample enters with its physical share. Under the theory nuisances a sample without theory
+// weights has ratio 1; a sample with a positive yield but no ratio is an error. Inactive for a
+// process without MC samples (the data-driven ABCD QCD), without yield, or whose samples all
+// lack theory weights under a theory nuisance (a kappa of exactly 1).
+Kappa processRatio(const PerChannelCard& pc, const Process& proc, int sr,
+                   const RatioNuisanceSpec& spec, const SampleRatios& ratios) {
+    if (pc.sample_yields == nullptr || pc.sample_info == nullptr) return {};
+    const int sr_id = pc.sr_ids[sr];
+    double total = 0.0, up_sum = 0.0, down_sum = 0.0;
+    bool any_ratio = false;
+    for (const auto& sample : proc.member_samples) {
+        auto y_it = pc.sample_yields->find(sample);
+        if (y_it == pc.sample_yields->end()) continue;
+        const double y = y_it->second.yields[sr];
+        if (!(y > 0.0)) continue;
         total += y;
-        if (spec.theory && !reg.samples.at(sample).has_theory_weights) {
-            up += y;
-            down += y;
+        if (spec.theory && !pc.sample_info->at(sample).has_theory_weights) {
+            up_sum += y;
+            down_sum += y;
             continue;
         }
         const RatioPair* r = nullptr;
         auto s_it = ratios.find(sample);
         if (s_it != ratios.end()) {
-            auto c_it = s_it->second.find(ch.name);
+            auto c_it = s_it->second.find(pc.name);
             if (c_it != s_it->second.end()) {
                 auto r_it = c_it->second.regions.find(sr_id);
                 if (r_it != c_it->second.regions.end()) r = &r_it->second;
@@ -1365,128 +1517,128 @@ Kappa ratioKappa(const RatioNuisanceSpec& spec, const SampleRatios& ratios,
         if (r == nullptr) {
             throw std::runtime_error(
                 std::string("nuisance '") + spec.nuisance + "' has no ratio for sample '" + sample +
-                "' in channel '" + ch.name + "' SR " + std::to_string(sr_id) +
+                "' in channel '" + pc.name + "' SR " + std::to_string(sr_id) +
                 ", where the sample has a nonzero yield; re-run " + spec.producer);
         }
-        up += y * r->up;
-        down += y * r->down;
+        up_sum += y * r->up;
+        down_sum += y * r->down;
+        any_ratio = true;
     }
-    if (total <= 0.0) return k;
-    k.up = up / total;
-    k.down = down / total;
+    if (!(total > 0.0) || !any_ratio) return {};
+    Kappa k;
+    k.up = up_sum / total;
+    k.down = down_sum / total;
     k.active = true;
     if (!(k.up > 0.0) || !(k.down > 0.0) || !std::isfinite(k.up) || !std::isfinite(k.down)) {
         std::ostringstream os;
         os << "nuisance '" << spec.nuisance << "' gives kappa down/up = " << k.down << "/" << k.up
-           << " for process '" << proc.name << "' in channel '" << ch.name << "' SR " << sr_id
+           << " for process '" << proc.name << "' in channel '" << pc.name << "' SR " << sr_id
            << "; a lnN kappa must be positive (the variation removes the whole yield)";
         throw std::runtime_error(os.str());
     }
     return k;
 }
 
-std::string formatKappa(double kappa) {
-    std::ostringstream os;
-    os << std::setprecision(6) << std::fixed << kappa;
-    return os.str();
-}
-
-// Writes one lnN row, kappas[sr][process]; an asymmetric entry is written as
-// kappa_down/kappa_up (combine's order). No row when no entry is active.
-void writeLnNRow(std::ofstream& ofs, const std::string& name,
-                 const std::vector<std::vector<Kappa>>& kappas) {
+// One asymmetric lnN row over all SRs and processes, written as kdown/kup (combine's order:
+// the yield ratio of the -1 sigma variation first). only_process >= 0 restricts the row to
+// that process; a row without any active entry is omitted.
+void writeRatioLnN(std::ofstream& ofs, const PerChannelCard& pc, const std::string& name,
+                   const RatioNuisanceSpec& spec, const SampleRatios& ratios, int only_process = -1) {
+    std::vector<std::string> cells;
     bool any_active = false;
-    for (const auto& row : kappas)
-        for (const auto& k : row) any_active = any_active || k.active;
-    if (!any_active) return;
-    ofs << name << " lnN";
-    for (const auto& row : kappas) {
-        for (const auto& k : row) {
-            if (!k.active) {
-                ofs << " -";
-            } else if (k.symmetric) {
-                ofs << " " << formatKappa(k.up);
-            } else {
-                ofs << " " << formatKappa(k.down) << "/" << formatKappa(k.up);
+    for (int sr = 0; sr < pc.n_sr; ++sr) {
+        for (size_t p = 0; p < pc.processes.size(); ++p) {
+            Kappa r;
+            if (only_process < 0 || static_cast<int>(p) == only_process) {
+                r = processRatio(pc, pc.processes[p], sr, spec, ratios);
             }
+            if (!r.active) {
+                cells.push_back("-");
+                continue;
+            }
+            std::ostringstream val;
+            val << std::setprecision(6) << std::fixed << r.down << "/" << r.up;
+            cells.push_back(val.str());
+            any_active = true;
         }
     }
+    if (!any_active) return;
+    ofs << name << " lnN";
+    for (const auto& cell : cells) ofs << " " << cell;
     ofs << "\n";
 }
 
-// All lnN rows of one channel card. The MC-based nuisances act on the MC
-// processes and are correlated across processes, SRs, and channels; the ABCD
-// QCD prediction takes the per-channel ABCD rows instead: the non-closure
-// |k - 1| (k = final_scale) and the MC statistics of the B/C/D regions, the
-// SR-correlated part of its statistics (the per-SR part is in autoMCStats).
-void writeLnNRows(std::ofstream& ofs, const AppConfig& cfg, const PerChannelCard& pc,
-                  const ChannelData& ch, const ClassRegistry& reg) {
-    const size_t n_proc = pc.processes.size();
+// Rows of the enabled per-sample-ratio nuisances, correlated across processes, SRs and channels,
+// except the QCD scale: one nuisance per process (theory_scale_<process>, correlated across
+// channels).
+void writeRatioNuisances(std::ofstream& ofs, const AppConfig& cfg, const PerChannelCard& pc) {
     for (const auto& spec : kRatioNuisances) {
-        auto r_it = cfg.ratios.find(spec.nuisance);
-        if (r_it == cfg.ratios.end()) continue;  // not enabled
-        std::vector<std::vector<Kappa>> kappas(pc.n_sr, std::vector<Kappa>(n_proc));
-        for (int sr = 0; sr < pc.n_sr; ++sr) {
-            for (size_t p = 0; p < n_proc; ++p) {
-                if (!pc.processes[p].abcd) {
-                    kappas[sr][p] = ratioKappa(spec, r_it->second, pc.processes[p], ch, sr, reg);
-                }
+        auto it = cfg.ratios.find(spec.nuisance);
+        if (it == cfg.ratios.end()) continue;
+        if (std::string(spec.nuisance) == "theory_scale") {
+            for (size_t p = 0; p < pc.processes.size(); ++p) {
+                writeRatioLnN(ofs, pc, "theory_scale_" + pc.processes[p].name, spec, it->second,
+                              static_cast<int>(p));
             }
+        } else {
+            writeRatioLnN(ofs, pc, spec.nuisance, spec, it->second);
         }
-        writeLnNRow(ofs, spec.nuisance, kappas);
     }
+}
 
-    const auto writeFlat = [&](const std::string& name, double kappa, bool on_abcd) {
-        std::vector<std::vector<Kappa>> kappas(pc.n_sr, std::vector<Kappa>(n_proc));
-        for (auto& row : kappas) {
-            for (size_t p = 0; p < n_proc; ++p) {
-                if (pc.processes[p].abcd == on_abcd) row[p] = {kappa, kappa, true, true};
-            }
+// The per-SR systematic ratios must be computed for the signal regions of the channel's
+// qcd_est output: both record the SR CSV hash, and a mismatch is an error.
+void checkSrProvenance(const SampleRatios& fracs, const std::string& label, const ChannelData& ch) {
+    bool unchecked = false;
+    for (const auto& s_kv : fracs) {
+        auto t_it = s_kv.second.find(ch.name);
+        if (t_it == s_kv.second.end() || t_it->second.regions.empty()) continue;
+        const std::string& hash = t_it->second.sr_csv_hash;
+        if (hash.empty() || ch.sr_csv_hash.empty()) {
+            unchecked = true;
+            continue;
         }
-        writeLnNRow(ofs, name, kappas);
-    };
-    if (nuisanceEnabled(cfg.enabled_nuisances, "lumi")) {
-        writeFlat("lumi", 1.0 + cfg.lumi_unc, /*on_abcd=*/false);
+        if (hash != ch.sr_csv_hash) {
+            throw std::runtime_error(
+                label + ": the per-SR ratios of sample '" + s_kv.first + "' in channel '" + ch.name +
+                "' were computed for other signal regions (SR CSV hash " + hash +
+                ") than the channel's qcd_est output (" + ch.sr_csv_hash +
+                "); rerun the systematics with the current signal_region.csv");
+        }
     }
-    if (nuisanceEnabled(cfg.enabled_nuisances, "trigger")) {
-        writeFlat("trigger", 1.0 + cfg.trigger_unc, /*on_abcd=*/false);
-    }
-    if (nuisanceEnabled(cfg.enabled_nuisances, "abcd_nonclosure")) {
-        writeFlat("abcd_nonclosure_" + pc.name, 1.0 + std::fabs(ch.abcd.final_scale - 1.0),
-                  /*on_abcd=*/true);
-    }
-    if (nuisanceEnabled(cfg.enabled_nuisances, "abcd_mcstat")) {
-        writeFlat("abcd_mcstat_" + pc.name, 1.0 + ch.abcd.pred_union_error / ch.abcd.pred_union,
-                  /*on_abcd=*/true);
+    if (unchecked) {
+        logMessage("WARNING: " + label + ": per-SR ratios in channel '" + ch.name +
+                   "' cannot be matched to the channel's signal regions (no SR CSV hash in the JSON "
+                   "or in the qcd_est output; rerun both to enable the check)");
     }
 }
 
 void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
-                          const std::string& shape_file, const ChannelData& ch,
-                          const ClassRegistry& reg) {
+                          const std::string& shape_file) {
     std::ofstream ofs(pc.datacard_path);
     if (!ofs) {
         throw std::runtime_error("Cannot write datacard: " + pc.datacard_path);
     }
-    if (static_cast<int>(pc.sr_ids.size()) != pc.n_sr) {
+    if (shape_file.empty()) {
+        throw std::runtime_error("Shape file path is required for the one-bin shape datacards");
+    }
+    if (!cardBinCountOk(pc)) {
         throw std::runtime_error("Signal-region id count mismatch in channel '" + pc.name + "'");
     }
     ofs << "# Auto-generated by combine.C\n";
     ofs << "imax " << pc.n_sr << "\njmax *\nkmax *\n";
     ofs << "----------\n";
-    // One-bin shapes per SR: the nominal histograms carry the MC statistics
-    // for autoMCStats; the optional covariance modes carry their variations.
     ofs << "shapes * * " << shape_file
         << " $CHANNEL/$PROCESS $CHANNEL/$PROCESS_$SYSTEMATIC\n";
     ofs << "----------\n";
     ofs << "bin";
     for (int sr = 0; sr < pc.n_sr; ++sr) {
-        ofs << " " << srBinName(pc.name, pc.sr_ids[sr]);
+        ofs << " " << cardBinName(pc, sr);
     }
     ofs << "\n";
     ofs << "observation";
     for (int sr = 0; sr < pc.n_sr; ++sr) {
-        ofs << " " << formatDouble(pc.data_obs[sr]);
+        ofs << " -1";
     }
     ofs << "\n";
     ofs << "----------\n";
@@ -1495,7 +1647,7 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
     ofs << "bin";
     for (int sr = 0; sr < pc.n_sr; ++sr) {
         for (size_t p = 0; p < pc.processes.size(); ++p) {
-            ofs << " " << srBinName(pc.name, pc.sr_ids[sr]);
+            ofs << " " << cardBinName(pc, sr);
         }
     }
     ofs << "\n";
@@ -1511,12 +1663,12 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
         for (size_t p = 0; p < pc.processes.size(); ++p) ofs << " " << p;
     }
     ofs << "\n";
-    // Explicit rates, equal to the shape integrals (combine checks them): a
-    // process without yield in an SR has rate 0 and drops out of that bin.
+    // Rates are read from the one-bin shapes. An exactly empty template gets rate 0: combine
+    // keeps rate -1 for a zero integral and then rejects the process ("Null norm").
     ofs << "rate";
     for (int sr = 0; sr < pc.n_sr; ++sr) {
-        for (size_t p = 0; p < pc.processes.size(); ++p) {
-            ofs << " " << formatDouble(pc.processes[p].yields[sr]);
+        for (const auto& proc : pc.processes) {
+            ofs << (nominalTemplateValue(cfg, proc, sr) == 0.0 ? " 0" : " -1");
         }
     }
     ofs << "\n";
@@ -1542,13 +1694,68 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
         }
     }
 
-    writeLnNRows(ofs, cfg, pc, ch, reg);
-
-    // Bin-wise MC statistics (Barlow-Beeston-lite) from the histogram errors;
-    // include-signal = 0 still models the signal statistics.
-    if (nuisanceEnabled(cfg.enabled_nuisances, "mcstat")) {
-        ofs << "* autoMCStats " << cfg.mc_stat_threshold << " 0 1\n";
+    // Zero-count floor: one gmN 0 row per (SR, background process) without MC yield.
+    for (int sr = 0; sr < pc.n_sr; ++sr) {
+        for (size_t p = 0; p < pc.processes.size(); ++p) {
+            const Process& proc = pc.processes[p];
+            if (!zeroCountFloorActive(cfg, proc, sr)) continue;
+            ofs << "zc_" << cardBinName(pc, sr) << "_" << proc.name << " gmN 0";
+            for (int s2 = 0; s2 < pc.n_sr; ++s2) {
+                for (size_t q = 0; q < pc.processes.size(); ++q) {
+                    ofs << " " << ((s2 == sr && q == p) ? formatDouble(proc.floor_alpha) : "-");
+                }
+            }
+            ofs << "\n";
+        }
     }
+
+    // ABCD QCD prediction: B/C/D MC-stat uncertainty of the union scale and MC
+    // non-closure |1 - scale|, each one lnN per channel, correlated across its SRs.
+    // Per-SR ABCD: only the configured non-closure (the statistics come from the fitted
+    // control regions).
+    auto writeQcdLnN = [&](const std::string& base, double kappa) {
+        if (!(kappa > 1.0) || !nuisanceEnabled(cfg.enabled_nuisances, base)) return;
+        ofs << base << "_" << pc.name << " lnN";
+        for (int sr = 0; sr < pc.n_sr; ++sr) {
+            for (const auto& proc : pc.processes) {
+                ofs << " " << (proc.name == "bkg_qcd" ? formatDouble(kappa) : "-");
+            }
+        }
+        ofs << "\n";
+    };
+    if (pc.per_sr_abcd) {
+        if (!pc.control) writeQcdLnN("qcd_abcd_nonclosure", 1.0 + pc.abcd_nonclosure);
+    } else if (pc.use_abcd && pc.abcd_scale > 0.0) {
+        writeQcdLnN("qcd_abcd_stat", 1.0 + pc.abcd_scale_error / pc.abcd_scale);
+        writeQcdLnN("qcd_abcd_nonclosure", 1.0 + std::fabs(1.0 - pc.abcd_scale));
+    }
+
+    // The per-sample systematic ratios are per SR; the control card has none of them.
+    if (!pc.control) writeRatioNuisances(ofs, cfg, pc);
+
+    // Luminosity and trigger lnN, correlated across all channels (row names "lumi", "trigger").
+    // Applied to every MC process (also the MC-true QCD); the data-driven ABCD QCD has no MC
+    // samples and is excluded.
+    auto writeFlatMcLnN = [&](const std::string& name, double unc) {
+        if (!nuisanceEnabled(cfg.enabled_nuisances, name)) return;
+        std::ostringstream kappa_str;
+        kappa_str << std::setprecision(6) << std::fixed << (1.0 + unc);
+        ofs << name << " lnN";
+        for (int sr = 0; sr < pc.n_sr; ++sr) {
+            for (const auto& proc : pc.processes) {
+                ofs << (proc.member_samples.empty() ? " -" : " " + kappa_str.str());
+            }
+        }
+        ofs << "\n";
+    };
+    writeFlatMcLnN("lumi", cfg.lumi_unc);
+    writeFlatMcLnN("trigger", cfg.trigger_unc);
+
+    // Finite MC statistics (Barlow-Beeston-lite, combine default: signal excluded).
+    if (!cfg.use_root_covariance && nuisanceEnabled(cfg.enabled_nuisances, "autoMCStats")) {
+        ofs << "* autoMCStats " << cfg.mc_stat_threshold << "\n";
+    }
+    for (const auto& line : pc.rate_params) ofs << line << "\n";
 }
 
 // -------------------- Running combine --------------------
@@ -1630,6 +1837,15 @@ bool tryReadLimitQuantiles(const std::string& root_path, CombineOutput& out,
     return true;
 }
 
+void setNanExpectedLimits(CombineOutput& out) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    out.exp_2p5 = nan;
+    out.exp_16 = nan;
+    out.exp_50 = nan;
+    out.exp_84 = nan;
+    out.exp_97p5 = nan;
+}
+
 void setInfiniteExpectedLimits(CombineOutput& out) {
     const double inf = std::numeric_limits<double>::infinity();
     out.exp_2p5 = inf;
@@ -1658,16 +1874,69 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
     const fs::path work = fs::path(cfg.work_dir) / tag;
     fs::create_directories(work);
 
-    // Build per-channel cards. Shape files are only needed when optional ROOT
-    // covariance nuisances are enabled.
+    // Build per-channel cards, each with a one-bin-per-SR shape file.
     std::vector<std::string> card_tokens;  // for combineCards.py
     std::vector<std::string> skipped_zero_signal_channels;
+    // Per-SR ABCD (qcd_est.py abcd_mode 'per_sr'): QCD in A_i = C_i * B / D, with C_i, B and D the
+    // fitted QCD yields of the control card. The A_i templates hold the MC transfer factor and
+    // the formula rateParam C_i * rB / rD (C_i absolute, B and D relative to MC) sets their
+    // normalisation; the C_i templates hold 1 and the B / D templates the MC QCD yields.
+    auto makeAbcdQcd = [](std::vector<Process>& processes, const std::vector<double>& templates,
+                          const std::string& channel_name) {
+        for (auto& proc : processes) {
+            if (proc.name != "bkg_qcd") continue;
+            proc.template_values = templates;
+            proc.floor_alpha = 0.0;
+            std::fill(proc.stat_errors.begin(), proc.stat_errors.end(), 0.0);
+            proc.cov.Zero();
+            return;
+        }
+        throw std::runtime_error("Missing bkg_qcd for the per-SR ABCD in channel '" + channel_name + "'");
+    };
+    auto buildModes = [&](PerChannelCard& card) {
+        card.modes.reserve(card.processes.size());
+        for (const auto& p : card.processes) {
+            if (cfg.use_root_covariance && p.template_values.empty()) {
+                card.modes.push_back(decomposeCov(p.cov, cfg.eigen_rel_cutoff));
+            } else {
+                card.modes.emplace_back();
+            }
+            for (size_t k = 0; k < card.modes.back().size(); ++k) {
+                const std::string nuis = "cov_" + card.name + "_" + p.name +
+                                         "_eig" + std::to_string(k);
+                regularizeModeTemplateScale(
+                    cfg, p, card.modes.back()[k], card.name, nuis);
+            }
+        }
+        // Asimov data_obs: sum of all processes (signal+background).
+        card.data_obs.assign(card.n_sr, 0.0);
+        for (const auto& p : card.processes) {
+            for (int i = 0; i < card.n_sr; ++i) card.data_obs[i] += p.yields[i];
+        }
+    };
+
     for (const auto& ch : channels) {
         PerChannelCard pc;
         pc.name = ch.name;
         pc.n_sr = ch.n_sr;
         pc.sr_ids = ch.sr_ids;
+        pc.use_abcd = use_abcd;
+        pc.abcd_scale = ch.qcd_abcd_scale;
+        pc.abcd_scale_error = ch.qcd_abcd_scale_error;
+        pc.per_sr_abcd = use_abcd && ch.per_sr_abcd;
+        pc.abcd_nonclosure = ch.abcd_nonclosure;
+        pc.sample_yields = &ch.sample;
+        pc.sample_info = &reg.samples;
         pc.processes = buildProcesses(ch, reg, sc, use_abcd);
+        if (pc.per_sr_abcd) {
+            makeAbcdQcd(pc.processes, std::vector<double>(pc.n_sr, ch.abcd_tf), ch.name);
+            for (int sr = 0; sr < pc.n_sr; ++sr) {
+                const std::string id = ch.name + "_sr" + std::to_string(pc.sr_ids[sr]);
+                pc.rate_params.push_back("qcdA_" + id + " rateParam " + srBinName(ch.name, pc.sr_ids[sr]) +
+                                         " bkg_qcd (@0*@1/@2) qcdC_" + id + ",qcdB_" + ch.name +
+                                         ",qcdD_" + ch.name);
+            }
+        }
         pc.processes = maybeDropZeroBackgroundProcesses(cfg, std::move(pc.processes), sc, ch.name);
         const Process& signal_proc = getRequiredProcess(pc.processes, "signal", sc, ch.name);
         if (isExactlyZeroProcess(signal_proc)) {
@@ -1683,34 +1952,63 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
                 "Signal process is identically zero for scenario '" + sc.scope + "/" +
                 sc.name + "' in channel '" + ch.name + "'");
         }
-        pc.modes.reserve(pc.processes.size());
-        for (const auto& p : pc.processes) {
-            if (cfg.use_root_covariance) {
-                pc.modes.push_back(decomposeCov(p.cov, cfg.eigen_rel_cutoff));
-            } else {
-                pc.modes.emplace_back();
-            }
-            for (size_t k = 0; k < pc.modes.back().size(); ++k) {
-                const std::string nuis = "cov_" + ch.name + "_" + p.name +
-                                         "_eig" + std::to_string(k);
-                regularizeModeTemplateScale(
-                    cfg, p, pc.modes.back()[k], ch.name, nuis);
-            }
-        }
-        // Asimov data_obs: sum of all process rates (signal+background).
-        pc.data_obs.assign(pc.n_sr, 0.0);
-        for (const auto& p : pc.processes) {
-            for (int i = 0; i < pc.n_sr; ++i) pc.data_obs[i] += p.yields[i];
-        }
+        buildModes(pc);
 
         const std::string shape_path = (work / ("shapes_" + ch.name + ".root")).string();
         writeChannelShape(cfg, pc, shape_path);
 
         pc.datacard_path = (work / ("card_" + ch.name + ".txt")).string();
         // Bin names are globally unique (<channel>_sr<N>), so labels are not
-        // needed and channel names stay identical to the shape directories.
-        writeChannelDatacard(cfg, pc, shape_path, ch, reg);
+        // needed and channel names stay identical to any optional shape dirs.
+        writeChannelDatacard(cfg, pc, shape_path);
         card_tokens.push_back(pc.datacard_path);
+
+        if (pc.per_sr_abcd) {
+            // Control card: bins <channel>_cr<id> (C_i), <channel>_abcdB, <channel>_abcdD with the
+            // same processes, built from the control-region bundles.
+            ChannelData view;
+            view.name = ch.name;
+            view.n_sr = ch.n_sr + 2;
+            view.sample = ch.control_sample;
+            view.group = ch.control_group;
+            view.qcd_predict = ch.control_qcd;
+            PerChannelCard cc;
+            cc.name = ch.name + "_abcdcr";
+            cc.n_sr = view.n_sr;
+            cc.use_abcd = true;
+            cc.per_sr_abcd = true;
+            cc.control = true;
+            for (int id : ch.sr_ids) cc.bin_names.push_back(ch.name + "_cr" + std::to_string(id));
+            cc.bin_names.push_back(ch.name + "_abcdB");
+            cc.bin_names.push_back(ch.name + "_abcdD");
+            cc.processes = buildProcesses(view, reg, sc, true);
+            std::vector<double> templates(ch.n_sr, 1.0);
+            templates.push_back(ch.control_qcd.yields[ch.n_sr]);
+            templates.push_back(ch.control_qcd.yields[ch.n_sr + 1]);
+            if (!(templates[ch.n_sr] > 0.0) || !(templates[ch.n_sr + 1] > 0.0)) {
+                throw std::runtime_error("Per-SR ABCD needs positive MC QCD in B and D in channel '" +
+                                         ch.name + "'");
+            }
+            makeAbcdQcd(cc.processes, templates, ch.name);
+            cc.processes = maybeDropZeroBackgroundProcesses(cfg, std::move(cc.processes), sc, cc.name);
+            buildModes(cc);
+            for (int sr = 0; sr < ch.n_sr; ++sr) {
+                const std::string id = ch.name + "_sr" + std::to_string(ch.sr_ids[sr]);
+                const double c_mc = ch.control_qcd.yields[sr];
+                cc.rate_params.push_back("qcdC_" + id + " rateParam " + cc.bin_names[sr] + " bkg_qcd " +
+                                         formatDouble(c_mc) + " [0," +
+                                         formatDouble(std::max(10.0 * cc.data_obs[sr], 10.0)) + "]");
+            }
+            cc.rate_params.push_back("qcdB_" + ch.name + " rateParam " + cc.bin_names[ch.n_sr] +
+                                     " bkg_qcd 1 [0,10]");
+            cc.rate_params.push_back("qcdD_" + ch.name + " rateParam " + cc.bin_names[ch.n_sr + 1] +
+                                     " bkg_qcd 1 [0,10]");
+            const std::string cr_shape_path = (work / ("shapes_" + cc.name + ".root")).string();
+            writeChannelShape(cfg, cc, cr_shape_path);
+            cc.datacard_path = (work / ("card_" + cc.name + ".txt")).string();
+            writeChannelDatacard(cfg, cc, cr_shape_path);
+            card_tokens.push_back(cc.datacard_path);
+        }
     }
 
     if (card_tokens.empty()) {
@@ -1754,6 +2052,7 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
         os << "cd " << shellQuote(work.string()) << " && "
            << cfg.combine_cmd
            << " -M Significance -t -1 --expectSignal 1 -m 120 "
+           << " --setParameters " << shellQuote(kZeroFloorStart)
            << " -n " << shellQuote(combine_name_sig) << " "
            << shellQuote("datacard.txt");
         runShell(os.str());
@@ -1770,6 +2069,7 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
         os << "cd " << shellQuote(work.string()) << " && "
            << cfg.combine_cmd
            << " -M AsymptoticLimits -t -1 -m 120 --run expected "
+           << " --setParameters " << shellQuote(kZeroFloorStart)
            << " -n " << shellQuote(combine_name_lim) << " "
            << shellQuote("datacard.txt");
         runShell(os.str());
@@ -1782,13 +2082,12 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
     if (!tryReadLimitQuantiles(lim_root, lim_out, limit_parse_failure)) {
         if (limit_parse_failure.find("Missing expected limit quantiles") != std::string::npos) {
             logMessage("WARNING: AsymptoticLimits output is missing expected quantiles; "
-                       "storing significance=0 and infinite expected limits: scenario=" +
+                       "keeping the significance and storing nan expected limits: scenario=" +
                        sc.scope + "/" + sc.name +
                        " qcd_mode=" + mode_tag +
-                       " previous_significance=" + formatDouble(sig_out.significance) +
+                       " significance=" + formatDouble(sig_out.significance) +
                        " reason=" + limit_parse_failure);
-            sig_out.significance = 0.0;
-            setInfiniteExpectedLimits(lim_out);
+            setNanExpectedLimits(lim_out);
         } else {
             throw std::runtime_error(limit_parse_failure);
         }
@@ -1870,7 +2169,10 @@ int runMain() {
     logMessage("combine.C: output_dir=" + cfg.output_dir);
     logMessage("combine.C: work_dir=" + cfg.work_dir);
     logMessage(std::string("combine.C: root covariance nuisances=") +
-               (cfg.use_root_covariance ? "enabled" : "disabled"));
+               (cfg.use_root_covariance ? "enabled" : "disabled") +
+               ", MC statistics=" +
+               (cfg.use_root_covariance ? "covariance eigen-modes"
+                                        : "autoMCStats + zero-count gmN floor"));
     {
         std::ostringstream msg;
         msg << "combine.C: lumi_unc=" << cfg.lumi_unc << ", trigger_unc=" << cfg.trigger_unc
@@ -1898,16 +2200,44 @@ int runMain() {
                ", signal_samples=" + std::to_string(reg.signal_samples.size()) +
                ", qcd_classes=" + std::to_string(reg.qcd_classes.size()));
 
-    const bool read_mc_stat = nuisanceEnabled(cfg.enabled_nuisances, "mcstat");
-    const bool read_abcd = nuisanceEnabled(cfg.enabled_nuisances, "abcd_nonclosure") ||
-                           nuisanceEnabled(cfg.enabled_nuisances, "abcd_mcstat");
     std::vector<ChannelData> channels;
     for (const auto& ch : cfg.channels) {
-        channels.push_back(loadChannel(ch, read_mc_stat, read_abcd));
+        channels.push_back(loadChannel(ch));
         validateChannelAgainstRegistry(channels.back(), reg);
+        std::set<std::string> checked;  // one check per input file (the theory JSON feeds four nuisances)
+        for (const auto& spec : kRatioNuisances) {
+            auto it = cfg.ratios.find(spec.nuisance);
+            if (it == cfg.ratios.end() || !checked.insert(spec.config_key).second) continue;
+            checkSrProvenance(it->second, spec.config_key, channels.back());
+        }
     }
 
+    // A failed scenario (combine error, invalid inputs) is logged and stored as nan, so the
+    // other scenarios and the CSVs are still produced; the run then exits non-zero.
+    int n_failed = 0;
+    auto runScenario = [&](const std::vector<ChannelData>& scenario_channels, const Scenario& sc,
+                           bool use_abcd, const std::string& tag_prefix,
+                           CombineOutput& sig_out, CombineOutput& lim_out) {
+        try {
+            buildAndRun(cfg, reg, scenario_channels, sc, use_abcd, tag_prefix, sig_out, lim_out);
+        } catch (const std::exception& e) {
+            ++n_failed;
+            logMessage("ERROR: scenario failed, storing nan: scope=" + sc.scope + " name=" + sc.name +
+                       " qcd_mode=" + (use_abcd ? "abcd" : "mc") +
+                       (tag_prefix.empty() ? "" : " " + tag_prefix) + ": " + e.what());
+            sig_out.significance = std::numeric_limits<double>::quiet_NaN();
+            setNanExpectedLimits(lim_out);
+        }
+    };
+
     std::vector<Scenario> scenarios = buildScenarios(reg);
+    if (!cfg.scenario_scopes.empty()) {
+        std::vector<Scenario> kept;
+        for (auto& sc : scenarios) {
+            if (cfg.scenario_scopes.count(sc.scope)) kept.push_back(std::move(sc));
+        }
+        scenarios = std::move(kept);
+    }
     logMessage("Scenarios: " + std::to_string(scenarios.size()));
 
     std::vector<CombineOutput> sig_mc(scenarios.size());
@@ -1918,9 +2248,9 @@ int runMain() {
     for (size_t i = 0; i < scenarios.size(); ++i) {
         const auto& sc = scenarios[i];
         logMessage("=== Scenario: scope=" + sc.scope + " name=" + sc.name + " (MC true QCD) ===");
-        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/false, "", sig_mc[i], lim_mc[i]);
+        runScenario(channels, sc, /*use_abcd=*/false, "", sig_mc[i], lim_mc[i]);
         logMessage("=== Scenario: scope=" + sc.scope + " name=" + sc.name + " (ABCD QCD) ===");
-        buildAndRun(cfg, reg, channels, sc, /*use_abcd=*/true, "", sig_abcd[i], lim_abcd[i]);
+        runScenario(channels, sc, /*use_abcd=*/true, "", sig_abcd[i], lim_abcd[i]);
     }
 
     std::vector<std::string> channel_result_names;
@@ -1946,9 +2276,7 @@ int runMain() {
             logMessage("=== Channel scenario: channel=" + ch.name +
                        " scope=" + sc.scope + " name=" + sc.name +
                        " (MC true QCD) ===");
-            buildAndRun(
-                cfg,
-                reg,
+            runScenario(
                 single_channel,
                 sc,
                 /*use_abcd=*/false,
@@ -1958,9 +2286,7 @@ int runMain() {
             logMessage("=== Channel scenario: channel=" + ch.name +
                        " scope=" + sc.scope + " name=" + sc.name +
                        " (ABCD QCD) ===");
-            buildAndRun(
-                cfg,
-                reg,
+            runScenario(
                 single_channel,
                 sc,
                 /*use_abcd=*/true,
@@ -2002,6 +2328,11 @@ int runMain() {
     if (!cfg.keep_work) {
         std::error_code ec;
         fs::remove_all(cfg.work_dir, ec);
+    }
+    if (n_failed > 0) {
+        logMessage("combine.C done with " + std::to_string(n_failed) +
+                   " failed scenario runs (stored as nan in the CSVs)");
+        return 1;
     }
     logMessage("combine.C done");
     return 0;

@@ -226,14 +226,18 @@ def _process_tree_shapes(tree_name, no_selection=False, stat_band=False, n_worke
             mc_n_totals[sname]     = n_total
             mc_sample_files[sname] = files
 
-    # ---- Step 2: parallel pre-pass (ranges + reweight sums) ----
-    mc_raw_w_sums = {}
+    # ---- Step 2: parallel pre-pass (ranges) ----
+    # MC normalisation is absolute (N_tree x all-generated-event mean of raw_w, gen_weight.py).
+    mc_raw_w_sums = {
+        sname: float(mc_n_totals[sname]) * dm.reweight_mean(dm.SAMPLE_INFO[sname], reweight_branches, sname)
+        for sname in mc_sample_files
+    }
     prepass_mins  = {b:  np.inf for b in auto_range_branches}
     prepass_maxs  = {b: -np.inf for b in auto_range_branches}
     tasks, labels = [], []
     for sname in mc_sample_files:
         tasks.append((mc_sample_files[sname], tree_name, auto_range_branches,
-                      reweight_branches, branch_logx, not no_selection))
+                      [], branch_logx, not no_selection))
         labels.append(sname)
     log_message(f"Pre-pass: {len(tasks)} MC samples ({n_workers} workers)")
     if n_workers > 1 and len(tasks) > 1:
@@ -241,11 +245,10 @@ def _process_tree_shapes(tree_name, no_selection=False, stat_band=False, n_worke
             results = pool.map(dm._prepass_worker, tasks)
     else:
         results = [dm._prepass(*t) for t in tasks]
-    for sname, (rw_sum, ranges) in zip(labels, results):
+    for sname, (_rw_sum, ranges) in zip(labels, results):
         for b, (lo, hi) in ranges.items():
             prepass_mins[b] = min(prepass_mins[b], lo)
             prepass_maxs[b] = max(prepass_maxs[b], hi)
-        mc_raw_w_sums[sname] = rw_sum if rw_sum > 0 else float(mc_n_totals[sname])
 
     merged_ranges = {}
     for b in auto_range_branches:
@@ -279,7 +282,8 @@ def _process_tree_shapes(tree_name, no_selection=False, stat_band=False, n_worke
                             if raw_entries > 0 else 0.0)
             stream_tasks.append((mc_sample_files[sname], tree_name, branch_edges,
                                  target_total, mc_raw_w_sums[sname], reweight_branches,
-                                 plot_thresholds, plot_clip_ranges, not no_selection))
+                                 plot_thresholds, plot_clip_ranges, not no_selection,
+                                 dm.require_genweight_mean(info.get("genweight_mean"), sname)))
             stream_labels.append((cls_name, sname))
     log_message(f"Streaming histograms: {len(stream_tasks)} samples ({n_workers} workers)")
     if n_workers > 1 and len(stream_tasks) > 1:

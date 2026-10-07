@@ -19,8 +19,9 @@ that ``qcd_est.py`` applies, so the regions match the ABCD method exactly.
 PDF uncertainty: the method must match the PDF set type, set via the config key
   ``pdf_uncertainty_method``:
     "hessian_symmetric" (DEFAULT) -- for symmetric-Hessian sets such as
-      NNPDF31_nnlo_hessian_pdfas (LHA 306000), which is what these samples use
-      (LHE combine type "symmhessian+as").  sigma = sqrt(sum_i (Y_i/Y_0 - 1)^2)
+      NNPDF31_nnlo_hessian_pdfas (LHA 306000) or
+      NNPDF31_nnlo_as_0118_nf_4_mc_hessian (LHA 325500, used by the v5 VVV/VV
+      samples).  sigma = sqrt(sum_i (Y_i/Y_0 - 1)^2)
       over the 100 Hessian members, applied as +/- around the central member.
     "mc_replica" -- PDF4LHC replica prescription (arXiv:1510.03865 §6.2):
       sort the 100 replica yields, take the 16th and 84th as the 68% CL interval.
@@ -29,7 +30,9 @@ PDF uncertainty: the method must match the PDF set type, set via the config key
   alpha_s ("+as"): when the LHEPdfWeightAlphaS branch is present (mode 0 now
   stores the two alpha_s members 306101/306102), the alpha_s variation
   (Y_up - Y_down)/2 is folded into the PDF uncertainty in quadrature. Files
-  produced before that convert change get the Hessian PDF part only.
+  produced before that convert change get the Hessian PDF part only. Sets
+  without alpha_s members (e.g. LHA 325500, 101 weights) leave the branch at
+  the 1.0 placeholder; such samples are reported with alphas_available=false.
 Scale uncertainty: envelope of 7 (mu_R, mu_F) combinations excluding the two
   anti-correlated corners (LHEScaleWeight indices 2 and 6).
 PS uncertainty: PSWeight is [0] isr.murfac=2.0; [1] fsr.murfac=2.0;
@@ -52,6 +55,7 @@ Outputs (written to output_dir):
 
 import csv
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -68,6 +72,7 @@ _BDT_TOOLS_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "BDT"))
 if _BDT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _BDT_TOOLS_DIR)
 import model_io  # noqa: E402
+from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean  # noqa: E402
 
 
 def log(msg):
@@ -309,6 +314,8 @@ def _build_tree_context(tree):
         clip_ranges=clip_ranges, log_transform=log_transform,
         decorrelate=decorrelate, sr_df=sr_df, axes=axes, bin_ids=bin_ids,
         sr_csv=sr_csv,
+        # SR provenance for combine: first 13 hex digits of the SHA-256 of the SR CSV bytes.
+        sr_csv_hash=hashlib.sha256(open(sr_csv, "rb").read()).hexdigest()[:13],
     )
     log(f"  [{tree}] regions enabled: {len(bin_ids)} SRs from {os.path.basename(sr_csv)}, "
         f"axes={axes}")
@@ -436,6 +443,7 @@ def _ratios_from_sums(nom_sum, pdf_sums, scale_sums, ps_sums, n_events, alphas_s
         "nom_sum":     float(nom_sum),
         "pdf_method":  PDF_METHOD,
         "pdf_alphas_unc": float(sigma_as),
+        "alphas_available": alphas_sums is not None,
         "pdf_up":      pdf_up,      "pdf_down":     pdf_down,  "pdf_central": pdf_central,
         "scale_up":    scale_up,    "scale_down":   scale_down,
         "ps_isr_up":   ps_isr_up,   "ps_isr_down":  ps_isr_down,
@@ -459,11 +467,12 @@ def _compute_ratios(sample_name, ctx):
     thresholds = ctx["thresholds"]
     enabled = ctx["regions_enabled"]
     n_slots = 1 + (len(ctx["bin_ids"]) if enabled else 0)
+    genweight_mean = require_genweight_mean(SAMPLE_INFO[sample_name].get("genweight_mean"), sample_name)
 
     # LHEPdfWeightAlphaS is optional (only present after re-running mode 0 with
     # the alpha_s branch); folded into the PDF uncertainty when available.
     theory_branches = ["LHEPdfWeight", "LHEScaleWeight", "PSWeight"]
-    load_set = {"weight_pu", *theory_branches, *thresholds.keys()}
+    load_set = {"weight_pu", GEN_WEIGHT_BRANCH, *theory_branches, *thresholds.keys()}
     if enabled:
         load_set.update(ctx["feature_cols"])
     load_list = sorted(load_set)
@@ -495,20 +504,31 @@ def _compute_ratios(sample_name, ctx):
             if missing:
                 raise KeyError(f"{fpath}:{ctx['_tree']} lacks the branches {missing}; "
                                f"re-run mode 0 (convert)")
-            # LHEPdfWeightAlphaS is optional (files converted before the alpha_s
-            # branch existed); folded into the PDF uncertainty when available.
-            actual = load_list + (["LHEPdfWeightAlphaS"] if "LHEPdfWeightAlphaS" in avail else [])
+            # LHEPdfWeightAlphaS and nLHEPdfWeight are optional (files converted before
+            # these branches existed); alpha_s is folded into the PDF uncertainty when available.
+            actual = load_list + [b for b in ("LHEPdfWeightAlphaS", "nLHEPdfWeight") if b in avail]
             for chunk in tree.iterate(expressions=actual, step_size=CHUNK_SIZE, library="np"):
                 mask = _threshold_mask(chunk, thresholds)
                 if not mask.any():
                     continue
-                w_pu    = np.asarray(chunk["weight_pu"],      dtype=np.float64)[mask]
+                # Nominal weight with the signed generator-weight factor.
+                w_pu    = (np.asarray(chunk["weight_pu"], dtype=np.float64)[mask]
+                           * gen_weight_factor(np.asarray(chunk[GEN_WEIGHT_BRANCH])[mask],
+                                               genweight_mean, sample_name))
                 pdf_w   = np.asarray(chunk["LHEPdfWeight"],   dtype=np.float64)[mask]
                 scale_w = np.asarray(chunk["LHEScaleWeight"], dtype=np.float64)[mask]
                 ps_w    = np.asarray(chunk["PSWeight"],       dtype=np.float64)[mask]
                 if "LHEPdfWeightAlphaS" in chunk:
                     as_w = np.asarray(chunk["LHEPdfWeightAlphaS"], dtype=np.float64)[mask]
-                    has_alphas[0] = True
+                    # convert_branch.C fills 1.0 when the PDF set has no alpha_s
+                    # members (e.g. LHA 325500 with 101 weights). It now also stores
+                    # nLHEPdfWeight: alpha_s members exist iff >= 103 weights; older
+                    # files fall back to treating non-placeholder values as present.
+                    if "nLHEPdfWeight" in chunk:
+                        if np.any(np.asarray(chunk["nLHEPdfWeight"])[mask] >= 103):
+                            has_alphas[0] = True
+                    elif np.any(as_w != 1.0):
+                        has_alphas[0] = True
                 else:
                     as_w = None
 
@@ -524,6 +544,10 @@ def _compute_ratios(sample_name, ctx):
                             _accumulate(j + 1, w_pu[rmask], pdf_w[rmask],
                                         scale_w[rmask], ps_w[rmask],
                                         as_w[rmask] if as_w is not None else None)
+
+    if not has_alphas[0]:
+        log(f"    WARNING [{sample_name}] no alpha_s variations stored (LHEPdfWeightAlphaS absent "
+            f"or placeholder 1.0): PDF uncertainty excludes alpha_s (alphas_available=false)")
 
     def _slot_alphas(slot):
         return alphas_sums[slot] if has_alphas[0] else None
@@ -613,6 +637,7 @@ def main():
                             f"  pdf=[{_pct(rr['pdf_down'])}, {_pct(rr['pdf_up'])}]"
                             f"  scale=[{_pct(rr['scale_down'])}, {_pct(rr['scale_up'])}]")
                 entry["regions"] = region_out
+                entry["sr_csv_hash"] = ctx["sr_csv_hash"]
 
             all_results[(sample_name, tree_name)] = entry
 

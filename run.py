@@ -118,8 +118,10 @@ Sample selection for modes 0, 1, 6:
     p.add_argument("--slurm-partition", default="", metavar="NAME",
                    help="SLURM partition passed as sbatch --partition (default: cluster default)")
     p.add_argument("--slurm-time", default="24:00:00", metavar="HH:MM:SS")
-    p.add_argument("--slurm-mem", default="4G", metavar="MEM")
-    p.add_argument("--slurm-cpus", type=int, default=1, metavar="N")
+    p.add_argument("--slurm-mem", default=None, metavar="MEM",
+                   help="Memory per SLURM job (default: 200G for mode 2, else 4G)")
+    p.add_argument("--slurm-cpus", type=int, default=None, metavar="N",
+                   help="CPUs per SLURM job (default: 32 for mode 2, else 1)")
     p.add_argument("--slurm-extra", default="", metavar="ARGS",
                    help="Extra sbatch arguments (space-separated)")
     p.add_argument("--slurm-files-per-job", type=int, default=50, metavar="N",
@@ -146,6 +148,11 @@ Sample selection for modes 0, 1, 6:
         rest += [tok for tok in passthrough if not tok.startswith("-")]
         passthrough = [tok for tok in passthrough if tok.startswith("-")]
     args.passthrough = passthrough
+    # One BDT training job (mode 2) needs far more than a conversion batch.
+    if args.slurm_cpus is None:
+        args.slurm_cpus = 32 if args.mode == 2 else 1
+    if args.slurm_mem is None:
+        args.slurm_mem = "200G" if args.mode == 2 else "4G"
 
     # config.json may appear in any position; pull it out, the rest are sample names.
     args.config_input = None
@@ -416,6 +423,44 @@ def copy_log_to_output_dirs(mode, config_path, work_dir, log_path):
 # ---------------------------------------------------------------------------
 # Python-script modes (2-5)
 # ---------------------------------------------------------------------------
+
+def submit_training_jobs(mode_cfg, config_path, work_dir, args):
+    """Mode 2 with --slurm: one SLURM job per tree in the config's submit_trees, each running
+    train.py restricted to that tree (BDT_TREES), so the trees train in parallel."""
+    trees = json.loads(Path(config_path).read_text()).get("submit_trees", [])
+    if not trees:
+        sys.exit(f"mode=2 --slurm: no submit_trees in {config_path}")
+    for tree in trees:
+        job_name = f"{mode_cfg['label']}_{tree}"
+        cmd = [
+            "sbatch",
+            f"--job-name={job_name}",
+            f"--output={work_dir}/{job_name}_%j.out",
+            f"--error={work_dir}/{job_name}_%j.out",
+            f"--cpus-per-task={args.slurm_cpus}",
+            f"--mem={args.slurm_mem}",
+            f"--time={args.slurm_time}",
+        ]
+        if args.slurm_exclude:
+            cmd.append(f"--exclude={args.slurm_exclude}")
+        if args.slurm_account:
+            cmd.append(f"--account={args.slurm_account}")
+        if args.slurm_partition:
+            cmd.append(f"--partition={args.slurm_partition}")
+        if args.slurm_extra:
+            cmd.extend(args.slurm_extra.split())
+        script_cmd = " ".join(["python3", f"./{mode_cfg['script']}", *(args.passthrough or [])])
+        cmd.append(
+            f"--wrap=cd {work_dir} && export OMP_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}}; "
+            f"env {mode_cfg['config_env']}={config_path} BDT_TREES={tree} {script_cmd}"
+        )
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=work_dir)
+        if r.returncode != 0:
+            sys.exit(f"sbatch failed for tree={tree}: {r.stderr.decode().strip()}")
+        log(f"submitted tree={tree} slurm_job_id={r.stdout.decode().strip().split()[-1]}")
+    log("all jobs submitted to SLURM")
+    return 0
+
 
 def run_python_mode(mode_cfg, config_path, work_dir, passthrough=None):
     env = {**os.environ, mode_cfg["config_env"]: str(config_path)}
@@ -867,7 +912,10 @@ def main():
         log(f"work_dir={work_dir}")
         log(f"config={config_path}")
         log(f"started job={label} pid={os.getpid()}")
-        status = run_python_mode(mode_cfg, config_path, work_dir, args.passthrough)
+        if mode == 2 and args.slurm:
+            status = submit_training_jobs(mode_cfg, config_path, work_dir, args)
+        else:
+            status = run_python_mode(mode_cfg, config_path, work_dir, args.passthrough)
         log(f"finished job={label} pid={os.getpid()} status={status}")
         sys.exit(status)
 

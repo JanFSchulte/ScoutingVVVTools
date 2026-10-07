@@ -13,7 +13,8 @@ signal-region definition.
   <syst>_up   = sum(weight_branch on <tree>__<syst>_up)   / sum(weight_branch on <tree>)
   <syst>_down = sum(weight_branch on <tree>__<syst>_down) / sum(weight_branch on <tree>)
 
-A variation without events in a region has ratio 0. Regions: the thresholds of
+Every event weight carries the signed generator-weight factor genWeight / genweight_mean
+(selections/BDT/gen_weight.py). A variation without events in a region has ratio 0. Regions: the thresholds of
 the BDT selection.json (the ABCD window included) are applied with
 qcd_est.py's semantics (sentinel values fail), so each signal region is the
 ABCD A region whose yields combine uses, and the inclusive entry is the
@@ -28,6 +29,7 @@ Outputs (written to output_dir):
 
 import csv
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -41,6 +43,7 @@ _BDT_TOOLS_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "BDT"))
 if _BDT_TOOLS_DIR not in sys.path:
     sys.path.insert(0, _BDT_TOOLS_DIR)
 import model_io  # noqa: E402
+from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean  # noqa: E402
 
 # Keys of the removed one-dataset-per-variation scheme.
 REMOVED_CONFIG_KEYS = ("input_root_up", "input_root_down")
@@ -243,6 +246,8 @@ def build_tree_context(script_dir, bdt_root_cfg, sr_csv_cfg, tree):
         clip_ranges=clip_ranges, log_transform=log_transform,
         decorrelate=decorrelate, sr_df=sr_df, axes=axes, bin_ids=bin_ids,
         sr_csv=sr_csv,
+        # SR provenance for combine: first 13 hex digits of the SHA-256 of the SR CSV bytes.
+        sr_csv_hash=hashlib.sha256(open(sr_csv, "rb").read()).hexdigest()[:13],
     )
     log(f"  [{tree}] regions enabled: {len(bin_ids)} SRs from {os.path.basename(sr_csv)}, "
         f"axes={axes}")
@@ -271,16 +276,16 @@ def infer_proba(chunk, mask, ctx):
 # Weighted SR yield accumulation of one tree
 # ---------------------------------------------------------------------------
 
-def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size):
-    """Sum `weight_branch` inclusive (slot 0) and per SR (slots 1..N) over one
-    tree (nominal or variation) of the converted files. Returns
+def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size, genweight_mean):
+    """Sum `weight_branch` x genWeight / genweight_mean inclusive (slot 0) and per SR
+    (slots 1..N) over one tree (nominal or variation) of the converted files. Returns
     {"inclusive": slot, "regions": {bin_id: slot} or None} with
     slot = {"sum": float, "n_events": int}."""
     thresholds = ctx["thresholds"]
     enabled = ctx["regions_enabled"]
     n_slots = 1 + (len(ctx["bin_ids"]) if enabled else 0)
 
-    load_set = {weight_branch, *thresholds.keys()}
+    load_set = {weight_branch, GEN_WEIGHT_BRANCH, *thresholds.keys()}
     if enabled:
         load_set.update(ctx["feature_cols"])
     load_list = sorted(load_set)
@@ -304,7 +309,8 @@ def accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_si
                 if not mask.any():
                     continue
 
-                w = np.asarray(chunk[weight_branch], dtype=np.float64)[mask]
+                w = (np.asarray(chunk[weight_branch], dtype=np.float64)[mask]
+                     * gen_weight_factor(np.asarray(chunk[GEN_WEIGHT_BRANCH])[mask], genweight_mean))
                 sum_w[0] += float(w.sum())
                 n_events[0] += int(mask.sum())
 
@@ -422,11 +428,13 @@ def run(syst, script_dir, config_env):
                     f"No converted files for MC sample {sample_name} under {input_root} "
                     f"(pattern {input_pattern}); convert it or leave it out of submit_samples"
                 )
-            nominal = accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size)
+            genweight_mean = require_genweight_mean(sample_info[sample_name].get("genweight_mean"), sample_name)
+            nominal = accumulate_weighted_sr_yields(files, tree_name, ctx, weight_branch, chunk_size,
+                                                    genweight_mean)
             up = accumulate_weighted_sr_yields(files, f"{tree_name}__{up_key}", ctx, weight_branch,
-                                               chunk_size)
+                                               chunk_size, genweight_mean)
             down = accumulate_weighted_sr_yields(files, f"{tree_name}__{down_key}", ctx, weight_branch,
-                                                 chunk_size)
+                                                 chunk_size, genweight_mean)
 
             if nominal["inclusive"]["n_events"] < 1 or nominal["inclusive"]["sum"] <= 0.0:
                 log(f"    [{sample_name}/{tree_name}] no nominal events after the thresholds -> no entry")
@@ -454,6 +462,7 @@ def run(syst, script_dir, config_env):
                     log(f"    SR{bid}: n={rr['n_events']}"
                         f"  {up_key}={_pct(rr[up_key])}  {down_key}={_pct(rr[down_key])}")
                 entry["regions"] = region_out
+                entry["sr_csv_hash"] = ctx["sr_csv_hash"]
 
             nested.setdefault(sample_name, {})[tree_name] = entry
 

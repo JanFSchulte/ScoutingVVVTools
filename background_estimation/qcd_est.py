@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import colorsys
 import json
 import math
@@ -76,6 +77,7 @@ _BDT_DIR = os.path.join(_SELECTIONS_DIR, "BDT")
 if _BDT_DIR not in sys.path:
     sys.path.insert(0, _BDT_DIR)
 
+from gen_weight import GEN_WEIGHT_BRANCH, gen_weight_factor, require_genweight_mean, reweight_mean
 from model_io import (
     load_model as _shared_load_model,
     predict_model_proba as _shared_predict_model_proba,
@@ -157,6 +159,16 @@ if ABCD_SIDEBAND_MODE not in {"complement", "annulus"}:
         f"abcd_sideband_mode must be 'complement' or 'annulus', got {ABCD_SIDEBAND_MODE!r}")
 if ABCD_SIDEBAND_WIDTH <= 0.0:
     raise ValueError(f"abcd_sideband_width must be > 0, got {ABCD_SIDEBAND_WIDTH}")
+# ABCD prediction (abcd_mode):
+#   "union"  (default) = one scale B*C/D / A_union applied to the MC-true QCD shape of the SRs.
+#   "per_sr" = every SR i gets its own prediction C_i * B/D, where C_i is the SR box in the
+#              control window abcd_control_window of the (single) ABCD branch inside its fail
+#              region (e.g. the low-mass sideband 0 < msoftdrop_1 < 50 GeV) and B / D are the
+#              pass region / control window in the B/D sideband; combine fits C_i, B and D to the
+#              data (combine.C), with abcd_per_sr_nonclosure as the non-closure uncertainty.
+ABCD_MODE = str(qcd_cfg.get("abcd_mode", "union")).strip().lower()
+if ABCD_MODE not in {"union", "per_sr"}:
+    raise ValueError(f"abcd_mode must be 'union' or 'per_sr', got {ABCD_MODE!r}")
 TEST_REFERENCE_QCD_EST = os.path.join(BDT_ROOT, "test_reference_qcd_est.npz")
 TEST_REFERENCE_QCD_EST_FULL = os.path.join(BDT_ROOT, "test_reference_qcd_est_full.npz")
 
@@ -264,6 +276,23 @@ QCD_PREDICT_SCALE_MULTIPLIER = _resolve_tree_float(
     TREE_NAME,
     "qcd_predict_scale_multipliers",
 )
+ABCD_CONTROL_WINDOW = None
+ABCD_PER_SR_NONCLOSURE = 0.0
+if ABCD_MODE == "per_sr":
+    if len(ABCD_BRANCH_NAMES) != 1:
+        raise RuntimeError("abcd_mode 'per_sr' needs exactly one ABCD branch per tree")
+    _window = qcd_cfg.get("abcd_control_window", {}).get(TREE_NAME)
+    if (not isinstance(_window, list) or len(_window) != 2
+            or not all(isinstance(v, (int, float)) for v in _window) or not _window[0] < _window[1]):
+        raise RuntimeError(
+            f"abcd_mode 'per_sr' needs abcd_control_window['{TREE_NAME}'] = [low, high] with low < high"
+        )
+    ABCD_CONTROL_WINDOW = (float(_window[0]), float(_window[1]))
+    if TREE_NAME not in qcd_cfg.get("abcd_per_sr_nonclosure", {}):
+        raise RuntimeError(f"abcd_mode 'per_sr' needs abcd_per_sr_nonclosure['{TREE_NAME}']")
+    ABCD_PER_SR_NONCLOSURE = _resolve_tree_float(qcd_cfg, TREE_NAME, "abcd_per_sr_nonclosure")
+    if QCD_PREDICT_SCALE_MULTIPLIER != 1.0:
+        raise RuntimeError("qcd_predict_scale_multipliers is not supported with abcd_mode 'per_sr'")
 
 QCD_CLASS_NAMES = [class_name for class_name in CLASS_NAMES if "qcd" in class_name.lower()]
 if not QCD_CLASS_NAMES:
@@ -272,22 +301,15 @@ QCD_CLASS_SET = set(QCD_CLASS_NAMES)
 QCD_PREDICT_GROUP_NAME = "QCD"
 
 
-def _poisson_vars_from_yield(values: np.ndarray) -> np.ndarray:
-    """Variance for combine: weighted yields are treated as Poisson counts."""
-    vals = np.asarray(values, dtype=float)
-    return np.maximum(vals, 0.0)
-
-
-def _diag_cov_from_vars(vars_: np.ndarray) -> np.ndarray:
-    return np.diag(np.maximum(np.asarray(vars_, dtype=float), 0.0))
-
-
 # -------------------- Sample registry --------------------
 SAMPLE_INFO = {}
 for rule in sample_cfg["sample"]:
     SAMPLE_INFO[rule["name"]] = {
         "xsection": float(rule["xsection"]),
         "raw_entries": int(rule.get("raw_entries", -1)),
+        "genweight_mean": rule.get("genweight_mean"),
+        # all-event means of the reweight branches (weight_pu*_mean), absolute normalisation
+        **{key: value for key, value in rule.items() if key.startswith("weight_") and key.endswith("_mean")},
         "is_MC": bool(rule["is_MC"]),
         "is_signal": bool(rule["is_signal"]),
         "sample_ID": int(rule["sample_ID"]),
@@ -682,7 +704,7 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
 
     reweight_branches = list(cfg.get(TREE_NAME, {}).get("event_reweight_branches", []))
     load_branches = list(branches)
-    for rb in reweight_branches:
+    for rb in reweight_branches + [GEN_WEIGHT_BRANCH]:
         if rb not in load_branches:
             load_branches.append(rb)
 
@@ -703,6 +725,8 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
             raise RuntimeError(
                 f"Sample '{sample_name}' has raw_entries={raw_entries}; fill src/sample.json"
             )
+        genweight_mean = require_genweight_mean(info["genweight_mean"], sample_name)
+        raw_w_mean = reweight_mean(info, reweight_branches, sample_name)
 
         parts = []
         for seg in sample_meta["test_segments"]:
@@ -745,6 +769,10 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
             df = df.drop(columns=reweight_branches)
         else:
             raw_w = np.ones(n_loaded, dtype=float)
+        # Signed generator-weight factor and absolute reweight normalisation (gen_weight.py).
+        gen_w = gen_weight_factor(df[GEN_WEIGHT_BRANCH].to_numpy(dtype=float, copy=False),
+                                  genweight_mean, sample_name)
+        df = df.drop(columns=[GEN_WEIGHT_BRANCH])
 
         if xsec <= 0.0:
             target_total = 0.0
@@ -754,12 +782,7 @@ def load_test_data(branches: list[str]) -> pd.DataFrame:
             )
         else:
             target_total = LUMI * xsec * total_entries / raw_entries
-            raw_w_sum = float(raw_w.sum())
-            if raw_w_sum <= 0.0:
-                raise RuntimeError(
-                    f"Sample '{sample_name}' has non-positive raw weight sum {raw_w_sum:.6g}"
-                )
-            df["weight"] = raw_w * (target_total / raw_w_sum)
+            df["weight"] = raw_w * gen_w * (target_total / (float(n_loaded) * raw_w_mean))
 
         df["class_idx"] = SAMPLE_TO_CLASS[sample_name]
         df["sample_name"] = sample_name
@@ -1301,49 +1324,78 @@ def write_root_output(
     signal_region_ids: List[int],
     sample_yields: Dict[str, np.ndarray],
     sample_vars: Dict[str, np.ndarray],
+    sample_entries: Dict[str, np.ndarray],
+    sample_mean_weights: Dict[str, float],
     group_yields: Dict[str, np.ndarray],
     group_vars: Dict[str, np.ndarray],
+    group_entries: Dict[str, np.ndarray],
+    group_mean_weights: Dict[str, float],
     pred_qcd_vals: np.ndarray,
     pred_qcd_stat_vars: np.ndarray,
     pred_qcd_scale_vars: np.ndarray,
     pred_qcd_cov: np.ndarray,
+    qcd_entries: np.ndarray,
+    qcd_scale: float,
+    qcd_scale_sigma: float,
     true_qcd_vals: np.ndarray,
     true_qcd_vars: np.ndarray,
+    qcd_mean_weight: float,
     pred_total_vals: np.ndarray,
     pred_total_stat_vars: np.ndarray,
     pred_total_scale_vars: np.ndarray,
     pred_total_cov: np.ndarray,
     true_total_vals: np.ndarray,
     true_total_vars: np.ndarray,
-    mc_vars: Dict[str, np.ndarray],
-    abcd_closure: Dict[str, float],
+    total_entries: np.ndarray,
+    total_mean_weight: float,
+    per_sr_abcd: Optional[dict] = None,
 ) -> None:
-    """Write the combine inputs. Besides the Poisson-convention stat_error /
-    scale_error / covariance_total, every SR of every bundle has mc_stat_error
-    = sqrt(sum w^2) of the test-split MC (for the ABCD prediction: the per-SR
-    part from the A-region fractions), qcd_predict / total_predict also
-    mc_scale_error (the SR-correlated part from the B/C/D statistics), and
-    metadata/abcd_closure holds the ABCD scale factors. mc_vars maps each
-    bundle prefix to its MC variances (and "<prefix>:scale" to the scale part)."""
+    """Write the combine-facing ROOT file.
+
+    stat_error is the finite-MC uncertainty sqrt(sum w^2) (for qcd_predict: the MC
+    statistics of the per-SR A_i/A shape fraction); scale_error is the ABCD
+    B/C/D-propagated scale uncertainty, also stored as qcd_predict/abcd_scale_error
+    next to qcd_predict/abcd_scale (= predicted / MC-true QCD in the A union, i.e.
+    the MC closure). n_entries holds the raw MC event counts per SR and
+    mean_event_weight the bundle's typical per-event weight (median |w|; the name is kept
+    for combine) over all selected events, used by combine for the zero-count floor. Negative SR yields (possible with
+    signed generator weights) are written as 0 with a warning.
+
+    With abcd_mode 'per_sr' (per_sr_abcd given) the file also holds the marker
+    qcd_predict/per_sr_abcd = 1, the MC transfer factor qcd_predict/abcd_tf (= QCD B/D) with its
+    MC-stat error abcd_tf_error, the configured qcd_predict/abcd_nonclosure, and, in the same
+    bundle layout, the control regions C_i (control/samples/*, control/groups/*,
+    control/qcd_true; sr{bin_index} = the control region of that SR) and the B/D regions
+    (abcd_bd/samples/*, abcd_bd/groups/*, abcd_bd/qcd_true with sub-bins b and d).
+    """
     sr_ids = np.asarray(signal_region_ids, dtype=np.int32)
     if sr_ids.ndim != 1 or len(sr_ids) == 0:
         raise RuntimeError("Signal region ids must be a non-empty one-dimensional list")
     if len(set(int(value) for value in sr_ids)) != len(sr_ids) or np.any(sr_ids <= 0):
         raise RuntimeError("Signal region ids must be unique positive integers")
 
+    one_bin_edges = np.array([0.0, 1.0], dtype=float)
+
     def _write_bundle(
         root_file,
         prefix: str,
         values: np.ndarray,
         stat_vars: np.ndarray,
+        n_entries: np.ndarray,
+        mean_event_weight: float,
         scale_vars: np.ndarray | None = None,
         covariance_total: np.ndarray | None = None,
+        bin_names: Optional[List[str]] = None,
     ) -> None:
-        mc_stat_err = np.sqrt(np.maximum(np.asarray(mc_vars[prefix], dtype=float), 0.0))
-        mc_scale_vars = mc_vars.get(f"{prefix}:scale")
-        mc_scale_err = (None if mc_scale_vars is None
-                        else np.sqrt(np.maximum(np.asarray(mc_scale_vars, dtype=float), 0.0)))
-        vals = np.asarray(values, dtype=float)
+        vals = np.asarray(values, dtype=float).copy()
+        negative = vals < 0.0
+        if np.any(negative):
+            log_warning(
+                f"ROOT bundle '{prefix}': negative SR yields {vals[negative].tolist()} "
+                f"(signed generator weights) written as 0"
+            )
+            vals[negative] = 0.0
+        n_entries = np.asarray(n_entries, dtype=float)
         stat_vars = np.asarray(stat_vars, dtype=float)
         if scale_vars is None:
             scale_vars = np.zeros_like(stat_vars)
@@ -1355,20 +1407,22 @@ def write_root_output(
             covariance_total = np.asarray(covariance_total, dtype=float)
 
         n_sr = len(vals)
-        if n_sr != len(sr_ids):
+        if bin_names is None:
+            bin_names = [f"sr{int(sr_id)}" for sr_id in sr_ids]
+            bundle_edges = edges
+        else:
+            bundle_edges = np.arange(len(bin_names) + 1, dtype=float)
+        if n_sr != len(bin_names):
             raise RuntimeError(f"Signal-region count mismatch for ROOT bundle '{prefix}'")
-        if stat_vars.shape != vals.shape or scale_vars.shape != vals.shape:
+        if stat_vars.shape != vals.shape or scale_vars.shape != vals.shape or n_entries.shape != vals.shape:
             raise RuntimeError(f"Uncertainty size mismatch for ROOT bundle '{prefix}'")
         if covariance_total.shape != (n_sr, n_sr):
             raise RuntimeError(f"Covariance size mismatch for ROOT bundle '{prefix}'")
-        if mc_stat_err.shape != vals.shape or (mc_scale_err is not None and mc_scale_err.shape != vals.shape):
-            raise RuntimeError(f"MC-statistics size mismatch for ROOT bundle '{prefix}'")
 
-        one_bin_edges = np.array([0.0, 1.0], dtype=float)
         stat_err = np.sqrt(np.maximum(stat_vars, 0.0))
         scale_err = np.sqrt(np.maximum(scale_vars, 0.0))
         for idx in range(n_sr):
-            sr_prefix = f"{prefix}/sr{int(sr_ids[idx])}"
+            sr_prefix = f"{prefix}/{bin_names[idx]}"
             root_file[f"{sr_prefix}/yield"] = (np.array([vals[idx]], dtype=float), one_bin_edges)
             root_file[f"{sr_prefix}/stat_error"] = (
                 np.array([stat_err[idx]], dtype=float),
@@ -1378,22 +1432,23 @@ def write_root_output(
                 np.array([scale_err[idx]], dtype=float),
                 one_bin_edges,
             )
-            root_file[f"{sr_prefix}/mc_stat_error"] = (
-                np.array([mc_stat_err[idx]], dtype=float),
+            root_file[f"{sr_prefix}/n_entries"] = (
+                np.array([n_entries[idx]], dtype=float),
                 one_bin_edges,
             )
-            if mc_scale_err is not None:
-                root_file[f"{sr_prefix}/mc_scale_error"] = (
-                    np.array([mc_scale_err[idx]], dtype=float),
-                    one_bin_edges,
-                )
-        root_file[f"{prefix}/covariance_total"] = (covariance_total, edges, edges)
+        root_file[f"{prefix}/covariance_total"] = (covariance_total, bundle_edges, bundle_edges)
+        root_file[f"{prefix}/mean_event_weight"] = (
+            np.array([float(mean_event_weight)], dtype=float),
+            one_bin_edges,
+        )
 
     with uproot.recreate(root_path) as root_file:
         root_file["metadata/signal_regions"] = {"bin_index": sr_ids}
-        root_file["metadata/abcd_closure"] = {
-            key: np.array([float(value)], dtype=float) for key, value in abcd_closure.items()
-        }
+        # Provenance of the SRs, checked by combine against the systematics JSONs: the first 13 hex
+        # digits of the SHA-256 of the SR CSV bytes (exact in a double).
+        with open(SIGNAL_REGION_CSV_PATH, "rb") as fh:
+            sr_csv_hash = int(hashlib.sha256(fh.read()).hexdigest()[:13], 16)
+        root_file["metadata/sr_csv_hash"] = (np.array([float(sr_csv_hash)], dtype=float), one_bin_edges)
 
         for sample_name in sorted(sample_yields):
             _write_bundle(
@@ -1401,6 +1456,8 @@ def write_root_output(
                 f"samples/{sample_name}",
                 sample_yields[sample_name],
                 sample_vars[sample_name],
+                sample_entries[sample_name],
+                sample_mean_weights[sample_name],
             )
 
         for group_name in CLASS_NAMES:
@@ -1409,6 +1466,8 @@ def write_root_output(
                 f"groups/{_slugify(group_name)}",
                 group_yields[group_name],
                 group_vars[group_name],
+                group_entries[group_name],
+                group_mean_weights[group_name],
             )
 
         _write_bundle(
@@ -1416,19 +1475,35 @@ def write_root_output(
             "qcd_predict",
             pred_qcd_vals,
             pred_qcd_stat_vars,
+            qcd_entries,
+            qcd_scale * qcd_mean_weight,
             pred_qcd_scale_vars,
             pred_qcd_cov,
         )
-        _write_bundle(root_file, "qcd_true", true_qcd_vals, true_qcd_vars)
+        root_file["qcd_predict/abcd_scale"] = (np.array([float(qcd_scale)], dtype=float), one_bin_edges)
+        root_file["qcd_predict/abcd_scale_error"] = (
+            np.array([float(qcd_scale_sigma)], dtype=float),
+            one_bin_edges,
+        )
+        _write_bundle(root_file, "qcd_true", true_qcd_vals, true_qcd_vars, qcd_entries, qcd_mean_weight)
         _write_bundle(
             root_file,
             "total_predict",
             pred_total_vals,
             pred_total_stat_vars,
+            total_entries,
+            total_mean_weight,
             pred_total_scale_vars,
             pred_total_cov,
         )
-        _write_bundle(root_file, "total_true", true_total_vals, true_total_vars)
+        _write_bundle(root_file, "total_true", true_total_vals, true_total_vars, total_entries, total_mean_weight)
+
+        if per_sr_abcd is not None:
+            for key in ("per_sr_abcd", "abcd_tf", "abcd_tf_error", "abcd_nonclosure"):
+                root_file[f"qcd_predict/{key}"] = (
+                    np.array([float(per_sr_abcd[key])], dtype=float), one_bin_edges)
+            for prefix, vals, vars_, entries, mean_weight, bin_names in per_sr_abcd["bundles"]:
+                _write_bundle(root_file, prefix, vals, vars_, entries, mean_weight, bin_names=bin_names)
 
     log_message(f"Wrote ROOT file: {root_path}")
 
@@ -1701,6 +1776,20 @@ def main() -> None:
         sideband_mask = ~union_score_mask
     b_mask = sideband_mask & abcd_pass
     d_mask = sideband_mask & abcd_fail
+    region_c_masks = None
+    if ABCD_MODE == "per_sr":
+        # Per-SR ABCD: C_i and D use only the control window of the fail region.
+        abcd_branch = ABCD_BRANCH_NAMES[0]
+        branch_vals = X_raw[abcd_branch].to_numpy(dtype=float)
+        control_mask = abcd_fail & (branch_vals > ABCD_CONTROL_WINDOW[0]) & (branch_vals < ABCD_CONTROL_WINDOW[1])
+        region_c_masks = [mask & control_mask for mask in region_score_masks]
+        c_mask = union_score_mask & control_mask
+        d_mask = sideband_mask & control_mask
+        log_message(
+            f"Per-SR ABCD: control window {ABCD_CONTROL_WINDOW[0]:g} < {abcd_branch} < "
+            f"{ABCD_CONTROL_WINDOW[1]:g} of the fail region: events={int(np.count_nonzero(control_mask))} "
+            f"of fail={int(np.count_nonzero(abcd_fail))}"
+        )
 
     # Signal-contamination check: the B/D sideband must stay signal-depleted, else real
     # signal in the control region biases the QCD prediction. Report signal in sideband.
@@ -1758,9 +1847,9 @@ def main() -> None:
         )
         log_message(f"Wrote ABCD 2-D dump: {_dump_path} (events={len(weights)})")
 
-    if qcd_b_total <= 0.0 or qcd_c_total <= 0.0 or qcd_d_total <= 0.0:
+    if qcd_b_total <= 0.0 or qcd_d_total <= 0.0 or (ABCD_MODE == "union" and qcd_c_total <= 0.0):
         raise RuntimeError("QCD B/C/D totals must be positive for ABCD scaling")
-    if qcd_a_total <= 0.0:
+    if qcd_a_total <= 0.0 and ABCD_MODE == "union":
         raise RuntimeError("QCD A-union total is zero; cannot derive global QCD scale")
 
     raw_pred_qcd_union = qcd_b_total * qcd_c_total / qcd_d_total
@@ -1772,12 +1861,16 @@ def main() -> None:
     pred_qcd_union = raw_pred_qcd_union * QCD_PREDICT_SCALE_MULTIPLIER
     pred_qcd_union_var = raw_pred_qcd_union_var * (QCD_PREDICT_SCALE_MULTIPLIER ** 2)
     pred_qcd_union_sigma = math.sqrt(max(pred_qcd_union_var, 0.0))
-    raw_qcd_scale = raw_pred_qcd_union / qcd_a_total
-    raw_qcd_scale_var = raw_pred_qcd_union_var / (qcd_a_total ** 2)
-    raw_qcd_scale_sigma = math.sqrt(max(raw_qcd_scale_var, 0.0))
-    qcd_scale = pred_qcd_union / qcd_a_total
-    qcd_scale_var = pred_qcd_union_var / (qcd_a_total ** 2)
-    qcd_scale_sigma = math.sqrt(max(qcd_scale_var, 0.0))
+    if qcd_a_total > 0.0:
+        raw_qcd_scale = raw_pred_qcd_union / qcd_a_total
+        raw_qcd_scale_var = raw_pred_qcd_union_var / (qcd_a_total ** 2)
+        raw_qcd_scale_sigma = math.sqrt(max(raw_qcd_scale_var, 0.0))
+        qcd_scale = pred_qcd_union / qcd_a_total
+        qcd_scale_var = pred_qcd_union_var / (qcd_a_total ** 2)
+        qcd_scale_sigma = math.sqrt(max(qcd_scale_var, 0.0))
+    else:  # per_sr only: the MC closure is undefined
+        log_warning("No QCD MC in the A union: MC closure undefined, abcd_scale written as 0")
+        raw_qcd_scale = raw_qcd_scale_sigma = qcd_scale = qcd_scale_var = qcd_scale_sigma = 0.0
 
     log_message(
         f"ABCD QCD totals: A_union={qcd_a_total:.6g}, B={qcd_b_total:.6g}, "
@@ -1789,7 +1882,9 @@ def main() -> None:
     )
 
     log_message(f"Filling signal-region yields: n={len(region_labels)}")
-    sample_names = sorted({sample for sample in sample_labels})
+    # Every class sample gets a bundle (zeros when no event survives the selection), so combine
+    # finds every configured sample in every channel.
+    sample_names = sorted({sample for members in CLASS_GROUPS.values() for sample in members})
     sample_yields = {sample: np.zeros(len(region_labels), dtype=float) for sample in sample_names}
     sample_vars = {sample: np.zeros(len(region_labels), dtype=float) for sample in sample_names}
     group_yields = {group: np.zeros(len(region_labels), dtype=float) for group in CLASS_NAMES}
@@ -1813,22 +1908,40 @@ def main() -> None:
         true_qcd_vals[idx] = float(np.sum(qcd_vals))
         true_qcd_vars[idx] = float(np.sum(qcd_vals ** 2))
 
-    qcd_fraction_vals = true_qcd_vals / qcd_a_total
-    qcd_fraction_vars = np.zeros(len(region_labels), dtype=float)
-    for idx in range(len(region_labels)):
-        region_val = true_qcd_vals[idx]
-        region_var = true_qcd_vars[idx]
-        rest_val = qcd_a_total - region_val
-        rest_var = max(0.0, qcd_a_var - region_var)
-        qcd_fraction_vars[idx] = (
-            ((rest_val / (qcd_a_total ** 2)) ** 2) * region_var
-            + ((region_val / (qcd_a_total ** 2)) ** 2) * rest_var
+    per_sr_abcd = None
+    if ABCD_MODE == "per_sr":
+        # A_i = C_i * TF with TF = B / D: stat_error from C_i, scale_error from TF (correlated).
+        tf = qcd_b_total / qcd_d_total
+        tf_var = qcd_b_var / qcd_d_total ** 2 + (qcd_b_total / qcd_d_total ** 2) ** 2 * qcd_d_var
+        qcd_c_vals = np.array([float(np.sum(weights[m & qcd_mask])) for m in region_c_masks])
+        qcd_c_vars = np.array([float(np.sum(weights[m & qcd_mask] ** 2)) for m in region_c_masks])
+        raw_pred_qcd_vals = qcd_c_vals * tf
+        pred_qcd_vals = raw_pred_qcd_vals.copy()
+        pred_qcd_stat_vars = tf ** 2 * qcd_c_vars
+        pred_qcd_scale_vars = qcd_c_vals ** 2 * tf_var
+        per_sr_abcd = {"per_sr_abcd": 1.0, "abcd_tf": tf, "abcd_tf_error": math.sqrt(max(tf_var, 0.0)),
+                       "abcd_nonclosure": ABCD_PER_SR_NONCLOSURE, "bundles": []}
+        log_message(
+            f"Per-SR ABCD: TF = B/D = {tf:.6g} ± {math.sqrt(max(tf_var, 0.0)):.6g}, "
+            f"non-closure uncertainty = {ABCD_PER_SR_NONCLOSURE:.4g}"
         )
+    else:
+        qcd_fraction_vals = true_qcd_vals / qcd_a_total
+        qcd_fraction_vars = np.zeros(len(region_labels), dtype=float)
+        for idx in range(len(region_labels)):
+            region_val = true_qcd_vals[idx]
+            region_var = true_qcd_vars[idx]
+            rest_val = qcd_a_total - region_val
+            rest_var = max(0.0, qcd_a_var - region_var)
+            qcd_fraction_vars[idx] = (
+                ((rest_val / (qcd_a_total ** 2)) ** 2) * region_var
+                + ((region_val / (qcd_a_total ** 2)) ** 2) * rest_var
+            )
 
-    raw_pred_qcd_vals = raw_pred_qcd_union * qcd_fraction_vals
-    pred_qcd_vals = pred_qcd_union * qcd_fraction_vals
-    pred_qcd_stat_vars = (pred_qcd_union ** 2) * qcd_fraction_vars
-    pred_qcd_scale_vars = (true_qcd_vals ** 2) * qcd_scale_var
+        raw_pred_qcd_vals = raw_pred_qcd_union * qcd_fraction_vals
+        pred_qcd_vals = pred_qcd_union * qcd_fraction_vals
+        pred_qcd_stat_vars = (pred_qcd_union ** 2) * qcd_fraction_vars
+        pred_qcd_scale_vars = (true_qcd_vals ** 2) * qcd_scale_var
     pred_qcd_cov = np.diag(pred_qcd_stat_vars) + np.outer(
         np.sqrt(np.maximum(pred_qcd_scale_vars, 0.0)),
         np.sqrt(np.maximum(pred_qcd_scale_vars, 0.0)),
@@ -1841,6 +1954,13 @@ def main() -> None:
         f"raw_scale={raw_qcd_scale:.6g}, final_scale={qcd_scale:.6g}"
     )
     for idx, label in enumerate(region_labels):
+        if ABCD_MODE == "per_sr":
+            log_message(
+                f"  {label}: qcd_true={true_qcd_vals[idx]:.6g}, "
+                f"qcd_control={qcd_c_vals[idx]:.6g} ± {math.sqrt(qcd_c_vars[idx]):.6g}, "
+                f"predict={pred_qcd_vals[idx]:.6g}"
+            )
+            continue
         log_message(
             f"  {label}: qcd_true={true_qcd_vals[idx]:.6g}, "
             f"a_fraction={qcd_fraction_vals[idx]:.6g}, "
@@ -1875,27 +1995,49 @@ def main() -> None:
     )
     pred_total_vars = np.diag(pred_total_cov).astype(float)
 
-    # The plots above validate ABCD on finite MC and therefore use the propagated
-    # MC-entry variances. The ROOT file is consumed by combine, where the
-    # weighted yield itself is treated as the Poisson count. Store that
-    # combine-facing convention separately so it does not change the validation
-    # plots.
-    sample_root_vars = {
-        sample: _poisson_vars_from_yield(values)
-        for sample, values in sample_yields.items()
+    # Combine-facing MC statistics: raw MC entry counts per SR (zero-count floor) and
+    # each class's typical per-event weight over all selected events (abcd_pass, any score).
+    def _entries(mask):
+        return int(np.count_nonzero(mask))
+
+    def _typical_weight(mask):
+        # Median |w|: combine's zero-count floor is one MC event's worth of yield, and the mean
+        # is dominated by a few very heavy events (boosted3 QCD: mean 153, median 28.5).
+        w = np.abs(weights[mask])
+        return float(np.median(w)) if w.size else 0.0
+
+    sample_entries = {
+        sample: np.array([_entries(mask & (sample_labels == sample)) for mask in region_a_masks], dtype=float)
+        for sample in sample_names
     }
-    group_root_vars = {
-        group: _poisson_vars_from_yield(values)
-        for group, values in group_yields.items()
+    group_entries = {
+        group: np.array([_entries(mask & (group_labels == group)) for mask in region_a_masks], dtype=float)
+        for group in CLASS_NAMES
     }
-    true_qcd_root_vars = _poisson_vars_from_yield(true_qcd_vals)
-    pred_qcd_root_stat_vars = _poisson_vars_from_yield(pred_qcd_vals)
-    pred_qcd_root_scale_vars = np.zeros_like(pred_qcd_root_stat_vars)
-    pred_qcd_root_cov = _diag_cov_from_vars(pred_qcd_root_stat_vars)
-    pred_total_root_stat_vars = _poisson_vars_from_yield(pred_total_vals)
-    pred_total_root_scale_vars = np.zeros_like(pred_total_root_stat_vars)
-    pred_total_root_cov = _diag_cov_from_vars(pred_total_root_stat_vars)
-    true_total_root_vars = _poisson_vars_from_yield(true_total_vals)
+    qcd_entries = np.array([_entries(mask & qcd_mask) for mask in region_a_masks], dtype=float)
+    total_entries = np.array([_entries(mask) for mask in region_a_masks], dtype=float)
+    sample_mean_weights = {sample: _typical_weight(abcd_pass & (sample_labels == sample)) for sample in sample_names}
+    group_mean_weights = {group: _typical_weight(abcd_pass & (group_labels == group)) for group in CLASS_NAMES}
+    qcd_mean_weight = _typical_weight(abcd_pass & qcd_mask)
+    total_mean_weight = _typical_weight(abcd_pass)
+
+    if per_sr_abcd is not None:
+        # Control regions C_i and the B/D regions for every sample, class and the QCD sum,
+        # with the typical event weight in the control window (combine's zero-count floor).
+        def _region_sums(masks, select):
+            sel = [m & select for m in masks]
+            return (np.array([float(np.sum(weights[m])) for m in sel]),
+                    np.array([float(np.sum(weights[m] ** 2)) for m in sel]),
+                    np.array([float(_entries(m)) for m in sel]))
+
+        for region_key, masks, bin_names in (("control", region_c_masks, None), ("abcd_bd", [b_mask, d_mask], ["b", "d"])):
+            selections = [(f"samples/{name}", sample_labels == name) for name in sample_names]
+            selections += [(f"groups/{_slugify(name)}", group_labels == name) for name in CLASS_NAMES]
+            selections.append(("qcd_true", qcd_mask))
+            for suffix, select in selections:
+                vals, vars_, entries = _region_sums(masks, select)
+                per_sr_abcd["bundles"].append((f"{region_key}/{suffix}", vals, vars_, entries,
+                                               _typical_weight(control_mask & select), bin_names))
 
     abcd_group_vals = {group: np.zeros(4, dtype=float) for group in CLASS_NAMES}
     abcd_group_vars = {group: np.zeros(4, dtype=float) for group in CLASS_NAMES}
@@ -1911,36 +2053,6 @@ def main() -> None:
         abcd_group_vars,
     )
 
-    # MC statistics of the test split (sum w^2) for combine's autoMCStats, and the
-    # ABCD scale factors for its non-closure and scale-statistics nuisances.
-    mc_vars = {f"samples/{sample}": values for sample, values in sample_vars.items()}
-    mc_vars.update({f"groups/{_slugify(group)}": values for group, values in group_vars.items()})
-    mc_vars.update({
-        "qcd_predict": pred_qcd_stat_vars,
-        "qcd_predict:scale": pred_qcd_scale_vars,
-        "qcd_true": true_qcd_vars,
-        "total_predict": pred_total_stat_vars,
-        "total_predict:scale": pred_total_scale_vars,
-        "total_true": true_total_vars,
-    })
-    abcd_closure = {
-        "raw_scale": raw_qcd_scale,
-        "raw_scale_error": raw_qcd_scale_sigma,
-        "multiplier": QCD_PREDICT_SCALE_MULTIPLIER,
-        "final_scale": qcd_scale,
-        "final_scale_error": qcd_scale_sigma,
-        "pred_union": pred_qcd_union,
-        "pred_union_error": pred_qcd_union_sigma,
-        "qcd_a_union": qcd_a_total,
-        "qcd_a_union_error": math.sqrt(max(qcd_a_var, 0.0)),
-        "qcd_b": qcd_b_total,
-        "qcd_b_error": math.sqrt(max(qcd_b_var, 0.0)),
-        "qcd_c": qcd_c_total,
-        "qcd_c_error": math.sqrt(max(qcd_c_var, 0.0)),
-        "qcd_d": qcd_d_total,
-        "qcd_d_error": math.sqrt(max(qcd_d_var, 0.0)),
-    }
-
     root_path = os.path.join(OUTPUT_DIR, ROOT_FILE_NAME)
     log_message("Writing summary ROOT file")
     write_root_output(
@@ -1948,23 +2060,32 @@ def main() -> None:
         edges,
         [int(idx) for idx in signal_regions["bin_index"].tolist()],
         sample_yields,
-        sample_root_vars,
+        sample_vars,
+        sample_entries,
+        sample_mean_weights,
         group_yields,
-        group_root_vars,
+        group_vars,
+        group_entries,
+        group_mean_weights,
         pred_qcd_vals,
-        pred_qcd_root_stat_vars,
-        pred_qcd_root_scale_vars,
-        pred_qcd_root_cov,
+        pred_qcd_stat_vars,
+        pred_qcd_scale_vars,
+        pred_qcd_cov,
+        qcd_entries,
+        qcd_scale,
+        qcd_scale_sigma,
         true_qcd_vals,
-        true_qcd_root_vars,
+        true_qcd_vars,
+        qcd_mean_weight,
         pred_total_vals,
-        pred_total_root_stat_vars,
-        pred_total_root_scale_vars,
-        pred_total_root_cov,
+        pred_total_stat_vars,
+        pred_total_scale_vars,
+        pred_total_cov,
         true_total_vals,
-        true_total_root_vars,
-        mc_vars,
-        abcd_closure,
+        true_total_vars,
+        total_entries,
+        total_mean_weight,
+        per_sr_abcd,
     )
 
     log_message("Plotting ABCD summary")
