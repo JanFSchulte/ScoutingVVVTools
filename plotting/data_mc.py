@@ -559,7 +559,10 @@ def _standardize_model_X(X, clip_ranges, log_transform):
         return X
     X = X.copy()
     for col in cols_to_modify:
-        arr = X[col].to_numpy(dtype=float, copy=True)
+        # In the stored dtype, as train.py and qcd_est.py: a float64 log shifts float32 inputs by
+        # rounding, which moves rare events across a tree split (seen on the k-fold toy: 1 in ~2000
+        # events, score changes up to 0.009).
+        arr = X[col].to_numpy(copy=True)
         sentinel = arr < -990
         valid = ~sentinel
         if not valid.any():
@@ -572,6 +575,8 @@ def _standardize_model_X(X, clip_ranges, log_transform):
         if col in log_set:
             pos = valid & (arr > 0)
             if pos.any():
+                if not np.issubdtype(arr.dtype, np.floating):
+                    arr = arr.astype(float)
                 arr[pos] = np.log(arr[pos])
         X[col] = arr
     return X

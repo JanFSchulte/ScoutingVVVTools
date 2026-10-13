@@ -35,6 +35,13 @@ PDF uncertainty: the method must match the PDF set type, set via the config key
   the 1.0 placeholder; such samples are reported with alphas_available=false.
 Scale uncertainty: envelope of 7 (mu_R, mu_F) combinations excluding the two
   anti-correlated corners (LHEScaleWeight indices 2 and 6).
+Normalisation to the generated events (2026-10-09): every member's yield ratio Y_i / Y_0 is divided
+  by the member's value over all generated events, sum(genWeight * w_i) / sum(genWeight) from the
+  NanoAOD Runs trees (generator_sums.py, config key generator_sums_json, required for every theory
+  sample), before the envelope / quadrature, so the variations change only the selection
+  efficiency: the samples are normalised to their sample.json cross-sections, whose inclusive
+  uncertainty enters combine separately (combine.C xsec_unc_json). Before, the ratios also held
+  the change of the inclusive cross-section.
 PS uncertainty: PSWeight is [0] isr.murfac=2.0; [1] fsr.murfac=2.0;
   [2] isr.murfac=0.5; [3] fsr.murfac=0.5 (branch documentation). ps_isr_up /
   ps_isr_down are the isr.murfac = 0.5 / 2.0 variations (more / less ISR), and
@@ -118,6 +125,15 @@ if PDF_METHOD not in ("hessian_symmetric", "mc_replica"):
         f"pdf_uncertainty_method must be 'hessian_symmetric' or 'mc_replica', "
         f"got {PDF_METHOD!r}"
     )
+
+# Per-member theory-weight sums over all generated events (generator_sums.py).
+if "generator_sums_json" not in cfg:
+    raise KeyError("config generator_sums_json is required: run generator_sums.py (the variations are "
+                   "normalised to the generated events)")
+_gen_sums_path = os.path.normpath(os.path.join(_SCRIPT_DIR, cfg["generator_sums_json"]))
+if not os.path.exists(_gen_sums_path):
+    raise FileNotFoundError(f"{_gen_sums_path} missing: run generator_sums.py and generator_sums.py --merge")
+GENERATOR_SUMS = _load_json(_gen_sums_path)
 
 _sample_cfg_path = os.path.normpath(os.path.join(_SCRIPT_DIR, cfg["sample_config"]))
 sample_cfg   = _load_json(_sample_cfg_path)
@@ -404,12 +420,25 @@ def _infer_proba(chunk, mask, ctx, folds=None):
 # Ratio computation
 # ---------------------------------------------------------------------------
 
-def _ratios_from_sums(nom_sum, pdf_sums, scale_sums, ps_sums, n_events, alphas_sums=None):
-    """Return the ratio dict for one accumulation slot, or None if empty."""
+def _generator_sums(sample_name):
+    """The sample's per-member sums over all generated events, in the stored per-event layout."""
+    g = GENERATOR_SUMS.get(sample_name)
+    if g is None:
+        raise KeyError(f"{sample_name} has no entry in {_gen_sums_path}: run generator_sums.py {sample_name} "
+                       f"and generator_sums.py --merge")
+    return {"pdf": np.asarray(g["lhe_pdf_sumw"], dtype=np.float64),
+            "alphas": np.asarray(g["lhe_alphas_sumw"], dtype=np.float64),
+            "scale": np.asarray(g["lhe_scale_sumw"], dtype=np.float64),
+            "ps": np.asarray(g["ps_sumw"], dtype=np.float64)}
+
+
+def _ratios_from_sums(nom_sum, pdf_sums, scale_sums, ps_sums, n_events, gen, alphas_sums=None):
+    """Return the ratio dict for one accumulation slot, or None if empty. Every member's ratio is
+    divided by its value over all generated events (gen, _generator_sums)."""
     if nom_sum <= 0.0 or n_events < 1:
         return None
-    member_ratios = pdf_sums[1:101] / nom_sum    # 100 PDF members (i = 1..100)
-    central = float(pdf_sums[0] / nom_sum)        # central member, ~1.0
+    member_ratios = pdf_sums[1:101] / nom_sum / gen["pdf"][1:101]   # 100 PDF members (i = 1..100)
+    central = float(pdf_sums[0] / nom_sum / gen["pdf"][0])          # central member, ~1.0
     if PDF_METHOD == "hessian_symmetric":
         # Symmetric-Hessian set (NNPDF31_nnlo_hessian_pdfas): the uncertainty is
         # the quadrature sum of the per-eigenvector deviations from the central.
@@ -426,21 +455,21 @@ def _ratios_from_sums(nom_sum, pdf_sums, scale_sums, ps_sums, n_events, alphas_s
     # folded into the PDF uncertainty in quadrature when the branch is present.
     sigma_as = 0.0
     if alphas_sums is not None:
-        as_ratios = alphas_sums / nom_sum         # [alpha_s_down, alpha_s_up]
+        as_ratios = alphas_sums / nom_sum / gen["alphas"]   # [alpha_s_down, alpha_s_up]
         sigma_as = 0.5 * abs(float(as_ratios[1]) - float(as_ratios[0]))
     sigma_tot = float(np.sqrt(sigma_pdf ** 2 + sigma_as ** 2))
     pdf_up = pdf_center + sigma_tot
     pdf_down = pdf_center - sigma_tot
     pdf_central = pdf_center
 
-    scale_ratios = scale_sums / nom_sum
+    scale_ratios = scale_sums / nom_sum / gen["scale"]
     valid_s = scale_ratios[SCALE_VALID]
     scale_up   = float(valid_s.max())
     scale_down = float(valid_s.min())
 
     # PSWeight: [0] isr.murfac=2.0; [1] fsr.murfac=2.0; [2] isr.murfac=0.5;
     # [3] fsr.murfac=0.5. up = murfac 0.5 (more radiation), down = murfac 2.0.
-    ps_ratios = ps_sums / nom_sum
+    ps_ratios = ps_sums / nom_sum / gen["ps"]
     ps_isr_up   = float(ps_ratios[2])
     ps_isr_down = float(ps_ratios[0])
     ps_fsr_up   = float(ps_ratios[3])
@@ -449,6 +478,7 @@ def _ratios_from_sums(nom_sum, pdf_sums, scale_sums, ps_sums, n_events, alphas_s
     return {
         "n_events":    int(n_events),
         "nom_sum":     float(nom_sum),
+        "generator_normalised": True,
         "pdf_method":  PDF_METHOD,
         "pdf_alphas_unc": float(sigma_as),
         "alphas_available": alphas_sums is not None,
@@ -476,6 +506,7 @@ def _compute_ratios(sample_name, ctx):
     enabled = ctx["regions_enabled"]
     n_slots = 1 + (len(ctx["bin_ids"]) if enabled else 0)
     genweight_mean = require_genweight_mean(SAMPLE_INFO[sample_name].get("genweight_mean"), sample_name)
+    gen = _generator_sums(sample_name)
 
     # LHEPdfWeightAlphaS is optional (only present after re-running mode 0 with
     # the alpha_s branch); folded into the PDF uncertainty when available.
@@ -568,7 +599,7 @@ def _compute_ratios(sample_name, ctx):
         return alphas_sums[slot] if has_alphas[0] else None
 
     inclusive = _ratios_from_sums(nom_sum[0], pdf_sums[0], scale_sums[0], ps_sums[0],
-                                  n_events[0], _slot_alphas(0))
+                                  n_events[0], gen, _slot_alphas(0))
     regions = None
     if enabled:
         regions = {}
@@ -576,7 +607,7 @@ def _compute_ratios(sample_name, ctx):
             slot = j + 1
             regions[bid] = _ratios_from_sums(
                 nom_sum[slot], pdf_sums[slot], scale_sums[slot], ps_sums[slot],
-                n_events[slot], _slot_alphas(slot)
+                n_events[slot], gen, _slot_alphas(slot)
             )
     return {"inclusive": inclusive, "regions": regions}
 
@@ -602,6 +633,7 @@ def main():
 
     log("theory_syst.py — theory weight variations (inclusive + per signal region)")
     log(f"  pdf_method: {PDF_METHOD}")
+    log(f"  variations normalised to the generated events: {_gen_sums_path}")
     log(f"  trees:   {SUBMIT_TREES}")
     log(f"  samples: {THEORY_SAMPLES}")
     log(f"  output:  {OUTPUT_DIR}\n")

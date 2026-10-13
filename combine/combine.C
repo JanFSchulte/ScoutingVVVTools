@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fnmatch.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -164,9 +165,9 @@ const RatioNuisanceSpec kRatioNuisances[] = {
     {"jms",           "jms_syst_json",    "mode 13 (jms_syst.py)",    "jms_up",    "jms_down",    false},
     {"jmr",           "jmr_syst_json",    "mode 14 (jmr_syst.py)",    "jmr_up",    "jmr_down",    false},
 };
-// The other nuisances: lumi and trigger (flat lnN on the MC processes), autoMCStats, the
-// zero-count floors, and the ABCD QCD rows.
-const char* const kOtherNuisances[] = {"lumi", "trigger", "autoMCStats", "zero_count_floor",
+// The other nuisances: lumi and trigger (flat lnN on the MC processes), the cross sections
+// (xsec_unc_json), autoMCStats, the zero-count floors, and the ABCD QCD rows.
+const char* const kOtherNuisances[] = {"lumi", "trigger", "xsec", "autoMCStats", "zero_count_floor",
                                        "qcd_abcd_stat", "qcd_abcd_nonclosure"};
 
 // Kappa of one process in one SR (an asymmetric lnN entry down/up).
@@ -238,6 +239,9 @@ struct AppConfig {
     double trigger_unc = 0.0;
     // autoMCStats event threshold (combine's default 10).
     int mc_stat_threshold = 10;
+    // Fractional cross-section uncertainty per sample-name pattern (fnmatch), from the
+    // "uncertainties" object of xsec_unc_json; required when the nuisance 'xsec' is enabled.
+    std::vector<std::pair<std::string, double>> xsec_unc;
     // Per-sample ratios of every enabled kRatioNuisances nuisance (nuisance name -> ratios).
     std::map<std::string, SampleRatios> ratios;
     // Nuisance names to include in datacards.  Empty set = all enabled (default).
@@ -330,6 +334,25 @@ AppConfig loadAppConfig() {
     }
     if (cfg.mc_stat_threshold < 0) {
         throw std::runtime_error("mc_stat_threshold must be >= 0");
+    }
+    if (nuisanceEnabled(cfg.enabled_nuisances, "xsec")) {
+        if (!payload.contains("xsec_unc_json")) {
+            throw std::runtime_error("nuisance 'xsec' is enabled but xsec_unc_json is not set in config.json");
+        }
+        const std::string xsec_path = resolveReferencedPath(abs, payload.at("xsec_unc_json").asString());
+        if (!fs::exists(xsec_path)) {
+            throw std::runtime_error("nuisance 'xsec' is enabled but " + xsec_path + " does not exist");
+        }
+        const JsonValue xsec = simple_json::parseFile(xsec_path);
+        for (const auto& kv : xsec.at("uncertainties").asObject()) {
+            const double f = static_cast<double>(kv.second.asNumber());
+            if (!std::isfinite(f) || f < 0.0 || f >= 1.0) {
+                throw std::runtime_error(xsec_path + ": cross-section uncertainty of '" + kv.first +
+                                         "' must be a fraction in [0, 1)");
+            }
+            cfg.xsec_unc.emplace_back(kv.first, f);
+        }
+        logMessage("Loaded cross-section uncertainties: " + xsec_path);
     }
 
     if (payload.contains("scenario_scopes")) {
@@ -441,6 +464,10 @@ ClassRegistry loadRegistryFromBdtRoot(const std::string& bdt_root,
     return reg;
 }
 
+// The background classes may have different member samples per channel (a channel's model can
+// leave out samples with too few entries in its tree, e.g. kfold_finedecor_2lep); the class
+// order, the signal classes with their samples and the QCD classes must match, and a sample must
+// be in the same class in every channel.
 void ensureRegistryCompatible(const ClassRegistry& reference,
                               const ClassRegistry& candidate,
                               const std::string& reference_label,
@@ -448,16 +475,18 @@ void ensureRegistryCompatible(const ClassRegistry& reference,
     const std::string detail =
         candidate_label + " BDT registry differs from " + reference_label +
         "; combine.C requires all channel bdt_root configs to share the same "
-        "class_groups and signal/QCD sample definitions";
+        "class order and signal/QCD definitions";
 
     if (candidate.class_order != reference.class_order) {
         throw std::runtime_error(detail + " (class order mismatch)");
     }
-    if (candidate.class_members != reference.class_members) {
-        throw std::runtime_error(detail + " (class_groups membership mismatch)");
-    }
     if (candidate.signal_classes != reference.signal_classes) {
         throw std::runtime_error(detail + " (signal class mismatch)");
+    }
+    for (const auto& cls : reference.signal_classes) {
+        if (candidate.class_members.at(cls) != reference.class_members.at(cls)) {
+            throw std::runtime_error(detail + " (members of signal class '" + cls + "' differ)");
+        }
     }
     if (candidate.signal_samples != reference.signal_samples) {
         throw std::runtime_error(detail + " (signal sample mismatch)");
@@ -465,18 +494,51 @@ void ensureRegistryCompatible(const ClassRegistry& reference,
     if (candidate.qcd_classes != reference.qcd_classes) {
         throw std::runtime_error(detail + " (QCD class mismatch)");
     }
+    for (const auto& kv : candidate.sample_to_class) {
+        auto it = reference.sample_to_class.find(kv.first);
+        if (it != reference.sample_to_class.end() && it->second != kv.second) {
+            throw std::runtime_error(detail + " (sample '" + kv.first + "' is in class '" + kv.second +
+                                     "' here and in class '" + it->second + "' there)");
+        }
+    }
 }
 
+// The shared registry holds, per background class, the union of the channels' member samples:
+// each channel's processes are built from its own groups/ yields, and a member sample that is
+// absent from a channel's ROOT file is skipped there (per-sample systematics, xsec, sample scope).
 ClassRegistry loadRegistry(const AppConfig& cfg) {
-    const ChannelSpec& first = cfg.channels.front();
-    const std::string reference_label = "channel '" + first.name + "'";
-    ClassRegistry reg = loadRegistryFromBdtRoot(first.bdt_root, reference_label);
+    std::vector<ClassRegistry> per_channel;
+    for (const auto& ch : cfg.channels) {
+        per_channel.push_back(loadRegistryFromBdtRoot(ch.bdt_root, "channel '" + ch.name + "'"));
+    }
+    const std::string reference_label = "channel '" + cfg.channels.front().name + "'";
+    ClassRegistry reg = per_channel.front();
 
-    for (size_t i = 1; i < cfg.channels.size(); ++i) {
-        const ChannelSpec& ch = cfg.channels[i];
-        const std::string candidate_label = "channel '" + ch.name + "'";
-        ClassRegistry candidate = loadRegistryFromBdtRoot(ch.bdt_root, candidate_label);
-        ensureRegistryCompatible(reg, candidate, reference_label, candidate_label);
+    for (size_t i = 1; i < per_channel.size(); ++i) {
+        const ClassRegistry& candidate = per_channel[i];
+        ensureRegistryCompatible(reg, candidate, reference_label, "channel '" + cfg.channels[i].name + "'");
+        for (const auto& cls : reg.class_order) {
+            std::vector<std::string>& members = reg.class_members.at(cls);
+            for (const auto& s : candidate.class_members.at(cls)) {
+                if (std::find(members.begin(), members.end(), s) != members.end()) continue;
+                members.push_back(s);
+                reg.sample_to_class[s] = cls;
+                reg.samples.emplace(s, candidate.samples.at(s));
+            }
+        }
+    }
+    for (size_t i = 0; i < per_channel.size(); ++i) {
+        std::vector<std::string> absent;
+        for (const auto& kv : reg.sample_to_class) {
+            if (!per_channel[i].sample_to_class.count(kv.first)) absent.push_back(kv.first);
+        }
+        if (absent.empty()) continue;
+        std::sort(absent.begin(), absent.end());
+        std::string list;
+        for (const auto& s : absent) list += (list.empty() ? "" : ", ") + s;
+        logMessage("Channel '" + cfg.channels[i].name + "': its class_groups lack " +
+                   std::to_string(absent.size()) +
+                   " background sample(s) of the other channels (zero yield there): " + list);
     }
     return reg;
 }
@@ -1181,6 +1243,12 @@ bool isExactlyZeroProcess(const Process& proc) {
 // in the fits at the cost of their Poisson constraint. A regex matching nothing is harmless.
 const char* kZeroFloorStart = "rgx{zc_.*}=0";
 
+// With combine's default POI range (r >= 0), '-M Significance' returned exactly 0 for a valid
+// Asimov card (boosted3 study, MC-true QCD, all systematics), whose likelihood scan in r gives
+// 0.580; the same card gives 0.580 when the minimiser may move r below 0. The significance call
+// therefore uses this range; AsymptoticLimits keeps the default (r >= 0).
+const char* kSignificanceRRange = "--rMin -5 --rMax 10";
+
 // The autoMCStats mode (default) gives a floor-eligible background process a
 // 'gmN 0 alpha' term in every SR where its yield is zero (no MC events, or a
 // signed-weight sum clamped to 0 by qcd_est). Disabled in covariance mode.
@@ -1544,6 +1612,79 @@ Kappa processRatio(const PerChannelCard& pc, const Process& proc, int sr,
     return k;
 }
 
+// Cross-section uncertainty of one sample: the value of the xsec_unc_json pattern(s) matching its
+// name (fnmatch); no match, or matches with different values, is an error.
+double sampleXsecUnc(const AppConfig& cfg, const std::string& sample) {
+    bool found = false;
+    double value = 0.0;
+    for (const auto& kv : cfg.xsec_unc) {
+        if (fnmatch(kv.first.c_str(), sample.c_str(), 0) != 0) continue;
+        if (found && kv.second != value) {
+            throw std::runtime_error("xsec_unc_json: patterns with different values match sample '" + sample + "'");
+        }
+        found = true;
+        value = kv.second;
+    }
+    if (!found) {
+        throw std::runtime_error("xsec_unc_json has no cross-section uncertainty for sample '" + sample + "'");
+    }
+    return value;
+}
+
+// The B and D bins of a per-SR ABCD control card (its last two bins) carry no MC-normalisation
+// nuisances (lumi, trigger, xsec): their non-QCD MC is subtracted at its nominal yield. The free
+// qcdB / qcdD absorb any change of it, so these bins cannot constrain such a nuisance, but with
+// up to ~1e9 events they force qcdB / qcdD to follow it to ~3e-5, and these narrow valleys, joined
+// across channels by the shared nuisances, broke the minimisation (5-category combination,
+// 2026-10-13). The transfer factor changes by only delta x (f_B - f_D) for a normalisation change
+// delta of the non-QCD fractions f (<= 0.5% for delta = 15%).
+bool isAbcdBdBin(const PerChannelCard& pc, int bin) {
+    return pc.control && bin >= pc.n_sr - 2;
+}
+
+// Cross-section lnN rows: one nuisance per MC process (xsec_<process>), correlated across bins and
+// channels; its kappa in a bin is 1 + the mean of its samples' uncertainties weighted by their MC
+// yields there. The data-driven ABCD QCD has no MC samples and no row; a row whose kappas are all 1
+// (e.g. uncertainty 0) is omitted.
+void writeXsecLnN(std::ofstream& ofs, const AppConfig& cfg, const PerChannelCard& pc) {
+    if (!nuisanceEnabled(cfg.enabled_nuisances, "xsec") || pc.sample_yields == nullptr) return;
+    for (size_t p = 0; p < pc.processes.size(); ++p) {
+        const Process& proc = pc.processes[p];
+        if (proc.member_samples.empty()) continue;
+        std::vector<std::string> cells;
+        bool any_active = false;
+        for (int sr = 0; sr < pc.n_sr; ++sr) {
+            if (isAbcdBdBin(pc, sr)) {
+                cells.insert(cells.end(), pc.processes.size(), "-");
+                continue;
+            }
+            double total = 0.0, weighted = 0.0;
+            for (const auto& sample : proc.member_samples) {
+                auto y_it = pc.sample_yields->find(sample);
+                if (y_it == pc.sample_yields->end()) continue;
+                const double y = y_it->second.yields[sr];
+                if (!(y > 0.0)) continue;
+                total += y;
+                weighted += y * sampleXsecUnc(cfg, sample);
+            }
+            for (size_t q = 0; q < pc.processes.size(); ++q) {
+                if (q != p || !(total > 0.0) || !(weighted > 0.0)) {
+                    cells.push_back("-");
+                    continue;
+                }
+                std::ostringstream val;
+                val << std::setprecision(6) << std::fixed << (1.0 + weighted / total);
+                cells.push_back(val.str());
+                any_active = true;
+            }
+        }
+        if (!any_active) continue;
+        ofs << "xsec_" << proc.name << " lnN";
+        for (const auto& cell : cells) ofs << " " << cell;
+        ofs << "\n";
+    }
+}
+
 // One asymmetric lnN row over all SRs and processes, written as kdown/kup (combine's order:
 // the yield ratio of the -1 sigma variation first). only_process >= 0 restricts the row to
 // that process; a row without any active entry is omitted.
@@ -1740,7 +1881,7 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
 
     // Luminosity and trigger lnN, correlated across all channels (row names "lumi", "trigger").
     // Applied to every MC process (also the MC-true QCD); the data-driven ABCD QCD has no MC
-    // samples and is excluded.
+    // samples and is excluded, as are the B and D bins of a control card (isAbcdBdBin).
     auto writeFlatMcLnN = [&](const std::string& name, double unc) {
         if (!nuisanceEnabled(cfg.enabled_nuisances, name)) return;
         std::ostringstream kappa_str;
@@ -1748,13 +1889,14 @@ void writeChannelDatacard(const AppConfig& cfg, const PerChannelCard& pc,
         ofs << name << " lnN";
         for (int sr = 0; sr < pc.n_sr; ++sr) {
             for (const auto& proc : pc.processes) {
-                ofs << (proc.member_samples.empty() ? " -" : " " + kappa_str.str());
+                ofs << ((proc.member_samples.empty() || isAbcdBdBin(pc, sr)) ? " -" : " " + kappa_str.str());
             }
         }
         ofs << "\n";
     };
     writeFlatMcLnN("lumi", cfg.lumi_unc);
     writeFlatMcLnN("trigger", cfg.trigger_unc);
+    writeXsecLnN(ofs, cfg, pc);
 
     // Finite MC statistics (Barlow-Beeston-lite, combine default: signal excluded).
     if (!cfg.use_root_covariance && nuisanceEnabled(cfg.enabled_nuisances, "autoMCStats")) {
@@ -1983,6 +2125,8 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
             cc.use_abcd = true;
             cc.per_sr_abcd = true;
             cc.control = true;
+            // Per-sample control-region yields: the weights of the cross-section kappas.
+            cc.sample_yields = &ch.control_sample;
             for (int id : ch.sr_ids) cc.bin_names.push_back(ch.name + "_cr" + std::to_string(id));
             cc.bin_names.push_back(ch.name + "_abcdB");
             cc.bin_names.push_back(ch.name + "_abcdD");
@@ -2057,6 +2201,7 @@ void buildAndRun(const AppConfig& cfg, const ClassRegistry& reg,
         os << "cd " << shellQuote(work.string()) << " && "
            << cfg.combine_cmd
            << " -M Significance -t -1 --expectSignal 1 -m 120 "
+           << kSignificanceRRange
            << " --setParameters " << shellQuote(kZeroFloorStart)
            << " -n " << shellQuote(combine_name_sig) << " "
            << shellQuote("datacard.txt");
@@ -2181,7 +2326,8 @@ int runMain() {
     {
         std::ostringstream msg;
         msg << "combine.C: lumi_unc=" << cfg.lumi_unc << ", trigger_unc=" << cfg.trigger_unc
-            << ", mc_stat_threshold=" << cfg.mc_stat_threshold << ", ratio nuisances loaded:";
+            << ", mc_stat_threshold=" << cfg.mc_stat_threshold << ", xsec patterns=" << cfg.xsec_unc.size()
+            << ", ratio nuisances loaded:";
         for (const auto& kv : cfg.ratios) msg << " " << kv.first;
         logMessage(msg.str());
     }

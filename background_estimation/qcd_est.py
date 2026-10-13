@@ -332,6 +332,15 @@ QCD_SAMPLES = set()
 for class_name in QCD_CLASS_NAMES:
     QCD_SAMPLES.update(CLASS_GROUPS[class_name])
 
+# Samples left out of every yield and ABCD region (exclude_samples, default none), e.g. the
+# HT < 400 GeV QCD samples, whose few very heavy events (hard QCD in the pileup overlay of a soft
+# primary interaction) set the ABCD transfer factor. They are written as zero bundles, like
+# samples without selected events.
+EXCLUDE_SAMPLES = set(qcd_cfg.get("exclude_samples", []))
+_unknown_excluded = sorted(EXCLUDE_SAMPLES - set(SAMPLE_TO_CLASS))
+if _unknown_excluded:
+    raise RuntimeError(f"exclude_samples names samples not in class_groups: {_unknown_excluded}")
+
 
 # -------------------- Threshold filtering --------------------
 def _mask_from_cond(col: pd.Series, cond) -> pd.Series:
@@ -1793,6 +1802,16 @@ def main() -> None:
             proba,
         )
         log_message(f"Finished filtered test-set reference comparison: elapsed={_format_seconds(step_start)}")
+
+    if EXCLUDE_SAMPLES:
+        keep = ~np.isin(sample_labels, sorted(EXCLUDE_SAMPLES))
+        log_message(
+            f"Excluding samples {sorted(EXCLUDE_SAMPLES)}: {int(np.count_nonzero(~keep))} events "
+            f"(weight {float(w[~keep].sum()):.6g}) left out of every yield and ABCD region"
+        )
+        X_raw = X_raw.loc[keep]
+        y, w, sample_labels, group_labels = y[keep], w[keep], sample_labels[keep], group_labels[keep]
+        proba, abcd_pass, abcd_fail = proba[keep], abcd_pass[keep], abcd_fail[keep]
 
     log_message("Building ABCD regions")
     region_score_masks = []

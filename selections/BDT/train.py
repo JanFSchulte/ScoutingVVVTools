@@ -99,8 +99,11 @@ EVAL_ENTRIES_PER_SAMPLE = cfg.get("eval_entries_per_sample", TEST_ENTRIES_PER_SA
 # scale), limited to each sample's training range and at least one block, so the per-event weights
 # inside a class come out roughly equal; every sample reads random blocks of
 # _BUDGET_BLOCK_ENTRIES entries of its training range. The usual target_total / N_loaded
-# normalisation keeps every sample's total weight.
-TRAIN_EVENTS_PER_CLASS = int(cfg.get("train_events_per_class", 0))
+# normalisation keeps every sample's total weight. A mapping {class: budget} budgets only the listed
+# classes; the others keep the per-sample cap (production: Top only, because the weight-share
+# allocation gives the high-HT QCD and V+jets samples, which populate the SR-like high-pT tail, few
+# training events).
+_TRAIN_EVENTS_CFG = cfg.get("train_events_per_class", 0)
 # The same for the eval and test splits (replacing eval/test_entries_per_sample), shared in
 # proportion to the physics totals without training-weight scales, so the eval/test events do not
 # depend on the training weights. test_ranges.json stores the selected blocks.
@@ -225,6 +228,18 @@ for _idx, (_cls, _members) in enumerate(CLASS_GROUPS.items()):
         SIGNAL_CLASS_INDICES.append(_idx)
     else:
         BACKGROUND_CLASS_INDICES.append(_idx)
+def _per_class_budget(value, key):
+    """{class: budget} of a budget setting: one number for every class, or a mapping {class: budget}
+    (classes not listed get 0, i.e. the per-sample entry cap)."""
+    if isinstance(value, dict):
+        unknown = [c for c in value if c not in CLASS_GROUPS]
+        if unknown:
+            raise ValueError(f"{key} names classes not in class_groups: {unknown}")
+        return {c: int(value.get(c, 0)) for c in CLASS_NAMES}
+    return {c: int(value) for c in CLASS_NAMES}
+
+
+TRAIN_EVENTS_PER_CLASS = _per_class_budget(_TRAIN_EVENTS_CFG, "train_events_per_class")
 # QCD classes (names containing "qcd", as in qcd_est.py): the smooth-CvM decorrelation acts on
 # their events, for which the ABCD estimate needs scores independent of the decorrelate variables.
 QCD_CLASS_INDICES = [_idx for _idx, _cls in enumerate(CLASS_NAMES) if "qcd" in _cls.lower()]
@@ -766,10 +781,13 @@ def _split_intervals(plan, split):
 
 
 def _apply_class_budget(split_plans, tree_name, split, budget):
-    """Replace each sample's read segments of `split` by random blocks within a per-class budget
-    (see TRAIN_EVENTS_PER_CLASS / TEST_EVENTS_PER_CLASS)."""
+    """Replace each sample's read segments of `split` by random blocks within its class's budget
+    (`budget` = {class: entries}, see TRAIN_EVENTS_PER_CLASS / TEST_EVENTS_PER_CLASS); classes with
+    budget 0 keep the per-sample entry cap."""
     scales = _training_weight_scales(tree_name) if split == "train" else {}
     for cls_name, members in CLASS_GROUPS.items():
+        if budget[cls_name] <= 0:
+            continue
         names = [name for name in members if name in split_plans]
         ranges = {name: _split_intervals(split_plans[name], split) for name in names}
         caps = {name: sum(stop - start for start, stop in ivs) for name, ivs in ranges.items()}
@@ -782,7 +800,7 @@ def _apply_class_budget(split_plans, tree_name, split, budget):
                 * float(scales.get(name, 1.0))
                 if raw_entries > 0.0 and float(info["xsection"]) > 0.0 else 0.0
             )
-        alloc = _water_fill(budget, caps, weights)
+        alloc = _water_fill(budget[cls_name], caps, weights)
         for name in names:
             n_entries = min(caps[name], max(alloc[name], _BUDGET_BLOCK_ENTRIES))
             seed_key = f"{tree_name}/{name}" if split == "train" else f"{tree_name}/{name}/{split}"
@@ -809,14 +827,15 @@ def build_split_plans(tree_name, fold=None):
         raise RuntimeError(f"No data available for tree '{tree_name}'")
     budgets = (
         ("train", TRAIN_EVENTS_PER_CLASS),
-        ("eval", EVAL_EVENTS_PER_CLASS if EVAL_FRACTION > 0.0 else 0),
-        ("test", TEST_EVENTS_PER_CLASS),
+        ("eval", _per_class_budget(EVAL_EVENTS_PER_CLASS if EVAL_FRACTION > 0.0 else 0, "eval_events_per_class")),
+        ("test", _per_class_budget(TEST_EVENTS_PER_CLASS, "test_events_per_class")),
     )
     for split, budget in budgets:
-        if budget > 0:
+        if any(b > 0 for b in budget.values()):
             log_message(
-                f"{split} split of tree = {tree_name}: random blocks within a budget of "
-                f"{budget} entries per class (per-sample entry cap not used)"
+                f"{split} split of tree = {tree_name}: random blocks within the per-class budget "
+                + ", ".join(f"{c}={b}" for c, b in budget.items() if b > 0)
+                + " (the other classes keep the per-sample entry cap)"
             )
             _apply_class_budget(split_plans, tree_name, split, budget)
     return split_plans

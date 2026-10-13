@@ -131,6 +131,27 @@ MIN_BKG_ENTRIES    = sr.MIN_BKG_ENTRIES
 # `gmN 0 alpha` rows do for an empty process, so regions that are free of a class's MC events
 # only by chance (e.g. heavy QCD events) are not rated as background-free.
 ZERO_COUNT_FLOOR   = bool(sr.scan_cfg.get("zero_count_floor", False))
+# Samples left out of the scan (exclude_samples, default none), as in qcd_est.py: e.g. the
+# HT < 400 GeV QCD samples, whose few very heavy events set the ABCD transfer factor.
+EXCLUDE_SAMPLES    = set(sr.scan_cfg.get("exclude_samples", []))
+# ABCD-aware background uncertainty (abcd_uncertainty, default off; k-fold models only): QCD is
+# predicted per SR from its control region, A = C x TF (qcd_est.py abcd_mode per_sr, combine's
+# control-region fit), so in every box the QCD part of sigma_B^2 is TF^2 x (C + sum w^2 of the
+# non-QCD background MC in C), C being the expected control-region count (every process), plus
+# (nonclosure x QCD)^2, instead of the QCD MC statistics; QCD gets no zero-count floor.
+#   {"branch": <ABCD branch, a threshold of selection.json>, "control_window": [low, high]
+#    (exclusive, in the branch's fail region), "nonclosure": <fraction>}
+ABCD_CFG = sr.scan_cfg.get("abcd_uncertainty")
+if ABCD_CFG is not None:
+    ABCD_BRANCH = str(ABCD_CFG["branch"])
+    ABCD_CONTROL = tuple(float(v) for v in ABCD_CFG["control_window"])
+    ABCD_NONCLOSURE = float(ABCD_CFG["nonclosure"])
+    if len(ABCD_CONTROL) != 2 or not ABCD_CONTROL[0] < ABCD_CONTROL[1] or ABCD_NONCLOSURE < 0.0:
+        raise ValueError(f"abcd_uncertainty needs control_window [low, high] with low < high and "
+                         f"nonclosure >= 0, got {ABCD_CFG}")
+    if not sr.KFOLD:
+        raise RuntimeError("abcd_uncertainty needs a k-fold bdt_root (the score cache holds the "
+                           "control-region events)")
 EPS = 1e-12
 
 log_message = sr.log_message
@@ -169,9 +190,12 @@ def prepare_inputs():
     drop_after_filter = [c for c in extra_cols if c not in decorrelate]
 
     log_message(f"SR optimisation split: {sr.OPT_SPLIT}")
+    if sr.KFOLD and ABCD_CFG is not None:
+        return load_kfold_with_control(thresholds)
     if sr.KFOLD:
         proba, y, w, sample_labels = sr.load_kfold_inputs(thresholds)
-        return proba, y, w, sample_labels, []
+        proba, y, w, sample_labels = _exclude_samples(proba, y, w, sample_labels)
+        return proba, y, w, sample_labels, [], None
     df_all = sr.load_split_data(load_cols, sr.OPT_SPLIT)
     X             = df_all[load_cols].copy()
     y             = df_all["class_idx"].values.astype(int)
@@ -218,14 +242,50 @@ def prepare_inputs():
             sample_labels, y, w, proba,
         )
 
-    return proba, y, w, sample_labels, list(X_model.columns)
+    proba, y, w, sample_labels = _exclude_samples(proba, y, w, sample_labels)
+    return proba, y, w, sample_labels, list(X_model.columns), None
+
+
+def _exclude_samples(proba, y, w, sample_labels):
+    """Drop the events of EXCLUDE_SAMPLES (no-op without them)."""
+    if not EXCLUDE_SAMPLES:
+        return proba, y, w, sample_labels
+    keep = ~np.isin(np.asarray(sample_labels, dtype=str), sorted(EXCLUDE_SAMPLES))
+    log_message(f"Excluding samples {sorted(EXCLUDE_SAMPLES)}: {int(np.count_nonzero(~keep))} events "
+                f"(weight {float(np.asarray(w)[~keep].sum()):.6g})")
+    return proba[keep], np.asarray(y)[keep], np.asarray(w)[keep], np.asarray(sample_labels)[keep]
+
+
+def load_kfold_with_control(thresholds):
+    """k-fold score cache with the ABCD control region: the events passing every threshold (the
+    scan events, as sr.load_kfold_inputs) and the events passing every threshold but the ABCD
+    branch's that lie in its control window inside its fail region (qcd_est.py per_sr)."""
+    if ABCD_BRANCH not in thresholds:
+        raise KeyError(f"abcd_uncertainty branch {ABCD_BRANCH} has no threshold in selection.json")
+    models = sr.kfold.KFoldModels(sr.BDT_ROOT, log=log_message)
+    samples = [s for members in sr.CLASS_GROUPS.values() for s in members]
+    others = {k: v for k, v in thresholds.items() if k != ABCD_BRANCH}
+    log_message(f"Loading the k-fold score cache: {models.k} folds, {len(samples)} samples "
+                f"(every threshold but {ABCD_BRANCH})")
+    scores = sr.kfold.load_scores(models, samples, branches=[ABCD_BRANCH], thresholds=others, log=log_message)
+    v = np.asarray(scores["columns"][ABCD_BRANCH], dtype=float)
+    passed = sr.kfold.threshold_mask({ABCD_BRANCH: v}, {ABCD_BRANCH: thresholds[ABCD_BRANCH]})
+    control = ~passed & (v > ABCD_CONTROL[0]) & (v < ABCD_CONTROL[1])
+    w = scores["weight"] * sr.LUMI
+    y = scores["class_idx"].astype(int)
+    labels = scores["sample_name"]
+    proba, yA, wA, lA = _exclude_samples(scores["proba"][passed], y[passed], w[passed], labels[passed])
+    pC, yC, wC, _ = _exclude_samples(scores["proba"][control], y[control], w[control], labels[control])
+    log_message(f"After thresholds: {len(wA)} events (all MC entries, k-fold scores); control window "
+                f"{ABCD_CONTROL[0]:g} < {ABCD_BRANCH} < {ABCD_CONTROL[1]:g}: {len(wC)} events")
+    return proba, yA, wA, lA, [], {"proba": pC, "y": yC, "w": wC}
 
 
 # -------------------- Scan context --------------------
 class Ctx:
     """Per-run event arrays and precomputed reference tables for the scan."""
 
-    def __init__(self, proba, y, w):
+    def __init__(self, proba, y, w, control=None):
         n_cls = int(proba.shape[1])
         if n_cls != sr.NUM_CLASSES:
             raise RuntimeError(f"Model returned {n_cls} classes, expected {sr.NUM_CLASSES}")
@@ -243,11 +303,36 @@ class Ctx:
         self.is_bkg = np.isin(self.y, sr.BACKGROUND_CLASS_INDICES)
         self.w_sig = np.where(self.is_sig, self.w, 0.0)
         self.w_bkg = np.where(self.is_bkg, self.w, 0.0)
-        self.w2_bkg = np.where(self.is_bkg, self.w * self.w, 0.0)  # sigma_B^2 for the Z
+        # ABCD-aware sigma_B (control = the control-region events, see ABCD_CFG): the QCD classes
+        # (names containing "qcd", as in qcd_est.py) leave the MC-statistics term and the
+        # zero-count floor, and the ABCD variance of the box is added instead.
+        self.abcd = control is not None
+        qcd_classes = [c for c in sr.BACKGROUND_CLASS_INDICES if "qcd" in sr.CLASS_NAMES[c].lower()]
+        mc_bkg = self.is_bkg & ~np.isin(self.y, qcd_classes) if self.abcd else self.is_bkg
+        self.w2_bkg = np.where(mc_bkg, self.w * self.w, 0.0)  # sigma_B^2 for the Z
+        if self.abcd:
+            if not qcd_classes:
+                raise RuntimeError("abcd_uncertainty needs a QCD class in class_groups")
+            is_qcd = np.isin(self.y, qcd_classes)
+            self.w_qcd = np.where(is_qcd, self.w, 0.0)
+            cy = np.asarray(control["y"], dtype=int)
+            cw = np.asarray(control["w"], dtype=float)
+            self.c_axes = np.column_stack([control["proba"][:, idxs].sum(axis=1) for idxs in index_groups])
+            c_qcd = np.isin(cy, qcd_classes)
+            c_mc_bkg = np.isin(cy, sr.BACKGROUND_CLASS_INDICES) & ~c_qcd
+            # Per control event: its expected count (Poisson variance of the control region, every
+            # process) plus w^2 for the non-QCD background MC (their MC statistics in the fit).
+            self.c_var = cw + np.where(c_mc_bkg, cw * cw, 0.0)
+            # Transfer factor window / control window of the QCD MC (qcd_est's B/D; the SR union
+            # holds a negligible part of the QCD).
+            self.abcd_tf = float(self.w_qcd.sum()) / float(cw[c_qcd].sum())
+            self.abcd_tf2 = self.abcd_tf ** 2
+            self.abcd_nc2 = ABCD_NONCLOSURE ** 2
         # Zero-count floor: per background class, its event mask and alpha^2, alpha = the typical
         # event weight (median |w|) of the class over all scan events, like qcd_est's
         # mean_event_weight for combine (the mean is dominated by a few very heavy events).
-        self.bkg_class_masks = [self.y == c for c in sr.BACKGROUND_CLASS_INDICES]
+        self.floor_classes = [c for c in sr.BACKGROUND_CLASS_INDICES if not (self.abcd and c in qcd_classes)]
+        self.bkg_class_masks = [self.y == c for c in self.floor_classes]
         self.floor_alpha2 = [
             (float(np.median(np.abs(self.w[mc]))) ** 2) if mc.any() else 0.0 for mc in self.bkg_class_masks
         ]
@@ -314,6 +399,14 @@ def floor_variance(ctx, m):
     return var
 
 
+def abcd_variance(ctx, lo, hi, m):
+    """ABCD variance of the QCD prediction in the box [lo, hi) (event mask m of the scan events):
+    TF^2 x (control count + non-QCD MC w^2 in the control box) + (nonclosure x QCD)^2."""
+    c_var = float(np.sum(ctx.c_var[box_mask(ctx.c_axes, lo, hi)]))
+    qcd = float(ctx.w_qcd[m].sum())
+    return ctx.abcd_tf2 * max(c_var, 0.0) + ctx.abcd_nc2 * qcd * qcd
+
+
 def _qcd_axis(ctx):
     """Index of the QCD axis within ctx.axis_names, or -1 if not scanned."""
     for i, name in enumerate(ctx.axis_names):
@@ -328,9 +421,14 @@ def _hi_to_open(h):
 
 
 def rect_mask(ctx, lo, hi):
-    m = np.ones(ctx.n_events, dtype=bool)
-    for d in range(ctx.D):
-        v = ctx.score_axes[:, d]
+    return box_mask(ctx.score_axes, lo, hi)
+
+
+def box_mask(axes, lo, hi):
+    """Events (rows of the score-axis array axes) inside the box [lo, hi)."""
+    m = np.ones(axes.shape[0], dtype=bool)
+    for d in range(axes.shape[1]):
+        v = axes[:, d]
         if _hi_to_open(hi[d]):
             m &= v >= lo[d]
         else:
@@ -404,7 +502,11 @@ def evaluate_region(ctx, lo, hi, S_v=None, B_v=None, B2_v=None, S_e_v=None, B_e_
         (need_counts and (S_e_v is None or B_e_v is None))
     if need_stats:
         S, _sS, B, sB, S_e, B_e = rect_stats(ctx, lo, hi)
-        B2 = sB * sB + floor_variance(ctx, rect_mask(ctx, lo, hi))
+        m = rect_mask(ctx, lo, hi)
+        if ctx.abcd:
+            B2 = float(ctx.w2_bkg[m].sum()) + floor_variance(ctx, m) + abcd_variance(ctx, lo, hi, m)
+        else:
+            B2 = sB * sB + floor_variance(ctx, m)
     else:
         S, B, B2 = float(S_v), float(B_v), float(B2_v)
         S_e, B_e = (int(S_e_v), int(B_e_v)) if need_counts else (-1, -1)
@@ -474,6 +576,20 @@ def top_intervals_on_axis(ctx, d, lo, hi, edges, top_n):
             pW = np.r_[0.0, np.cumsum(hW)]
             empty = ((pN[b_idx] - pN[a_idx]) == 0) | ((pW[b_idx] - pW[a_idx]) <= 0.0)
             B2_mat = B2_mat + np.where(empty, alpha2, 0.0)
+    if ctx.abcd:
+        # ABCD variance: the control events in the same box (other axes fixed) and the QCD yield.
+        mc_ = np.ones(ctx.c_axes.shape[0], dtype=bool)
+        for dd in range(ctx.D):
+            if dd == d:
+                continue
+            cv = ctx.c_axes[:, dd]
+            mc_ &= (cv >= lo[dd]) if _hi_to_open(hi[dd]) else ((cv >= lo[dd]) & (cv < hi[dd]))
+        hC, _ = np.histogram(ctx.c_axes[mc_, d], bins=edges, weights=ctx.c_var[mc_])
+        hQ, _ = np.histogram(v_d[m], bins=edges, weights=ctx.w_qcd[m])
+        pC = np.r_[0.0, np.cumsum(hC)]
+        pQ = np.r_[0.0, np.cumsum(hQ)]
+        Q_mat = pQ[b_idx] - pQ[a_idx]
+        B2_mat = B2_mat + ctx.abcd_tf2 * np.maximum(pC[b_idx] - pC[a_idx], 0.0) + ctx.abcd_nc2 * Q_mat * Q_mat
     valid = tri & (B_mat >= MIN_BKG_WEIGHT) & (S_mat > MIN_SIGNAL_WEIGHT)
     if not valid.any():
         return []
@@ -1036,6 +1152,14 @@ def build_top_bins(ctx, sel_los, sel_his):
         B_e = int((m_bin & ctx.is_bkg).sum())
         floor_bin = floor_variance(ctx, m_bin)
         sB_z = float(np.sqrt(sB_bin ** 2 + floor_bin)) if floor_bin > 0.0 else sB_bin
+        if ctx.abcd:
+            mc_var = float(ctx.w2_bkg[m_bin].sum())
+            abcd_var = abcd_variance(ctx, thr_low_vec, thr_high_vec, m_bin)
+            sB_z = float(np.sqrt(mc_var + floor_bin + abcd_var))
+            log_message(
+                f"  Bin {k + 1} ABCD: QCD={float(ctx.w_qcd[m_bin].sum()):.4g}, "
+                f"sigma_ABCD={abcd_var ** 0.5:.4g}, sigma_MC(non-QCD)={mc_var ** 0.5:.4g}, sigma_B={sB_z:.4g}"
+            )
         Z_bin, sZ_bin = calc_Z(S_bin, B_bin, sS_bin, sB_z)
 
         W_bin = S_bin + B_bin
@@ -1109,16 +1233,21 @@ def build_top_bins(ctx, sel_los, sel_his):
 
 # -------------------- Main --------------------
 def main():
-    proba, y, w, sample_labels, feature_names = prepare_inputs()
+    proba, y, w, sample_labels, feature_names, control = prepare_inputs()
 
     log_message("Plotting score distributions")
     sr.plot_score_distributions(proba, y, w)
 
-    ctx = Ctx(proba, y, w)
+    ctx = Ctx(proba, y, w, control)
+    if ctx.abcd:
+        log_message(
+            f"ABCD-aware sigma_B ON: control window {ABCD_CONTROL[0]:g} < {ABCD_BRANCH} < {ABCD_CONTROL[1]:g}, "
+            f"TF (QCD window / control) = {ctx.abcd_tf:.4g}, nonclosure = {ABCD_NONCLOSURE:g}"
+        )
     if ZERO_COUNT_FLOOR:
         log_message("Zero-count floor ON: alpha (median |event weight|) per background class: " + ", ".join(
             f"{sr.CLASS_NAMES[c]}={a2 ** 0.5:.4g}"
-            for c, a2 in zip(sr.BACKGROUND_CLASS_INDICES, ctx.floor_alpha2)))
+            for c, a2 in zip(ctx.floor_classes, ctx.floor_alpha2)))
     log_message(f"  S_total={ctx.S_total:.4g}, B_total={ctx.B_total:.4g}")
     log_message(f"  Scan dimensions D={ctx.D}, axes={ctx.axis_names}")
     log_message(

@@ -13,7 +13,7 @@
   "model_pattern": "{output_root}/{tree_name}_model",
   "model_type": "bdt",
   "entries_per_sample": 750000,
-  "train_events_per_class": 3000000,
+  "train_events_per_class": {"Top": 3000000},
   "eval_events_per_class": 0,
   "test_events_per_class": 0,
   "test_entries_per_sample": 500000,
